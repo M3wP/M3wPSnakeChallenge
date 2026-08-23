@@ -1,0 +1,38 @@
+;===============================================================================
+; snake.s - Snake Challenge QUADRO, MEGA65 client top-level file
+;
+; Ties together the generic framework (framework/*.s, extracted from
+; M3wPChess's chess.s during this port - see framework/fw_core.s for the
+; extraction note) with this game's own content (snake_game.s). Segment
+; order matters here (see framework/fw_hivars.s) - this is the one file
+; that has to get the .include order right, everything else just slots
+; into whichever segment is already open when it's reached.
+;===============================================================================
+
+.include "framework/fw_core.s"
+.include "framework/fw_startup.s"
+.include "framework/fw_ui_shell.s"
+
+;===============================================================================
+;	$2000 is a fixed load address (eth.bin/mega-ip's jump table is
+;	hardcoded to it). bigglesworth.s/eth.bin are path-relative to this
+;	file's own directory, so this block stays here rather than moving
+;	into framework/ - see fw_font_input.s's own note.
+;===============================================================================
+.include "bigglesworth.s"
+
+.out .sprintf("Before eth.bin pad: * = $%04X, room until $2000 = %d bytes", *, $2000 - *)
+
+.res    $2000 - *, 0
+
+.assert * = $2000, error, "eth.bin must load at $2000 - mega-ip's own jump table (MIP_INIT etc.) is hardcoded to that address, layout above no longer adds up"
+
+.incbin "eth.bin"
+
+
+.include "framework/fw_font_input.s"
+.include "framework/fw_ctrls_net.s"
+
+.include "snake_game.s"
+
+.include "framework/fw_hivars.s"
