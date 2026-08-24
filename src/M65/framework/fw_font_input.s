@@ -134,14 +134,14 @@ userIRQInstall:
 
 
 		LDA	#%01111111		;We'll always want rasters
-		AND	vicCtrlReg		;    less than $0100
-		STA	vicCtrlReg
+		AND	VAL_VIC_CTRLREG		;    less than $0100
+		STA	VAL_VIC_CTRLREG
 		
 		LDA	#$19
-		STA	vicRstrVal
+		STA	VAL_VIC_RSTRVAL
 		
 		LDA	#$01			;Enable raster irqs
-		STA	vicIRQMask
+		STA	VAL_VIC_IRQMASK
 		
 		RTS
 
@@ -157,37 +157,61 @@ userIRQ:
 ;-------------------------------------------------------------------------------
 		PHP				;save the initial state
 		PHA
-		TXA				
+		TXA
 		PHA
 		TYA
+		PHA
+
+;	Save/restore elemptr0 around the whole IRQ body - userHandleMouse
+;	(called below via userIRQHandler) reuses elemptr0 as its own
+;	per-cell mouse-hit-testing scratch, same as foreground code
+;	(ctrlsPageSelect, clientMainNextChng, ctrlsPageKeyPress's
+;	accelerator search, ...) does. Unlike irqptr0 (added specifically
+;	so the cursor-blink code never has to touch elemptr0 at all), mouse
+;	handling was never given its own pointer - root-caused (2026-08-24)
+;	as pageptr0 landing on a torn, bogus address after a rapid F7
+;	double-press: this raster IRQ fires ~50-60x/sec unconditionally,
+;	so it could preempt foreground code's own elemptr0 use at any
+;	instruction boundary and clobber it mid-sequence. Saving/restoring
+;	here makes the IRQ's use of elemptr0 fully transparent to whatever
+;	the foreground was doing with it, without having to hunt down and
+;	individually protect every foreground call site that touches it.
+		LDA	elemptr0
+		PHA
+		LDA	elemptr0 + 1
 		PHA
 
 		CLD
 		
 ;	Is the VIC-II needing service?
-		LDA	vicIRQFlgs
+		LDA	VAL_VIC_IRQFLGS
 		AND	#$01
 		BNE	@proc
 		
 ;	Some other interrupt source??  Peculiar...  And a real problem!  How
 ;	do I acknowledge it if its not a BRK when I don't know what it would be?
 		LDA	#$02
-		STA	vicBrdrClr
-		STA	vicBkgdClr
+		STA	VAL_VIC_BRDRCLR
+		STA	VAL_VIC_BKGDCLR
 
 		JMP 	@done
 		
 @proc:
-		ASL	vicIRQFlgs
+		ASL	VAL_VIC_IRQFLGS
 		
 		JSR	userIRQHandler
 
 @done:
-		PLA             
-		TAY             
-		PLA             
-		TAX             
-		PLA             
+		PLA
+		STA	elemptr0 + 1
+		PLA
+		STA	elemptr0
+
+		PLA
+		TAY
+		PLA
+		TAX
+		PLA
 		PLP
 
 		RTI
@@ -217,7 +241,7 @@ userIRQHandler:
 ;-------------------------------------------------------------------------------
 	.if	DEBUG_RASTERTIME
 		LDA	#$00
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 
@@ -238,13 +262,13 @@ userIRQHandler:
 		BNE	@flshoff
 		
 		LDA	#$01
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 		
 		JMP	@flshdone
 		
 @flshoff:
 		LDA	current_clrs
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 		
 		
 @flshdone:
@@ -341,7 +365,7 @@ userIRQHandler:
 
 	.if	DEBUG_RASTERTIME
 		LDA	#$05
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 		JSR	userKeyScanKey
@@ -354,7 +378,7 @@ userIRQHandler:
 
 	.if	DEBUG_RASTERTIME
 		LDA	#$01
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 		JSR	userHandleMouse
@@ -376,11 +400,11 @@ userIRQHandler:
 @finish:
 	.if	DEBUG_RASTERTIME
 		LDA	#$0E
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 		LDA	#$19
-		STA	vicRstrVal
+		STA	VAL_VIC_RSTRVAL
 		
 		RTS
 

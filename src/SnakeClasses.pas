@@ -135,15 +135,25 @@ const
 //		61	-	Join
 //		62	-	Part
 //		63	-	List
-//		64	-	TextPeer
-//		65	-	KickPeer
+//		64	-	TextPeer (unused by Snake QUADRO - see the FIXME on
+//				TSnakeGame.ProcessPlayerMessage, SnakeServer.pas)
+//		65	-	KickPeer (unused)
 //		66	-	StatusGame
 //		67	-	StatusPeer
+//		69	-	TileDelta (Snake QUADRO) - [count, (row,col,tile)*count],
+//				see TSnakeGame.SendTileDeltas/Tick
+//		6A	-	BoardRowsReq (Snake QUADRO) - client->server, [startRow]
+//		6B	-	BoardRowsData (Snake QUADRO) - server->client,
+//				[startRow, 30 bytes row, 30 bytes row+1]
+//		6C	-	WatchStart (Snake QUADRO) - client->server, no payload
+//		6D	-	WatchStop (Snake QUADRO) - client->server, no payload
+//		6E	-	GameChat - framework-generic (fw_ctrls_net.s's
+//				clientProcPlayMsg), not dispatched here
 //
-//		TODO: snake direction-input/tile-delta opcode(s) and any other
-//		board/game-message wiring go here once the board/movement model is
-//		designed - deliberately unimplemented for now (mirrors the
-//		client's own TODO markers around clientMsgProcs' mcPlay entry).
+//		TODO: snake direction-input and slot-claim opcodes go here once
+//		the movement/slot-claim model is designed - deliberately
+//		unimplemented for now (mirrors the client's own TODO markers
+//		around clientMsgProcs' mcPlay entry).
 
 procedure AddLogMessage(const AKind: TLogKind; const AMessage: string);
 

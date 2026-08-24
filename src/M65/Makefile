@@ -17,6 +17,7 @@
 TASS      ?= C:/tools/64tass.exe
 CA65      ?= C:/cc65/bin/ca65.exe
 CL65      ?= C:/cc65/bin/cl65.exe
+LD65      ?= C:/cc65/bin/ld65.exe
 ETHERLOAD ?= etherload
 EXOMIZER  ?= C:/tools/exomizer/win32/exomizer.exe
 
@@ -26,6 +27,13 @@ OBJ      := $(OBJDIR)/snake.o
 CONFIG   := m65.cfg
 PRG      := ../../snake.prg
 DISTNAME := ../../m65snake.prg
+# Full label/address debug info, regenerated on every build (addresses
+# shift whenever anything upstream changes size) - read with e.g.
+# grep -o 'name="SYMBOL",[^}]*val=0x[0-9A-Fa-f]*' snake.dbg. cl65 doesn't
+# forward --dbgfile to ld65, so the link step below calls ld65 directly
+# instead of going through cl65 - see reference_mega65_serial_debugger
+# memory note for the live-hardware debugging workflow this feeds.
+DBGFILE  := ../../obj/snake.dbg
 ETHSRC   := mega-ip/eth.asm
 ETHSRCS  := $(wildcard mega-ip/*.asm)
 ETHBIN   := eth.bin
@@ -49,13 +57,13 @@ $(ETHBIN): $(ETHSRCS)
 # snake.s pulls in framework/*.s, snake_game.s, bigglesworth.s, mouse.inc
 # etc. via .include, so any of them changing should trigger a rebuild too.
 $(OBJ): $(SRC) $(ETHBIN) $(FWSRCS) snake_game.s bigglesworth.s $(INCSRCS) $(PALSRCS) $(BINSRCS) | $(OBJDIR)
-	"$(CA65)" --cpu 4510 $(SRC) -o $(OBJ)
+	"$(CA65)" --cpu 4510 -g $(SRC) -o $(OBJ)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 $(PRG): $(OBJ) $(CONFIG)
-	"$(CL65)" -t none --config $(CONFIG) $(OBJ) -o $(PRG)
+	"$(LD65)" --config $(CONFIG) $(OBJ) -o $(PRG) --dbgfile $(DBGFILE)
 
 run: all
 	"$(ETHERLOAD)" -4 -r $(PRG)
@@ -64,4 +72,4 @@ dist: all
 	"$(EXOMIZER)" sfx 0x080d -x 1 -t 65 -Di_ram_exit=0 -o $(DISTNAME) $(PRG)
 
 clean:
-	rm -f $(OBJ) $(PRG) $(DISTNAME) $(ETHBIN) $(ETHLST)
+	rm -f $(OBJ) $(PRG) $(DISTNAME) $(ETHBIN) $(ETHLST) $(DBGFILE)

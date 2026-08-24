@@ -247,23 +247,23 @@ VICYPOS2    	= 	VIC + $05      		; Y POSITION
 VICXPOS3    	= 	VIC + $06      		; LOW ORDER X POSITION
 VICYPOS3    	= 	VIC + $07      		; Y POSITION
 VICXPOSMSB 	=	VIC + $10      		; BIT 0 IS HIGH ORDER X POS
-vicCtrlReg	=	$D011
-vicRstrVal	=	$D012
-vicSprEnab	= 	$D015
-vicSprExpY	=	$D017
-vicMemCtrl	=	$D018
-vicIRQFlgs	=	$D019
-vicIRQMask	=	$D01A
-vicSprCMod	= 	$D01C
-vicSprExpX	= 	$D01D
-vicBrdrClr	=	$D020
-vicBkgdClr	= 	$D021
-vicSprMCl0	= 	$D025
-vicSprMCl1	= 	$D026
-vicSprClr0	= 	$D027
-vicSprClr1	= 	$D028
-vicSprClr2	= 	$D029
-vicSprClr3	= 	$D02A
+VAL_VIC_CTRLREG	=	$D011
+VAL_VIC_RSTRVAL	=	$D012
+VAL_VIC_SPRENAB	= 	$D015
+VAL_VIC_SPREXPY	=	$D017
+VAL_VIC_MEMCTRL	=	$D018
+VAL_VIC_IRQFLGS	=	$D019
+VAL_VIC_IRQMASK	=	$D01A
+VAL_VIC_SPRCMOD	= 	$D01C
+VAL_VIC_SPREXPX	= 	$D01D
+VAL_VIC_BRDRCLR	=	$D020
+VAL_VIC_BKGDCLR	= 	$D021
+VAL_VIC_SPRMCL0	= 	$D025
+VAL_VIC_SPRMCL1	= 	$D026
+VAL_VIC_SPRCLR0	= 	$D027
+VAL_VIC_SPRCLR1	= 	$D028
+VAL_VIC_SPRCLR2	= 	$D029
+VAL_VIC_SPRCLR3	= 	$D02A
 
 SID     	= 	$D400         		; SID REGISTERS
 SID_ADConv1    	= 	SID + $19
@@ -294,6 +294,16 @@ spritePtr3	=	$07FB
 
 
 FRAMECOUNT          = $d7fa
+
+;	MEGA65 hardware random number generator. Read a fresh byte from
+;	VAL_M65_RANDOM, but only once bit 7 of VAL_M65_RANDRDY is CLEAR - that bit
+;	being SET means "not ready yet" (per the MEGA65 docs, address and
+;	protocol from the user, 2026-08-24). Poll it before every byte,
+;	not just the first: consecutive reads without re-checking can hand
+;	back the same value.
+VAL_M65_RANDOM            = $d7ef
+VAL_M65_RANDRDY           = $d7fe
+VAL_M65_RAND_NOTRDY       = %10000000
 
 
 
@@ -585,8 +595,35 @@ ML_STAGE_ARG_Z      = 5
 	.define CLR_MONEY	$06
 	.define CLR_DIE		$07
 	.define CLR_SPEC_TEXT	$10		;Specific system text colour
-	.define CLR_SPEC_CTRL	$20		;Specific system control colour 
+	.define CLR_SPEC_CTRL	$20		;Specific system control colour
 						;(reversed on C64)
+
+;	Raw system palette colours (0-15, the standard C64/MEGA65 16-colour
+;	set) - NOT logical/theme colours like CLR_* above, which get
+;	remapped by screenCtrlToLogClr depending on the active colour
+;	scheme. Use these for content whose colour is fixed by what it
+;	depicts (game tiles, health/status bars) rather than by the UI
+;	theme - anywhere STCOLR16/dmaFillRow/dmaCopyRow16 already expect "a
+;	real system/palette colour value", per their own doc comments.
+;	Added after a mid-air mix-up over which raw value is actually
+;	light green (2026-08-24) - named constants instead of bare hex
+;	so that can't happen again.
+	.define CLR_LOG_C64_BLACK	$00
+	.define CLR_LOG_C64_WHITE	$01
+	.define CLR_LOG_C64_RED		$02
+	.define CLR_LOG_C64_CYAN	$03
+	.define CLR_LOG_C64_PURPLE	$04
+	.define CLR_LOG_C64_GREEN	$05
+	.define CLR_LOG_C64_BLUE	$06
+	.define CLR_LOG_C64_YELLOW	$07
+	.define CLR_LOG_C64_ORANGE	$08
+	.define CLR_LOG_C64_BROWN	$09
+	.define CLR_LOG_C64_LIGHTRED	$0A
+	.define CLR_LOG_C64_DARKGREY	$0B
+	.define CLR_LOG_C64_GREY	$0C
+	.define CLR_LOG_C64_LIGHTGREEN	$0D
+	.define CLR_LOG_C64_LIGHTBLUE	$0E
+	.define CLR_LOG_C64_LIGHTGREY	$0F
 
 ;	.define TYPE_ELEMENT	$00
 ;	.define TYPE_PAGE	$10
@@ -851,4 +888,28 @@ keyZPAbort = $4B
 ;irqptr0:
 ;			.res	4
 irqptr0 = $4C
+
+;	TEMPORARY test (2026-08-24) - dedicated far pointer for
+;	gameProcTileDeltaMsg's screen/colour cell writes (snake_game.s), NOT
+;	shared with tempptr0-3. Same rationale as irqptr0 above: on the
+;	4510/45GS02 a single instruction can't be interrupted mid-flight,
+;	but the STQ far-pointer write is built from several separate
+;	instructions (loading ptr+0..3, then the NOP-prefixed STA), and the
+;	board's TileDelta stream is the first continuous 6/sec user of
+;	tempptr2 in the whole project - if something else (control
+;	presentation/"dirty update" redraws, which also use tempptr0-3 as
+;	general-purpose scratch) runs between those instructions and reuses
+;	tempptr2 for its own far pointer, the TileDelta write would finish
+;	with a torn, wrong bank/address - matching the code-space corruption
+;	found live. Giving this its own pointer rules that out entirely.
+;boardptr0:
+;			.res	4
+boardptr0 = $51			;NB: $50 is eth_init_default (ip65), not free
+
+;	Same rationale as boardptr0 above, for gameProcTileDeltaMsg's plain
+;	2-byte boardTiles[] pointer - was tempptr3, also shared framework
+;	scratch.
+;boardptr1:
+;			.res	2
+boardptr1 = $55
 

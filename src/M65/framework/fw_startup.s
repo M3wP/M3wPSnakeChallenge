@@ -688,14 +688,14 @@ initSprites:
 ;	Turn off MCM and expansion
 
 		LDA	#$00			;MCM none
-		STA	vicSprCMod
-		STA	vicSprExpX
-		STA	vicSprExpY
+		STA	VAL_VIC_SPRCMOD
+		STA	VAL_VIC_SPREXPX
+		STA	VAL_VIC_SPREXPY
 
 ;	Enable all of the sprites required
 
 		LDA	#$0F			;sprites
-		STA	vicSprEnab
+		STA	VAL_VIC_SPRENAB
 
 		RTS
 

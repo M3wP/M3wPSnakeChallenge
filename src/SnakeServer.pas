@@ -9,6 +9,29 @@ interface
 uses
 	SyncObjs, Generics.Collections, Classes, TCPServer, SnakeClasses;
 
+const
+	// 30x20 - the original Lua game's 30x18 grown vertically to fill the
+	// screen (user, 2026-08-24); the 70x21 expansion is still deferred.
+	// The board draws at screen rows 5..5+BOARD_ROWS-1, so 20 rows runs
+	// to screen row 24 - the last row of page_detail (posy 3, height 22)
+	// and exactly the span the right-hand HUD column beside it already
+	// uses. 20 rather than 19 deliberately: the row-fetch protocol below
+	// moves TWO rows per message, so an even row count divides into
+	// whole pairs and needs no short final message or half-pair special
+	// case anywhere. Rows/cols are small enough that 2 rows (60 bytes)
+	// comfortably fits one message under the 254-byte payload cap - see
+	// TSnakeGame.SendBoardRows. Declared up here, ahead of the type
+	// block, since TSnakeGame.Board's own field declaration needs them
+	// in scope.
+	BOARD_COLS = 30;
+	BOARD_ROWS = 20;
+
+	// Upper bound on a snake body, so the body array can be a fixed
+	// record field rather than a dynamic array reallocated per growth.
+	// Demo snakes never grow; this is headroom for real play. Up here
+	// for the same reason as the board size - TDemoSnake needs it.
+	MAX_SNAKE_LEN = 64;
+
 type
 
 	{ TServerDispatcher }
@@ -166,6 +189,49 @@ type
 		// tile-grid/movement model is designed (see SnakeClasses.pas).
 	end;
 
+	// One cell of a TileDelta broadcast (mcPlay/$09 - see
+	// TSnakeGame.SendTileDeltas) - the general "these cells changed"
+	// wire shape any future per-tick board update rides on, not just
+	// the attract-mode bounce that's exercising it first. Row/Col are
+	// board-relative (0..BOARD_ROWS-1/0..BOARD_COLS-1), Tile is one of
+	// the TILE_* constants (see the board-size const block).
+	TTileDelta = record
+		Row, Col, Tile: Byte;
+	end;
+
+	// Which way a snake is looking/moving. Values match the original's
+	// tSNAKEDIR (server.lua) in meaning, not in numbering - nothing puts
+	// these on the wire, so a plain enum is clearer than the original's
+	// 1/2/4/8 bit flags.
+	TSnakeDir = (sdUp, sdDown, sdLeft, sdRight);
+
+	// One body segment's board position. Body[0] is the head, matching
+	// the original's body[1]-is-head convention (1-based there).
+	TSnakeSeg = record
+		Row, Col: Byte;
+	end;
+
+	// A demo-mode snake. The demo AI is the original's snakeMenu()
+	// (server.lua) exactly: no pathfinding, no look-ahead - the snake
+	// runs laps of the interior rectangle, turning only when its head
+	// lands on one of the four corners. Both snakes run the SAME circuit
+	// in the same rotational direction, started half a lap apart, which
+	// is why they never catch each other and no collision handling is
+	// needed here at all.
+	TDemoSnake = record
+		Body: array[0..MAX_SNAKE_LEN - 1] of TSnakeSeg;
+		Len: Integer;
+		Dir: TSnakeDir;
+
+		// Ticks left before this snake's next step - the original's
+		// per-snake moveTick countdown (objectsTick), which is what
+		// lets snakes move at different speeds off one shared tick.
+		MoveTick: Integer;
+
+		// Tile values this snake's head and body render as.
+		HeadTile, BodyTile: Byte;
+	end;
+
 	TSnakeGame = class(TZone)
 	public
 		Play: TPlayZone;
@@ -177,6 +243,49 @@ type
 		// separately, via bare zone membership (FPlayers), not this array
 		// - see TPlayZone.ProcessPlayerMessage's join handling.
 		Slots: array[0..3] of TSnakeSlot;
+
+		// Subset of FPlayers who've told us their client is actually on
+		// the board page right now (WatchStart/WatchStop, mcPlay/$0C and
+		// /$0D - see ProcessPlayerMessage and AddWatcher/RemoveWatcher).
+		// Being a zone member (spectating, i.e. in FPlayers) and actually
+		// watching the board are different things - a spectator sitting
+		// on the highscore overview or a chat tab shouldn't be sent board
+		// updates just because they're in the room. The row-fetch sync
+		// itself doesn't need this (it's pull-only, the client only asks
+		// when it wants rows), but the future per-tick dirty-cell delta
+		// broadcast (TODO) absolutely does - it should iterate Watchers,
+		// not FPlayers, or every spectator gets flooded every tick
+		// whether they're looking at the board or not.
+		//
+		// Plain TList<TPlayer>, not FPlayers' TThreadList - this class
+		// already has its own Lock guarding Slots/Board, so Watchers
+		// just joins that same critical section (see AddWatcher/
+		// RemoveWatcher) rather than adding a second, independent lock
+		// for one more piece of the same object's state.
+		Watchers: TList<TPlayer>;
+
+		// The one true copy of the board's tile grid - [row, col], row 0
+		// at the top. Currently just a static placeholder pattern (see
+		// Create) since the tick/movement simulation doesn't exist yet;
+		// this is where that simulation will write once it does. Full-
+		// grid sync is row-paginated (SendBoardRows) rather than one big
+		// message, to stay under the 254-byte payload cap; live per-cell
+		// updates (the attract-mode bounce below, and eventually real
+		// gameplay) go out as TileDelta broadcasts (mcPlay/$09 - see
+		// SendTileDeltas) instead - Board itself is kept in sync with
+		// every delta sent, so the two paths can never disagree, and a
+		// client that (re)syncs mid-tick sees exactly what a delta
+		// would have told it anyway.
+		Board: array[0..BOARD_ROWS - 1, 0..BOARD_COLS - 1] of Byte;
+
+		// The two demo-mode snakes, ticked forward by TPlayZone's tick
+		// thread and broadcast to Watchers as TileDeltas whenever no
+		// corner is claimed. These replaced the "Cylon/KITT" single-cell
+		// bounce that first proved the TileDelta pipeline out
+		// (2026-08-24) - the bounce was scaffolding for the wire format,
+		// this is the original's actual attract mode (server.lua's
+		// iGameMode = tGAMEMODE.attract, driven by snakeMenu).
+		DemoSnakes: array[0..1] of TDemoSnake;
 
 		constructor Create; override;
 		destructor  Destroy; override;
@@ -191,12 +300,41 @@ type
 
 		procedure SendGameStatus(APlayer: TPlayer);
 		procedure SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
+		procedure SendBoardRows(APlayer: TPlayer; AStartRow: Integer);
 
-		// TODO: tile-grid/tick-driven simulation state and the dirty-cell
-		// board-delta Send* methods land here once the movement model is
-		// designed - see SnakeClasses.pas' TODO and the project's own
-		// design-decision notes (6 ticks/sec, delta broadcast, 30x18
-		// board for now, demo/attract mode = 0 corners claimed).
+		// TileDelta (mcPlay/$09) - the general "these cells changed"
+		// broadcast; ADeltas is whatever cells changed this tick (see
+		// Tick). Not gated on Watchers itself - Tick already only calls
+		// this per-Watcher, same anti-flood reasoning as the board-row
+		// sync (see Watchers' own comment).
+		procedure SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TTileDelta);
+
+		// Demo/attract mode - see DemoSnakes. InitDemoSnakes lays both
+		// snakes out on the board (and writes them into Board);
+		// TickDemoSnakes advances them one tick, appending whatever
+		// cells changed to ADeltas.
+		procedure InitDemoSnakes;
+		procedure TickDemoSnakes(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+
+		procedure AddWatcher(APlayer: TPlayer);
+		procedure RemoveWatcher(APlayer: TPlayer);
+
+		// Tick - called once per server tick (see TPlayZone's tick
+		// thread) for every board, regardless of whether anyone's
+		// watching. Advances the attract-mode bounce above when idle
+		// (no corner claimed), writes it into Board, and broadcasts it
+		// as a TileDelta to Watchers; a no-op otherwise. This is also
+		// where the real tile/movement simulation will eventually hook
+		// in once it's designed.
+		procedure Tick;
+
+		// TODO: tile-grid/tick-driven simulation state (writing into
+		// Board above) and the dirty-cell board-delta broadcast land
+		// here once the movement model is designed - see
+		// SnakeClasses.pas' TODO and the project's own design-decision
+		// notes (6 ticks/sec, delta broadcast, 30x18 board for now,
+		// demo/attract mode = 0 corners claimed).
 	end;
 
 	TSnakeGames = TThreadList<TSnakeGame>;
@@ -204,6 +342,16 @@ type
 	TPlayZone = class(TZone)
 	private
 		FGames: TSnakeGames;
+
+		// Drives every board's Tick at TICK_MS (6/sec - see the
+		// project's own design-decision notes) via GetTickCount64, the
+		// FPC-portable monotonic ms source (works identically on
+		// Windows/Linux, unlike Now/DateUtils - see the earlier server-
+		// timing discussion). Declared as the base TThread here so
+		// TSnakeTickThread itself can stay entirely inside the
+		// implementation section - nothing in the interface needs the
+		// concrete type.
+		FTickThread: TThread;
 
 	public
 		constructor Create; override;
@@ -218,6 +366,10 @@ type
 
 		procedure ProcessPlayerMessage(APlayer: TPlayer; AMessage: TBaseMessage;
 				var AHandled: Boolean); override;
+
+		// Tick - called by FTickThread once per TICK_MS; calls every
+		// board's own Tick in turn.
+		procedure Tick;
 	end;
 
 	TZoneClass = class of TZone;
@@ -305,6 +457,25 @@ implementation
 uses
 	SysUtils, IniFiles;
 
+{$IFDEF WINDOWS}
+// Windows' default timer resolution is ~15.6ms, and BOTH GetTickCount64
+// and Sleep quantise to it - so TSnakeTickThread's pacing can only land
+// on ~15.6ms boundaries no matter what TICK_MS says. At TICK_MS=166 that
+// meant real periods of 172-187ms (measured client-side at 5.72 steps/sec
+// against a theoretical 6.02), and, worse, an UNEVEN period tick to tick,
+// which is exactly the "it does lurch every now and then" the user saw
+// on hardware (2026-08-24).
+//
+// timeBeginPeriod(1) drops the system timer to 1ms for the lifetime of
+// the process that asks. Without it TICK_MS=83 (12/sec) can't work at
+// all - Sleep(83) would round up to ~93.75ms, i.e. 10.7/sec, with the
+// relative jitter twice as bad as at 6/sec.
+function timeBeginPeriod(uPeriod: LongWord): LongWord; stdcall;
+		external 'winmm.dll' name 'timeBeginPeriod';
+function timeEndPeriod(uPeriod: LongWord): LongWord; stdcall;
+		external 'winmm.dll' name 'timeEndPeriod';
+{$ENDIF}
+
 const
 	MOTD_DIR = 'motd';
 
@@ -335,6 +506,78 @@ const
 	// TPlayZone.Create (see below), never created/destroyed at runtime.
 	// Trivially extended - just add more names here.
 	ARR_SNAKE_BOARDS: array[0..1] of AnsiString = ('board1', 'board2');
+
+	// Placeholder tile values only - no real tile set exists yet (see
+	// TSnakeGame.Board's TODO). Just enough to hand the client something
+	// real and stable to sync against while the row-fetch protocol is
+	// being built.
+	TILE_FLOOR = 0;
+	TILE_WALL = 1;
+
+	// Was the attract-mode bounce's lit cell, which the demo snakes below
+	// have now replaced (2026-08-24). The value is deliberately left in
+	// place rather than renumbered - the client's own gameTileChars/
+	// gameTileColrs tables are indexed by these values, so keeping the
+	// numbering stable means the snake tiles could be added without
+	// disturbing anything already on the wire.
+	TILE_ATTRACT = 2;
+
+	// Demo-mode snake segments. Head and body are separate values even
+	// though both currently render as the same character ($A0) - the
+	// user's own call (2026-08-24): "use $00A0 for the snake tiles
+	// including the head tile for now, we'll need to find out what the
+	// look direction tiles are". When those are known only the CLIENT's
+	// lookup table changes; the wire protocol and this numbering don't.
+	// The original does the same split - server.lua's realiseSnake draws
+	// body[1] from tSnakeLook[look] and every other segment from a fixed
+	// index.
+	TILE_SNAKE1 = 3;
+	TILE_SNAKE1_HEAD = 4;
+	TILE_SNAKE2 = 5;
+	TILE_SNAKE2_HEAD = 6;
+
+	// 12 ticks/sec (1000 div 12 = 83ms) as of 2026-08-24 - raised from
+	// the original 6/sec once measurement showed the client keeping up
+	// with the delta stream with room to spare. The point of the higher
+	// rate is NOT faster snakes: it's RESOLUTION. Snake speed is a
+	// per-snake tick COUNTDOWN (SNAKE_MOVE_TICKS), so the tick rate sets
+	// how many distinct speeds exist between "normal" and "flat out".
+	// At 6/sec with demo snakes already at 1 tick/step there was no
+	// faster gear left at all, which would have made the original's
+	// food speed-ups impossible to express.
+	//
+	// Note this does NOT double the network load: Tick only broadcasts
+	// on ticks where something actually moved (see TSnakeGame.Tick's
+	// deltaCount = 0 early out), so the message rate follows the snakes'
+	// step rate, not the tick rate.
+	//
+	// Requires the 1ms timer resolution timeBeginPeriod(1) buys - at
+	// Windows' default ~15.6ms granularity an 83ms period would round to
+	// ~93.75ms (10.7/sec) and jitter visibly.
+	TICK_MS = 83;
+
+	// Ticks between one demo snake step. The user's own reading of the
+	// original (2026-08-24): normal play is 3, flat out is 1, and the
+	// DEMO snakes ran at 2 - deliberately a bit quicker than normal
+	// play, which is what makes an attract screen look lively. At
+	// TICK_MS=83 that's ~6 steps/sec for the demo, ~4 for normal play
+	// and ~12 flat out.
+	//
+	// This is the demo/attract value only. Real play will carry a
+	// per-snake period (the original's moveTick reset value) rather
+	// than sharing this constant.
+	//
+	// The original also modulates this per snake via moveFast (food
+	// speed-ups and slow-downs, +30..-12, decaying 1/tick back toward
+	// 0) - deliberately NOT implemented here, since demo snakes never
+	// eat. When food lands, that becomes a per-snake offset applied to
+	// this base, exactly as objectsTick does it.
+	SNAKE_MOVE_TICKS = 2;
+
+	// Starting length of each demo snake, matching the original's
+	// non-battle initSnakes (5 segments).
+	DEMO_SNAKE_LEN = 5;
+
 
 
 procedure DoDestroyListMessages;
@@ -1691,17 +1934,34 @@ procedure TSnakeGame.Add(APlayer: TPlayer);
 	end;
 
 constructor TSnakeGame.Create;
+	var
+	r, c: Integer;
+
 	begin
 	inherited;
 
 	Lock:= TCriticalSection.Create;
+	Watchers:= TList<TPlayer>.Create;
 
-	// TODO: seed the tile grid / demo-mode simulation state here once the
-	// board/movement model is designed (see SnakeClasses.pas). State
-	// starts at gsWaiting (the TGameState default, Ord 0) - attract/demo
-	// mode is "gsWaiting with 0 corners claimed", not a separate TGameState
-	// value, per the confirmed design (0-4 active corners on one
-	// continuously-running board, not a synchronised 2-seat ready-gate).
+	// Placeholder board - a plain bordered room (wall around the edge,
+	// empty floor inside). No real level/tile simulation exists yet
+	// (see the TODO below) - this just gives the row-fetch protocol
+	// something real and stable to sync against. The eventual tick
+	// simulation replaces this wholesale, it doesn't build on it.
+	for r:= 0 to BOARD_ROWS - 1 do
+		for c:= 0 to BOARD_COLS - 1 do
+			if  (r = 0) or (r = BOARD_ROWS - 1)
+			or  (c = 0) or (c = BOARD_COLS - 1) then
+				Board[r][c]:= TILE_WALL
+			else
+				Board[r][c]:= TILE_FLOOR;
+
+	// Lay the demo snakes onto that board. State starts at gsWaiting (the
+	// TGameState default, Ord 0) - attract/demo mode is "gsWaiting with 0
+	// corners claimed", not a separate TGameState value, per the
+	// confirmed design (0-4 active corners on one continuously-running
+	// board, not a synchronised 2-seat ready-gate).
+	InitDemoSnakes;
 	end;
 
 destructor TSnakeGame.Destroy;
@@ -1710,9 +1970,260 @@ destructor TSnakeGame.Destroy;
 	// TPlayZone.Create) are never destroyed at runtime - this only runs
 	// at server shutdown (TPlayZone.Destroy), so there's no
 	// Play.RemoveGame(Desc) call here to mirror chess's Destroy.
+	Watchers.Free;
 	Lock.Free;
 
 	inherited;
+	end;
+
+// AddWatcher/RemoveWatcher - see Watchers' own comment above for why
+// this is a plain TList guarded by Lock rather than a TThreadList.
+procedure TSnakeGame.AddWatcher(APlayer: TPlayer);
+	begin
+	Lock.Acquire;
+		try
+		if  Watchers.IndexOf(APlayer) < 0 then
+			Watchers.Add(APlayer);
+
+		finally
+		Lock.Release;
+		end;
+	end;
+
+procedure TSnakeGame.RemoveWatcher(APlayer: TPlayer);
+	begin
+	Lock.Acquire;
+		try
+		Watchers.Remove(APlayer);
+
+		finally
+		Lock.Release;
+		end;
+	end;
+
+// TileDelta (mcPlay/$09) - payload is [count, (row, col, tile) * count].
+// General wire shape for "these cells changed" - Tick (below) is its
+// first caller (the attract-mode bounce), but any future per-tick
+// gameplay update rides the same message. Not gated on Watchers itself;
+// callers are expected to only call this per-Watcher (see Tick).
+procedure TSnakeGame.SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TTileDelta);
+	var
+	m: TBaseMessage;
+	i: Integer;
+
+	begin
+	m:= TBaseMessage.Create;
+	m.Category:= mcPlay;
+	m.Method:= $09;
+
+	SetLength(m.Data, 1 + Length(ADeltas) * 3);
+	m.Data[0]:= Length(ADeltas);
+
+	for i:= 0 to High(ADeltas) do
+		begin
+		m.Data[1 + i * 3]:= ADeltas[i].Row;
+		m.Data[1 + i * 3 + 1]:= ADeltas[i].Col;
+		m.Data[1 + i * 3 + 2]:= ADeltas[i].Tile;
+		end;
+
+	APlayer.AddSendMessage(m);
+	end;
+
+// The demo circuit - the interior rectangle, one cell inside the wall
+// border. The original's snakeMenu() hard-codes the equivalent numbers
+// for its own 28x16 playfield (1/26 horizontally, 1/14 vertically);
+// deriving them from the board size instead means the vertical growth
+// to 20 rows needed no change here at all.
+const
+	DEMO_LEFT   = 1;
+	DEMO_RIGHT  = BOARD_COLS - 2;
+	DEMO_TOP    = 1;
+	DEMO_BOTTOM = BOARD_ROWS - 2;
+
+procedure TSnakeGame.InitDemoSnakes;
+	var
+	i, s: Integer;
+
+	begin
+	// Snake 1 runs along the bottom edge heading right, snake 2 along the
+	// top edge heading left - both on the SAME circuit in the same
+	// rotational direction, started half a lap apart, exactly as the
+	// original's initSnakes lays them out. That's why they can chase each
+	// other forever without ever meeting.
+	DemoSnakes[0].Len:= DEMO_SNAKE_LEN;
+	DemoSnakes[0].Dir:= sdRight;
+	DemoSnakes[0].MoveTick:= 0;
+	DemoSnakes[0].HeadTile:= TILE_SNAKE1_HEAD;
+	DemoSnakes[0].BodyTile:= TILE_SNAKE1;
+
+	for i:= 0 to DEMO_SNAKE_LEN - 1 do
+		begin
+		DemoSnakes[0].Body[i].Row:= DEMO_BOTTOM;
+		DemoSnakes[0].Body[i].Col:= DEMO_LEFT + DEMO_SNAKE_LEN - 1 - i;
+		end;
+
+	DemoSnakes[1].Len:= DEMO_SNAKE_LEN;
+	DemoSnakes[1].Dir:= sdLeft;
+	DemoSnakes[1].MoveTick:= 0;
+	DemoSnakes[1].HeadTile:= TILE_SNAKE2_HEAD;
+	DemoSnakes[1].BodyTile:= TILE_SNAKE2;
+
+	for i:= 0 to DEMO_SNAKE_LEN - 1 do
+		begin
+		DemoSnakes[1].Body[i].Row:= DEMO_TOP;
+		DemoSnakes[1].Body[i].Col:= DEMO_RIGHT - DEMO_SNAKE_LEN + 1 + i;
+		end;
+
+	// Paint both onto Board itself, not just into the snake state - a
+	// client syncing via SendBoardRows has to see the same thing a
+	// TileDelta would have told it (see Board's own comment).
+	for s:= 0 to High(DemoSnakes) do
+		for i:= 0 to DemoSnakes[s].Len - 1 do
+			with DemoSnakes[s].Body[i] do
+				if  i = 0 then
+					Board[Row][Col]:= DemoSnakes[s].HeadTile
+				else
+					Board[Row][Col]:= DemoSnakes[s].BodyTile;
+	end;
+
+procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	i, s: Integer;
+	head: TSnakeSeg;
+
+	// Record one changed cell into both Board and the outgoing delta
+	// list. Silently drops the delta if the caller's array is full -
+	// Board stays authoritative either way, so the worst case is a cell
+	// that looks stale until the next full sync, not a desync.
+	procedure Emit(ARow, ACol, ATile: Byte);
+		begin
+		Board[ARow][ACol]:= ATile;
+
+		if  ADeltaCount <= High(ADeltas) then
+			begin
+			ADeltas[ADeltaCount].Row:= ARow;
+			ADeltas[ADeltaCount].Col:= ACol;
+			ADeltas[ADeltaCount].Tile:= ATile;
+			Inc(ADeltaCount);
+			end;
+		end;
+
+	begin
+	for s:= 0 to High(DemoSnakes) do
+		begin
+		// Per-snake countdown, not one shared timer - the original does
+		// the same (objectsTick), which is what will let food speed-ups
+		// give one snake a different pace from the other later.
+		if  DemoSnakes[s].MoveTick > 0 then
+			begin
+			Dec(DemoSnakes[s].MoveTick);
+			Continue;
+			end;
+
+		DemoSnakes[s].MoveTick:= SNAKE_MOVE_TICKS - 1;
+
+		// The whole demo AI, straight out of the original's snakeMenu():
+		// turn only when the head is sitting exactly on a circuit corner.
+		head:= DemoSnakes[s].Body[0];
+
+		if  (head.Row = DEMO_BOTTOM) and (head.Col = DEMO_LEFT) then
+			DemoSnakes[s].Dir:= sdRight
+		else if (head.Row = DEMO_BOTTOM) and (head.Col = DEMO_RIGHT) then
+			DemoSnakes[s].Dir:= sdUp
+		else if (head.Row = DEMO_TOP) and (head.Col = DEMO_RIGHT) then
+			DemoSnakes[s].Dir:= sdLeft
+		else if (head.Row = DEMO_TOP) and (head.Col = DEMO_LEFT) then
+			DemoSnakes[s].Dir:= sdDown;
+
+		case DemoSnakes[s].Dir of
+			sdUp:    Dec(head.Row);
+			sdDown:  Inc(head.Row);
+			sdLeft:  Dec(head.Col);
+			sdRight: Inc(head.Col);
+			end;
+
+		// Tail vacates first, so a snake exactly as long as the circuit
+		// still can't collide with the cell it's about to leave.
+		with DemoSnakes[s].Body[DemoSnakes[s].Len - 1] do
+			Emit(Row, Col, TILE_FLOOR);
+
+		for i:= DemoSnakes[s].Len - 1 downto 1 do
+			DemoSnakes[s].Body[i]:= DemoSnakes[s].Body[i - 1];
+
+		// Body[1] is the old head - it stops being the head this step, so
+		// it has to be repainted as a body segment. Cheap now (both
+		// render as $A0) but essential once the head has its own
+		// direction tiles.
+		with DemoSnakes[s].Body[1] do
+			Emit(Row, Col, DemoSnakes[s].BodyTile);
+
+		DemoSnakes[s].Body[0]:= head;
+		Emit(head.Row, head.Col, DemoSnakes[s].HeadTile);
+		end;
+	end;
+
+procedure TSnakeGame.Tick;
+	var
+	claimed: Boolean;
+	i,
+	deltaCount: Integer;
+	deltas: array of TTileDelta;
+
+	begin
+	// 3 cells per moving snake (tail vacated, old head demoted to body,
+	// new head), so 6 with both moving on the same tick - rounded up for
+	// headroom. TickDemoSnakes drops anything past the end rather than
+	// overrunning, so this is a ceiling, not an assumption.
+	SetLength(deltas, 8);
+	Lock.Acquire;
+		try
+		claimed:= False;
+		for i:= 0 to 3 do
+			if Assigned(Slots[i].Player) then
+				claimed:= True;
+
+		// Attract/demo mode is "0 corners claimed", not a separate
+		// TGameState value (see the project's own design-decision
+		// notes) - once a slot-claim protocol exists, a corner being
+		// claimed mid-lap will just stop new deltas going out; nothing
+		// currently resets whatever a client last drew, since there's
+		// no way to claim a slot yet to actually exercise that case
+		// (button_detail_start0-3 are still TODO stubs).
+		if not claimed then
+			begin
+			deltaCount:= 0;
+
+			TickDemoSnakes(deltas, deltaCount);
+
+			// Nothing moved this tick (both snakes still counting down
+			// to their next step) - don't send an empty broadcast.
+			if deltaCount = 0 then
+				Exit;
+
+			// Each watcher sent individually inside its own try/except - a
+			// stale watcher whose connection died without a clean WatchStop
+			// (e.g. a client that crashed mid-test) must not be able to
+			// throw here and kill TSnakeTickThread.Execute permanently,
+			// which has no exception handling of its own and would
+			// otherwise silently stop ticking for every watcher, forever,
+			// with no crash visible anywhere (root-caused 2026-08-24 after
+			// exactly one TileDelta message got through, then nothing -
+			// see the client-side gameDeltaMsgCount diagnostic).
+			for i:= 0 to Watchers.Count - 1 do
+				try
+				SendTileDeltas(Watchers[i], Copy(deltas, 0, deltaCount));
+
+				except
+				on E: Exception do
+					AddLogMessage(slkError, 'Tick: SendTileDeltas failed for watcher - ' +
+							E.Message);
+				end;
+			end;
+
+		finally
+		Lock.Release;
+		end;
 	end;
 
 class function TSnakeGame.Name: AnsiString;
@@ -1742,6 +2253,17 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 
 	begin
 	if  AMessage.Category = mcPlay then
+		begin
+		// FIXME: this still expects chess's old RoomPeer-shaped payload
+		// ([room, sender, message], method 4) and matches it against
+		// Desc, but the client (clientSendGameChat, fw_ctrls_net.s) was
+		// since corrected to send plain text only on method $0E with no
+		// room-name field, since ProcessPlayerMessage is only ever
+		// reached for players already in this game - see the comment on
+		// clientSendGameChat. The two ends currently don't agree, so
+		// chat doesn't actually work end-to-end yet - flagged for a
+		// follow-up pass, deliberately not fixed as a drive-by here
+		// since it's a separate concern from the board-row protocol.
 		if  AMessage.Method = 4 then
 			begin
 			// Game chat - broadcast to everyone in the zone (spectators
@@ -1768,7 +2290,53 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 					FPlayers.UnlockList;
 					end;
 				end;
+			end
+		else if  AMessage.Method = $0A then
+			begin
+			// BoardRowsReq - client asks for 2 rows of the board, starting
+			// at AMessage.Data[0]. Row-paginated full-board sync (see
+			// SendBoardRows) rather than one big snapshot message, to
+			// stay under the 254-byte payload cap. Silently ignores a
+			// malformed/out-of-range request rather than erroring back -
+			// this is an internal protocol driven entirely by our own
+			// client code, not user-typed input, so there's nothing
+			// meaningful to report if it's ever wrong.
+			AHandled:= True;
+
+			if  (Length(AMessage.Data) >= 1)
+			and (AMessage.Data[0] <= BOARD_ROWS - 2)
+			and (AMessage.Data[0] mod 2 = 0) then
+				begin
+				Lock.Acquire;
+					try
+					SendBoardRows(APlayer, AMessage.Data[0]);
+
+					finally
+					Lock.Release;
+					end;
+				end;
+			end
+		else if  AMessage.Method = $0C then
+			begin
+			// WatchStart - client is telling us its UI just switched to
+			// the board page (page_detail). Doesn't push anything itself
+			// - the client independently (re)starts its own row-fetch
+			// sync the moment it starts watching (see gamePollTick,
+			// snake_game.s) - this just adds APlayer to Watchers so the
+			// future per-tick delta broadcast knows to include them.
+			AHandled:= True;
+
+			AddWatcher(APlayer);
+			end
+		else if  AMessage.Method = $0D then
+			begin
+			// WatchStop - client's UI just left the board page. See
+			// WatchStart above.
+			AHandled:= True;
+
+			RemoveWatcher(APlayer);
 			end;
+		end;
 
 	// TODO: slot-claim (press-start-on-one-of-4-corners), direction input,
 	// and the dirty-cell board-delta broadcast all go here once the
@@ -1825,6 +2393,14 @@ procedure TSnakeGame.Remove(APlayer: TPlayer);
 			SlotStatusToEveryone;
 			end;
 
+		// Leaving the zone entirely also means no longer watching -
+		// unconditional (not just when s > -1), since a bare spectator
+		// who never claimed a corner can still have been watching.
+		// Already under Lock here, so this reaches into Watchers
+		// directly rather than via RemoveWatcher (which would just
+		// re-acquire the same Lock).
+		Watchers.Remove(APlayer);
+
 		finally
 		Lock.Release;
 		end;
@@ -1870,16 +2446,113 @@ procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
     APlayer.AddSendMessage(m);
 	end;
 
+// BoardRowsData (mcPlay/$0B) - reply to a client's BoardRowsReq
+// (mcPlay/$0A, see ProcessPlayerMessage). AStartRow must be even and in
+// range 0..BOARD_ROWS-2 - the caller (ProcessPlayerMessage) is
+// responsible for validating/clamping, this just trusts it. Payload is
+// [AStartRow, 30 bytes of row AStartRow, 30 bytes of row AStartRow+1] -
+// 61 bytes total, comfortably under the 254-byte cap even with room to
+// grow. Two rows/message was the user's own call (2026-08-24), over
+// 1 row (simpler but slower to fully sync) or more than 2 (marginal
+// speed gain, not worth the complexity).
+procedure TSnakeGame.SendBoardRows(APlayer: TPlayer; AStartRow: Integer);
+	var
+	m: TBaseMessage;
+	c: Integer;
+
+	begin
+	m:= TBaseMessage.Create;
+	m.Category:= mcPlay;
+	m.Method:= $0B;
+
+	SetLength(m.Data, 1 + BOARD_COLS * 2);
+	m.Data[0]:= AStartRow;
+
+	for c:= 0 to BOARD_COLS - 1 do
+		begin
+		m.Data[1 + c]:= Board[AStartRow][c];
+		m.Data[1 + BOARD_COLS + c]:= Board[AStartRow + 1][c];
+		end;
+
+	APlayer.AddSendMessage(m);
+	end;
+
 procedure TPlayZone.Add(APlayer: TPlayer);
 	begin
 	inherited;
 
 	end;
 
+type
+	// TSnakeTickThread - paces TPlayZone.Tick at TICK_MS via
+	// GetTickCount64 (SysUtils - FPC's portable monotonic ms source,
+	// implemented per-platform under the hood, unlike Now/DateUtils -
+	// see the project's own earlier design-decision notes on server
+	// timing). Entirely implementation-local: nothing outside this unit
+	// needs the concrete type, TPlayZone only stores it as a plain
+	// TThread (see FTickThread's own comment).
+	TSnakeTickThread = class(TThread)
+	protected
+		procedure Execute; override;
+
+	public
+		Zone: TPlayZone;
+	end;
+
+procedure TSnakeTickThread.Execute;
+	var
+	nextTick,
+	now: QWord;
+
+	begin
+	{$IFDEF WINDOWS}
+	// 1ms timer resolution for as long as we're ticking - see the
+	// timeBeginPeriod comment at the top of the implementation section.
+	timeBeginPeriod(1);
+	try
+	{$ENDIF}
+
+	nextTick:= GetTickCount64 + TICK_MS;
+
+	while not Terminated do
+		begin
+		now:= GetTickCount64;
+
+		if now >= nextTick then
+			begin
+			// Advance the deadline by exactly one period rather than
+			// re-basing it on 'now'. Re-basing (which this did until
+			// 2026-08-24) silently absorbs every overshoot, so the real
+			// rate is always slower than TICK_MS asks for and the error
+			// never gets corrected - that was the other half of the 5%
+			// shortfall measured on hardware.
+			nextTick:= nextTick + TICK_MS;
+
+			// ...but don't let a long stall turn into a burst of
+			// catch-up ticks. If we're more than a few periods behind
+			// (debugger break, machine sleep), give up on the lost time
+			// and re-base.
+			if now > (nextTick + TICK_MS * 4) then
+				nextTick:= now + TICK_MS;
+
+			Zone.Tick;
+			end
+		else
+			Sleep(nextTick - now);
+		end;
+
+	{$IFDEF WINDOWS}
+	finally
+	timeEndPeriod(1);
+	end;
+	{$ENDIF}
+	end;
+
 constructor TPlayZone.Create;
 	var
 	i: Integer;
 	g: TSnakeGame;
+	t: TSnakeTickThread;
 
 	begin
 	inherited;
@@ -1898,6 +2571,27 @@ constructor TPlayZone.Create;
 
 		FGames.Add(g);
 		end;
+
+	t:= TSnakeTickThread.Create(True);
+	t.FreeOnTerminate:= False;
+	t.Zone:= Self;
+	FTickThread:= t;
+	t.Start;
+	end;
+
+procedure TPlayZone.Tick;
+	var
+	i: Integer;
+
+	begin
+	with FGames.LockList do
+		try
+		for i:= 0 to Count - 1 do
+			Items[i].Tick;
+
+		finally
+		FGames.UnlockList;
+		end;
 	end;
 
 destructor TPlayZone.Destroy;
@@ -1905,6 +2599,10 @@ destructor TPlayZone.Destroy;
 	i: Integer;
 
 	begin
+	FTickThread.Terminate;
+	FTickThread.WaitFor;
+	FTickThread.Free;
+
 	with FGames.LockList do
 		try
 		for i:= Count - 1 downto 0 do

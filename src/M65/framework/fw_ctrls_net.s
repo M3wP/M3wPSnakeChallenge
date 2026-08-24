@@ -27,12 +27,25 @@ main:
 		JSR	ctrlsPageSelect
 
 	
-@loop:						
+@loop:
 		CLI
+
+;	GAME HOOK: gamePollTick - called once per main-loop iteration
+;	(so, very often - many times per frame, not once per frame or once
+;	per game tick), unconditionally, regardless of connection state.
+;	Cheap no-op by default; a game uses it for lightweight periodic
+;	polling that isn't naturally driven by an incoming message - e.g.
+;	Snake QUADRO's board-row-fetch retry timeout (see snake_game.s),
+;	which needs to notice "haven't heard back in a while" even though
+;	nothing arrived to trigger a check. Keep whatever a game does here
+;	trivial (a flag test, maybe a FRAMECOUNT comparison) - this is not
+;	the place for real per-frame work.
+		JSR	gamePollTick
+
 						;This is where we do our timer
 	.if	DEBUG_RASTERTIME		;	check for TCP keep alives
 		LDA	#$06			;	and any message data sends
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 		LDA	inetproc
@@ -106,7 +119,7 @@ main:
 
 	.if	DEBUG_RASTERTIME
 		LDA	#$02
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 @prepare:					;Normal control life cycle starts
@@ -157,7 +170,7 @@ main:
 @next:
 	.if	DEBUG_RASTERTIME
 		LDA	#$0E
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 @unlock:					;Unlock here...
@@ -215,6 +228,8 @@ inetInitialise:
 		RTS
 
 :
+		JSR	inetSeedLocalPort
+
 		LDA	#INET_PROC_IDLE
 		STA	inetproc
 
@@ -229,6 +244,73 @@ inetInitialise:
 
 		JSR	clientOutputInetConfig
 
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	inetSeedLocalPort - pick a random ephemeral TCP source port.
+;
+;	The stack's LOCAL_PORT (mega-ip/eth.asm) is initialised to $C000 /
+;	49152 and only ever incremented, once per connect attempt - so
+;	every MEGA65 reset restarts from the SAME port. Restart the server
+;	(or reset the client) while a connection is live and that 4-tuple
+;	sits in TIME_WAIT on the server's OS; the next connect after a
+;	reset reuses it exactly and gets an RST back. That was the
+;	intermittent "connect error" the user had been living with,
+;	root-caused 2026-08-24 (ineterrk=$02 / ineterrc=$05, the "peer
+;	actively refused (RST)" code in inetConnect below). Only the FIRST
+;	attempt after a reset could collide, since the stack's own +1 got
+;	the retry through - which is exactly why it looked random.
+;
+;	Seeding from the hardware RNG makes a reset start somewhere new
+;	instead. The high byte is forced into $C0-$FF so the result always
+;	lands in the standard 49152-65535 ephemeral range and can never be
+;	0 or a privileged port. The stack's own per-attempt increment still
+;	works from wherever this starts it, so the retry stays as a second
+;	line of defence.
+;
+;	The RNG ready flag is polled with a bounded retry rather than spun
+;	on: this runs during startup, and hanging the client forever
+;	because a core didn't bring the RNG up would be a much worse
+;	failure than a predictable port. FRAMECOUNT is the fallback - a
+;	free-running frame counter, so by the time init reaches here it
+;	holds a value that at least varies with how long the machine took
+;	to get going, which is all this needs.
+;	USED	.A, .X, .Y
+;-------------------------------------------------------------------------------
+inetSeedLocalPort:
+		JSR	@randbyte
+		AND	#$3F
+		ORA	#$C0				;force into the ephemeral range
+		PHA					;port high byte
+
+		JSR	@randbyte
+		TAX					;port low byte
+
+		PLA
+		JSR	MIP_SET_LOCAL_PORT
+
+		RTS
+
+;	One random byte in .A - from the RNG if it comes ready within the
+;	retry budget, otherwise from FRAMECOUNT. Polled before EVERY byte,
+;	not just the first, since back-to-back reads without re-checking
+;	can hand back the same value.
+@randbyte:
+		LDY	#$00
+@wait:
+		LDA	VAL_M65_RANDRDY
+		AND	#VAL_M65_RAND_NOTRDY
+		BEQ	@ready
+
+		INY
+		BNE	@wait
+
+		LDA	FRAMECOUNT			;never came ready - fall back
+		RTS
+
+@ready:
+		LDA	VAL_M65_RANDOM
 		RTS
 
 
@@ -671,9 +753,9 @@ inetGetNextSend:
 		
 @fail:
 ;		LDA	#$02
-;		STA	vicBrdrClr
+;		STA	VAL_VIC_BRDRCLR
 ;		LDA	#$05
-;		STA	vicBkgdClr
+;		STA	VAL_VIC_BKGDCLR
 ;		
 ;		JMP	mainPanic
 
@@ -833,11 +915,11 @@ inetWaitTxIdle:
 inet_callback:
 ;-------------------------------------------------------------------------------
 	.if	DEBUG_RASTERTIME
-		LDA	vicBrdrClr
+		LDA	VAL_VIC_BRDRCLR
 		PHA
 
 		LDA	#$07
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 		LDA 	#1
@@ -958,7 +1040,7 @@ inet_callback:
 @exit:
 	.if	DEBUG_RASTERTIME
 		PLA
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 	.endif
 
 		RTS
@@ -1024,7 +1106,7 @@ clientNotifyFail:
 		STA	uiflshdly
 		
 		LDA	current_clrs
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 
 		CLI
 
@@ -1085,7 +1167,7 @@ roomLogNotifyUpdate:
 		LDA	#$08
 		STA	uiflshdly
 		LDA	current_clrs
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 		CLI
 
 		RTS
@@ -3176,14 +3258,29 @@ clientHandleReadMsg:
 
 		TAY
 
+;	Y is category*2 (only categories 0-6/mcSystem..mcPlay are valid -
+;	Y in 0..12), used to index clientMsgProcs (7 .word entries, 14
+;	bytes). A garbled category nibble (Y >= 14) would read past the
+;	table and self-modify @branch's operand to a wild address - found
+;	live (2026-08-24) as the cause of a permanently leaked ctrlsLock:
+;	the CPU had fully unwound back to a clean main-loop state (empty
+;	stack), yet ctrlsLock/ctrlsLCnt were stuck at 1 forever after,
+;	freezing all control input while everything else (IRQ, network)
+;	kept running - consistent with a wild JSR target somewhere along
+;	the way executing one RTS too many, eating the frame that would
+;	have returned here to @exit's ctrlsLockRelease. Bail out safely
+;	instead, so a garbled category can never do that.
+		CPY	#$0E
+		BCS	@exit
+
 		LDA	clientMsgProcs, Y
 		STA	@branch + 1
 		LDA	clientMsgProcs + 1, Y
 		STA	@branch + 2
 
 		LDY	#$02
-		STY	imsgdat1	
-		
+		STY	imsgdat1
+
 @branch:
 		JSR	clientHandleReadMsg
 
@@ -3523,8 +3620,174 @@ clientRoomPartChng:
 		BEQ	@exit
 
 		JSR	clientSendRoomPart
-		
+
 @exit:
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	clientPlayJoinedSelf/clientPlayPartedSelf - the page_play equivalent
+;	of clientProcRoomJoinMsg/clientProcRoomPartMsg's button_room_join/
+;	button_room_part toggle above: swap button_play_join/button_play_
+;	part's visible+enabled state, move the active/picked control off
+;	whichever one just got hidden, and enable/disable edit_play_game/
+;	edit_play_pwd to match. Generic UI bookkeeping only - there's no
+;	single mcPlay method every game can rely on to mean "you joined"
+;	(unlike the lobby room, which always uses mcLoby/1), so a game calls
+;	clientPlayJoinedSelf from wherever ITS OWN wire protocol confirms a
+;	successful join (Snake QUADRO uses GameStatus/$06, since
+;	TSnakeGame.Add only sends it on success - see gameProcGameStatusMsg,
+;	snake_game.s) and clientPlayPartedSelf from its own gameResetPlayGame
+;	hook. Chess's originals (clientPlayJoinedSelf/clientResetPlayGame,
+;	chess.s) folded a lot of chess-specific board/turn/colour-authority
+;	resetting into these same two routines - deliberately NOT carried
+;	over here, only the generic button/edit toggle survives.
+;
+;	Found missing entirely during the Snake QUADRO port (2026-08-24) -
+;	chess's originals dispatched off mcPlay/1 and /2 join/part
+;	broadcasts that never got their own client-side handlers rebuilt for
+;	Snake's wire shape, so the join button silently never flipped to
+;	Part. Re-added here as framework since the underlying widgets
+;	(button_play_join/part, edit_play_game/pwd) are page_play's own
+;	generic controls, not anything chess-specific.
+;-------------------------------------------------------------------------------
+	.export	clientPlayJoinedSelf
+clientPlayJoinedSelf:
+;-------------------------------------------------------------------------------
+		JSR	ctrlsLockAcquire
+
+		LDA	#<button_play_join
+		STA	elemptr0
+		LDA	#>button_play_join
+		STA	elemptr0 + 1
+
+		LDA	#STATE_VISIBLE
+		JSR	ctrlsExcludeState
+		LDA	#STATE_ENABLED
+		JSR	ctrlsExcludeState
+
+		LDA	#<button_play_part
+		STA	elemptr0
+		LDA	#>button_play_part
+		STA	elemptr0 + 1
+
+		LDA	#STATE_VISIBLE
+		JSR	ctrlsIncludeState
+		LDA	#STATE_ENABLED
+		JSR	ctrlsIncludeState
+
+		LDA	#<button_play_join
+		CMP	actvCtrl
+		BNE	@tstpick
+
+		LDA	#>button_play_join
+		CMP	actvCtrl + 1
+		BNE	@tstpick
+
+		JSR	ctrlsActivateCtrl
+
+@tstpick:
+		LDA	#<button_play_join
+		CMP	pickCtrl
+		BNE	@cont
+
+		LDA	#>button_play_join
+		CMP	pickCtrl + 1
+		BNE	@cont
+
+		LDA	#$00
+		STA	pickCtrl
+		STA	pickCtrl + 1
+
+@cont:
+		LDA	#<edit_play_game
+		STA	elemptr0
+		LDA	#>edit_play_game
+		STA	elemptr0 + 1
+
+		LDA	#STATE_ENABLED
+		JSR	ctrlsExcludeState
+
+		LDA	#<edit_play_pwd
+		STA	elemptr0
+		LDA	#>edit_play_pwd
+		STA	elemptr0 + 1
+
+		LDA	#STATE_ENABLED
+		JSR	ctrlsExcludeState
+
+		JSR	ctrlsLockRelease
+
+		RTS
+
+
+	.export	clientPlayPartedSelf
+clientPlayPartedSelf:
+;-------------------------------------------------------------------------------
+		JSR	ctrlsLockAcquire
+
+		LDA	#<button_play_part
+		STA	elemptr0
+		LDA	#>button_play_part
+		STA	elemptr0 + 1
+
+		LDA	#STATE_VISIBLE
+		JSR	ctrlsExcludeState
+		LDA	#STATE_ENABLED
+		JSR	ctrlsExcludeState
+
+		LDA	#<button_play_join
+		STA	elemptr0
+		LDA	#>button_play_join
+		STA	elemptr0 + 1
+
+		LDA	#STATE_VISIBLE
+		JSR	ctrlsIncludeState
+		LDA	#STATE_ENABLED
+		JSR	ctrlsIncludeState
+
+		LDA	#<button_play_part
+		CMP	actvCtrl
+		BNE	@tstpick
+
+		LDA	#>button_play_part
+		CMP	actvCtrl + 1
+		BNE	@tstpick
+
+		JSR	ctrlsActivateCtrl
+
+@tstpick:
+		LDA	#<button_play_part
+		CMP	pickCtrl
+		BNE	@cont
+
+		LDA	#>button_play_part
+		CMP	pickCtrl + 1
+		BNE	@cont
+
+		LDA	#$00
+		STA	pickCtrl
+		STA	pickCtrl + 1
+
+@cont:
+		LDA	#<edit_play_game
+		STA	elemptr0
+		LDA	#>edit_play_game
+		STA	elemptr0 + 1
+
+		LDA	#STATE_ENABLED
+		JSR	ctrlsIncludeState
+
+		LDA	#<edit_play_pwd
+		STA	elemptr0
+		LDA	#>edit_play_pwd
+		STA	elemptr0 + 1
+
+		LDA	#STATE_ENABLED
+		JSR	ctrlsIncludeState
+
+		JSR	ctrlsLockRelease
+
 		RTS
 
 
@@ -4550,6 +4813,60 @@ dmaCopyRow:
 
 
 ;-------------------------------------------------------------------------------
+;	dmaCopyRow16 - dmaCopyRow plus dmaFillRow's own dest-skip=2 trick:
+;	copies dmaCnt bytes from dmaSrc, one per destination CELL rather
+;	than one per destination byte, landing each source byte in the low
+;	byte of a 16-bit screen cell (dmaDst pointed at column 0's low
+;	byte) or, with dmaDst pointed one byte later, the high byte of a
+;	16-bit colour cell (see STCOLR16's own layout note) - the other
+;	byte of each cell is left untouched either way. Lets a whole board
+;	row of varying per-cell tile chars or colours go in as one DMA
+;	burst instead of a STCELL16/STCOLR16 loop - see gameDrawBoardRows,
+;	snake_game.s, added alongside this routine (2026-08-24) once board
+;	tiles needed per-cell colour, not just per-cell character.
+;	IN	dmaSrc		source address (dmaCnt plain, non-interleaved bytes)
+;	IN	dmaDst		destination address (already row + column-0 selected)
+;	IN	dmaDstBank	destination bank (screen/colour RAM is bank 1)
+;	IN	dmaCnt		byte count (1-255) = number of CELLS, not bytes
+;	USED	.A
+;-------------------------------------------------------------------------------
+dmaCopyRow16:
+;-------------------------------------------------------------------------------
+		LDA	dmaCnt
+		STA	@cnt
+		LDA	dmaSrc
+		STA	@src
+		LDA	dmaSrc + 1
+		STA	@src + 1
+		LDA	dmaDst
+		STA	@dst
+		LDA	dmaDst + 1
+		STA	@dst + 1
+		LDA	dmaDstBank
+		STA	@dstbank
+
+		STA	$D707
+;	Dest skip = 2 - only every other destination byte gets written,
+;	same trick as dmaFillRow (EXPERIMENTAL - verify on hardware).
+		.byte	$85, $02
+		.byte	$00		;end of job options
+		.byte	$00		;copy
+@cnt:		
+    .byte	$00
+		.byte	$00		;count hi (row copies are always < 256 bytes)
+@src:		
+    .word	$0000
+		.byte	$00		;src bank
+@dst:		
+    .word	$0000
+@dstbank:		
+    .byte	$00		;dst bank
+		.byte	$00		;cmd hi
+		.word	$0000		;modulo/ignored
+
+		RTS
+
+;-------------------------------------------------------------------------------
 screenRectSetColour:
 ;	IN	.A		Colour ident
 ;	IN	tempvar_a	x pos
@@ -4886,24 +5203,24 @@ colourSchemeSelect:
 		BPL	@loop
 		
 		LDA	#$00
-		STA	vicBkgdClr
-		STA	vicSprClr0
+		STA	VAL_VIC_BKGDCLR
+		STA	VAL_VIC_SPRCLR0
 		
 		LDY	#$00
 		LDA	current_clrs, Y
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 		
 		INY
 		LDA	current_clrs, Y
-		STA	vicSprClr3		
+		STA	VAL_VIC_SPRCLR3		
 		
 		LDY	#$03
 		LDA	current_clrs, Y
-		STA	vicSprClr1
+		STA	VAL_VIC_SPRCLR1
 
 		LDY	#$06
 		LDA	current_clrs, Y
-		STA	vicSprClr2
+		STA	VAL_VIC_SPRCLR2
 		
 		RTS
 
@@ -5246,9 +5563,9 @@ msgsPushChanging:
 		BNE	@exit
 		
 		LDA	#$02
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 		LDA	#$03
-		STA	vicBkgdClr
+		STA	VAL_VIC_BKGDCLR
 		
 		JMP	mainPanic
 
@@ -5283,9 +5600,9 @@ msgsPushInvalid:
 		BNE	@exit
 		
 		LDA	#$02
-		STA	vicBrdrClr
+		STA	VAL_VIC_BRDRCLR
 		LDA	#$04
-		STA	vicBkgdClr
+		STA	VAL_VIC_BKGDCLR
 
 		JMP	mainPanic
 
@@ -6063,10 +6380,22 @@ ctrlsPageSelect:
 		JSR	screenClearHiBytes
 
 @nohi:
+;	TEMPORARY test (2026-08-24) - the CLI right after this SEI used to
+;	unconditionally re-enable interrupts partway through this routine,
+;	regardless of whether the caller had its own outer SEI it was
+;	relying on staying in effect for the whole ctrlsPageSelect call
+;	(clientMainNextChng, the F7 handler, does exactly that around its
+;	elemptr0 = pageNext write). Plain SEI/CLI isn't ref-counted like
+;	ctrlsLock is - a CLI here silently cancels an outer caller's
+;	protection no matter how many SEIs are stacked. Found while
+;	investigating pageptr0 landing on a bogus address (not any real
+;	page) after a rapid double F7 press - main/@loop's own CLI at the
+;	top of @loop re-enables interrupts again on the very next pass
+;	regardless, so dropping this CLI only lengthens the protected
+;	window, it can't leave interrupts permanently off.
 		SEI
 		LDA	#$01
 		STA	ctrlsPrep
-		CLI
 
 ;	Got a current page?
 
