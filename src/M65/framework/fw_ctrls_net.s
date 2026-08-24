@@ -255,12 +255,11 @@ inetInitialise:
 ;	every MEGA65 reset restarts from the SAME port. Restart the server
 ;	(or reset the client) while a connection is live and that 4-tuple
 ;	sits in TIME_WAIT on the server's OS; the next connect after a
-;	reset reuses it exactly and gets an RST back. That was the
-;	intermittent "connect error" the user had been living with,
-;	root-caused 2026-08-24 (ineterrk=$02 / ineterrc=$05, the "peer
-;	actively refused (RST)" code in inetConnect below). Only the FIRST
-;	attempt after a reset could collide, since the stack's own +1 got
-;	the retry through - which is exactly why it looked random.
+;	reset reuses it exactly and gets an RST back (ineterrk=$02 /
+;	ineterrc=$05, the "peer actively refused (RST)" code in inetConnect
+;	below). Only the FIRST attempt after a reset could collide, since
+;	the stack's own +1 got the retry through - which is exactly why it
+;	looked random.
 ;
 ;	Seeding from the hardware RNG makes a reset start somewhere new
 ;	instead. The high byte is forced into $C0-$FF so the result always
@@ -268,6 +267,13 @@ inetInitialise:
 ;	0 or a privileged port. The stack's own per-attempt increment still
 ;	works from wherever this starts it, so the retry stays as a second
 ;	line of defence.
+;
+;	NOTE: seeding alone did NOT fix the refusals - they kept happening
+;	afterwards. tcp_connect was overwriting LOCAL_PORT with the
+;	byte-swapped DESTINATION port on every attempt, so the seed never
+;	survived to reach the wire and the source port was a fixed 13134
+;	regardless. That is fixed at tcp_connect; this seeding is what
+;	makes the port genuinely per-boot now.
 ;
 ;	The RNG ready flag is polled with a bounded retry rather than spun
 ;	on: this runs during startup, and hanging the client forever
@@ -8900,10 +8906,9 @@ TIMEOUT_HI:
 TIMEOUT_FRAME_LAST:     
     .byte 0
 
-PORT_LO:
-    .byte 0
-PORT_HI:
-    .byte 0
+;	PORT_LO/PORT_HI removed - their only use was tcp_connect's bogus
+;	MIP_SET_LOCAL_PORT call (see there). The names were backwards too:
+;	PORT_HI was stored from .A, which is the LOW byte.
 
 ETH_TEMP_A:
     .byte $00
@@ -9068,25 +9073,38 @@ TCP_CONNECT_FAIL_BAD_SYNACK:
 ;	.import tcp_connect
 tcp_connect:
 
-;  huh?
-
+;	In: .A/.X = destination port, little-endian (.A low, .X high) - the
+;	order LDAX leaves it in. The stack stores ports in network order, so
+;	the two are swapped on the way into MIP_SET_REMOTE_PORT, which does
+;	a plain "sta REMOTE_PORT+0 / stx REMOTE_PORT+1" with REMOTE_PORT+0
+;	being the HIGH byte.
+;
+;	This used to also call MIP_SET_LOCAL_PORT with the same value, which
+;	set our SOURCE port to the DESTINATION port - and passed it through
+;	unswapped, so the source port became the byte-swapped destination:
+;	19763 ($4D33) came out as $334D, which the stack's own per-attempt
+;	increment then made 13134. Every client, every boot, connected from
+;	the same source port.
+;
+;	That is what made the intermittent "connect error" (ineterrc=$05,
+;	peer RST) intermittent-looking. A fixed source port means a fixed
+;	4-tuple, so restarting the server while a client was live left that
+;	exact tuple in TIME_WAIT on the server's OS and the next connect got
+;	RST'd; the retry only worked because the stack's +1 moved it. It is
+;	also why seeding LOCAL_PORT from the hardware RNG in
+;	inetSeedLocalPort appeared to do nothing - this ran afterwards and
+;	overwrote the seed every single time.
+;
+;	LOCAL_PORT needs no setting here at all: inetSeedLocalPort picks the
+;	ephemeral port at init and ETH_TCP_CONNECT_START advances it per
+;	attempt.
     STA STAGE_ARG_X_VAR
-    STA PORT_HI
     STX STAGE_ARG_A_VAR
-    STX PORT_LO
 
     LDA STAGE_ARG_A_VAR
     LDX STAGE_ARG_X_VAR
 
     JSR MIP_SET_REMOTE_PORT
-    
-    LDA PORT_HI
-    LDX PORT_LO
-
-    LDY #$00
-    LDZ #$00
-
-    JSR MIP_SET_LOCAL_PORT
 
     LDA #<CONNECT_TIMEOUT_FRAMES
     STA TIMEOUT_LO

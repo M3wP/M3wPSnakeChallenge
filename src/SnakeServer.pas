@@ -36,6 +36,16 @@ const
 	// TSnakeGame.DemoSnakes is declared in the type block below.
 	SNAKE_PLAYER_COUNT = 4;
 
+	// How many lava pools a wave seeds, and the hard ceiling on cells in
+	// one pool. Up here for the same reason again - TDemoLava's cell
+	// array and TSnakeGame.DemoLava both need them in scope. The
+	// reasoning behind the VALUES sits with the lava constants below.
+	//
+	// The CAP is only the array bound. What a pool actually grows to
+	// scales with difficulty - see LavaMaxCells.
+	DEMO_LAVA_SEEDS = 2;
+	DEMO_LAVA_CELLS_CAP = 32;
+
 type
 
 	{ TServerDispatcher }
@@ -257,7 +267,48 @@ type
 		// Which of the 4 players this snake renders as (0-3) - decides
 		// its colours client-side, via SnakeTile.
 		Player: Integer;
+
+		// Ticks of invulnerability left, and whether the body is
+		// CURRENTLY painted in the flash tile. FlashOn is the painted
+		// state, not the wanted one: comparing the two is what decides
+		// whether a repaint has to go out this tick, so the body is only
+		// re-emitted when the phase actually flips (or the burst ends)
+		// rather than every tick. The original's equivalent is
+		// invun/invunTicks (initSnakes, snakeInvunExp).
+		InvunTicks: Integer;
+		FlashOn: Boolean;
 	end;
+
+	// Which mechanic the attract reel is currently showing off. See
+	// DEMO_WAVE_FIRST/LAST - the reel runs the implemented span of this
+	// in order and then wraps.
+	TDemoWave = (dwLava, dwBees, dwFood);
+
+	// A lava pool's life: creep outward, sit at full extent, drain back.
+	// dlpIdle is the beat between waves.
+	TDemoLavaPhase = (dlpIdle, dlpGrow, dlpHold, dlpRecede);
+
+	// One spreading lava pool. Cells are kept in CREATION ORDER, which
+	// is doing three jobs at once: it fixes each cell's colour tier, it
+	// makes recession newest-first (just walk backwards), and it means
+	// the whole pool is one flat array with no per-cell bookkeeping.
+	TDemoCell = record
+		Row, Col: Byte;
+	end;
+
+	TDemoLava = record
+		Cells: array[0..DEMO_LAVA_CELLS_CAP - 1] of TDemoCell;
+		Count: Integer;
+	end;
+
+	// The original's tGAMEDIFFICULTY (server.lua), ordinals and all:
+	// training = 0 .. expert = 4. Difficulty seeds the level
+	// progression rather than being consulted directly - the original
+	// does `iLevelProgress = iGameDifficulty` and then increments
+	// iLevelProgress per level cleared, so starting on hard and
+	// reaching level 2 on normal are the same difficulty of level.
+	// Hazard scaling reads the PROGRESS, never this.
+	TGameDifficulty = (gdTraining, gdEasy, gdNormal, gdHard, gdExpert);
 
 	TSnakeGame = class(TZone)
 	public
@@ -314,6 +365,37 @@ type
 		// iGameMode = tGAMEMODE.attract, driven by snakeMenu).
 		DemoSnakes: array[0..SNAKE_PLAYER_COUNT - 1] of TDemoSnake;
 
+		// Ticks until the next invulnerability burst is handed to a
+		// randomly chosen demo snake. One counter for the whole board,
+		// not one per snake, because only ever ONE snake flashes at a
+		// time - see DEMO_INVUN_TICKS.
+		DemoInvunNext: Integer;
+
+		// This board's difficulty, and the level progression it seeds -
+		// the original's iGameDifficulty / iLevelProgress pair. Hazard
+		// scaling reads LevelProgress (see LavaMaxCells), never
+		// Difficulty directly, so clearing levels makes an easy board
+		// converge on a hard one exactly as the original intends.
+		//
+		// The eventual plan (dengland, 2026-08-24) is that the separate
+		// game boards ARE the difficulty tiers - each one created with
+		// its own starting difficulty and speed, so joining "board3"
+		// means choosing how hard you want it. Deliberately not wired up
+		// yet ("we'll wire that up much later"); every board is normal
+		// for now. Attract mode already renders from these, so once they
+		// do differ, each board's demo advertises what that board plays
+		// like without any further work.
+		Difficulty: TGameDifficulty;
+		LevelProgress: Integer;
+
+		// The attract reel: which mechanic is on stage, where its
+		// animation has got to, and the tick counters driving both.
+		DemoWave: TDemoWave;
+		DemoLava: array[0..DEMO_LAVA_SEEDS - 1] of TDemoLava;
+		DemoLavaPhase: TDemoLavaPhase;
+		DemoLavaStep: Integer;
+		DemoWaveWait: Integer;
+
 		constructor Create; override;
 		destructor  Destroy; override;
 
@@ -342,6 +424,19 @@ type
 		// cells changed to ADeltas.
 		procedure InitDemoSnakes;
 		procedure TickDemoSnakes(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+
+		// Record one changed cell into both Board and the outgoing delta
+		// list. Shared by the snakes and the hazard waves so there is
+		// exactly one place that knows Board is the authority.
+		procedure EmitCell(ARow, ACol, ATile: Byte;
+				var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+
+		// The attract reel - advances whichever hazard wave is on stage.
+		// See TDemoWave.
+		procedure TickDemoWave(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure TickDemoLava(var ADeltas: array of TTileDelta;
 				var ADeltaCount: Integer);
 
 		procedure AddWatcher(APlayer: TPlayer);
@@ -472,7 +567,7 @@ const
 		{$ELSE}
 		//	FPC defines UNIX and DARWIN for macOS, but NOT LINUX, so
 		//	without this macOS would fall through and report itself as
-		//	the generic 'unix' (spotted by the user, 2026-08-24 - "I
+		//	the generic 'unix' (spotted by dengland, 2026-08-24 - "I
 		//	might have forgotten it since I can't build for it at all").
 		//	Untested: there's no Mac here to build on. It's a
 		//	compile-time string choice only, so on every other target
@@ -501,7 +596,7 @@ uses
 // on ~15.6ms boundaries no matter what TICK_MS says. At TICK_MS=166 that
 // meant real periods of 172-187ms (measured client-side at 5.72 steps/sec
 // against a theoretical 6.02), and, worse, an UNEVEN period tick to tick,
-// which is exactly the "it does lurch every now and then" the user saw
+// which is exactly the "it does lurch every now and then" dengland saw
 // on hardware (2026-08-24).
 //
 // timeBeginPeriod(1) drops the system timer to 1ms for the lifetime of
@@ -588,7 +683,7 @@ const
 	// moves on, that cell keeps the identical character and only
 	// changes colour to the body's, making the hand-off invisible.
 	//
-	// This is why the user's character list has one "looking left or
+	// This is why dengland's character list has one "looking left or
 	// right" and one "looking up or down" rather than four facings: a
 	// head running straight is just a straight pipe.
 	SNAKE_ROLE_BODY = 0;
@@ -602,6 +697,40 @@ const
 	// inside the one byte a delta carries. All 48 are reachable: heads
 	// take corner shapes too, one step before they turn. See SnakeTile.
 	TILE_SNAKE_BASE = 3;
+
+	// One MORE block of 6 shapes straight after those 48 (51..56): the
+	// invulnerability flash body, white, shared by all four players.
+	//
+	// The original does the same thing - realiseSnake swaps the body to
+	// a different texture index (5) while invun, rather than recolouring
+	// - but its body has no shapes at all, just one flat texture, so its
+	// flash is a single tile. Ours keeps the connected-pipe shape and
+	// changes only the colour, otherwise a flashing snake would come
+	// apart into disconnected blocks for half of every cycle and undo
+	// the whole point of the pipe rendering.
+	//
+	// One shared block, not one per player: white is white, and the
+	// point of the flash is that it OVERRIDES the player colour.
+	TILE_SNAKE_FLASH_BASE = TILE_SNAKE_BASE
+			+ (SNAKE_PLAYER_COUNT * SNAKE_ROLE_COUNT * SHAPE_COUNT);
+
+	// Spreading lava (57..59), by AGE tier: the cells laid down first are
+	// the hot core, the newest are the cooling crust at the edge. Tier is
+	// fixed when a cell is created and never repainted, so a blob paints
+	// itself into a bullseye as it grows for free - and since it recedes
+	// newest-first, it visibly drains back toward its own bright centre.
+	//
+	// Placeholder colours (yellow/orange/brown heat ramp) - these are
+	// mine, not dengland's, unlike the snake pipe characters. Easy to
+	// respecify: they are three entries in the client's table.
+	TILE_LAVA_BASE = TILE_SNAKE_FLASH_BASE + SHAPE_COUNT;
+	LAVA_TIER_COUNT = 3;
+
+	// Total distinct tile values. The client indexes gameTileChars /
+	// gameTileColrs by raw tile value with NO bounds check (snake_game.s
+	// says so explicitly), so these tables must have exactly this many
+	// entries - if this number changes, they change with it.
+	TILE_COUNT = TILE_LAVA_BASE + LAVA_TIER_COUNT;
 
 
 	// 12 ticks/sec (1000 div 12 = 83ms) as of 2026-08-24 - raised from
@@ -624,7 +753,7 @@ const
 	// ~93.75ms (10.7/sec) and jitter visibly.
 	TICK_MS = 83;
 
-	// Ticks between one demo snake step. The user's own reading of the
+	// Ticks between one demo snake step. dengland's own reading of the
 	// original (2026-08-24): normal play is 3, flat out is 1, and the
 	// DEMO snakes ran at 2 - deliberately a bit quicker than normal
 	// play, which is what makes an attract screen look lively. At
@@ -643,7 +772,7 @@ const
 	// this base, exactly as objectsTick does it.
 	//
 	// Attract mode runs at FAST: quicker than normal play so the demo
-	// looks lively, but never TOP. Both halves are the user's own rules
+	// looks lively, but never TOP. Both halves are dengland's own rules
 	// (2026-08-24), guarded below rather than left to a comment.
 	//
 	// NORMAL and TOP were each run briefly to judge the turn telegraph,
@@ -679,15 +808,158 @@ const
 	// exactly that check.
 	DEMO_SNAKE_MAX_LEN = 10;
 
-	// Starting length of each demo snake. The original's non-battle
-	// initSnakes uses 5; kept at the ceiling here after the turn
-	// telegraph turned out to be hard to READ at 5, on the user's own
-	// diagnosis that the missing part was not seeing the snakes "moving
-	// straight ahead for long enough" rather than not seeing the turn
-	// early enough. A longer body makes the direction of travel legible
-	// at a glance, which is what a turn has to stand out against - and
-	// with it at 10 the telegraph reads clearly ("yes, its there").
-	DEMO_SNAKE_LEN = DEMO_SNAKE_MAX_LEN;
+	// Starting length of each demo snake. Matches the original: attract
+	// mode runs initSnakes(), whose non-battle branch builds 5-segment
+	// bodies (server.lua:588-589).
+	//
+	// This was briefly raised to the ceiling while tuning the turn
+	// telegraph, because a longer body makes the direction of travel
+	// easier to read at a glance and the turn stands out against that.
+	// The telegraph itself is unchanged and correct at either length -
+	// if it ever reads poorly again, the fix is NOT to lengthen the
+	// snakes, and it is not the timing either (three separate attempts
+	// at a longer preview all put the corner in the wrong cell). See
+	// TickDemoSnakes.
+	DEMO_SNAKE_LEN = 5;
+
+	// --- Attract-mode invulnerability showcase ---
+	//
+	// In the ORIGINAL, invulnerability is earned: eating food type 3
+	// sets invun and adds 24 to invunTicks, hard-capped at 30
+	// (snakeCheckEat), and snakes also spawn with 18 ticks of it
+	// (initSnakes). Demo snakes never eat, so none of that fires here.
+	//
+	// So this schedule is a DEMO-ONLY invention to show the effect off,
+	// dengland's rule (2026-08-24): pick a snake at random and
+	// give it a 10-second burst. Note 10s is far longer than anything
+	// the original grants - its 30-tick cap is only 2.5s at TICK_MS=83.
+	// That is fine for an attract screen, whose job is to show you the
+	// mechanic exists; it is NOT the gameplay value, and real play
+	// should use the original's earn-it-and-cap-it rule instead.
+	DEMO_INVUN_TICKS = 10000 div TICK_MS;
+
+	// Quiet gap between bursts, so the flash reads as an EVENT rather
+	// than a permanent state of the attract screen. Nothing in the
+	// original to copy here - it exists only because a demo that is
+	// always flashing somewhere stops drawing the eye.
+	DEMO_INVUN_GAP_TICKS = 6000 div TICK_MS;
+
+	// Ticks per flash half-cycle. 1 = flip every tick, which is what the
+	// original does (realiseSnake: invunTicks % 2) - at TICK_MS=83 that
+	// is a 6Hz flash. Raise to 2 for a slower 3Hz throb if 6 reads as
+	// shimmer rather than flash on real hardware. Only 4 cells flash, so
+	// this is a legibility question, not a brightness one.
+	DEMO_INVUN_FLASH_TICKS = 1;
+
+	// The demo circuit - a rectangle inset TWO cells from the board edge,
+	// i.e. one clear cell between the snakes and the wall (dengland's own
+	// call, 2026-08-24: "can we move them one tile in from the edge
+	// though?"). The original's snakeMenu() hard-codes the equivalent
+	// numbers for its own 28x16 playfield; deriving them from the board
+	// size instead means neither the growth to 20 rows nor this inset
+	// needed anything else changed.
+	//
+	// Declared here rather than beside the rest of the demo geometry
+	// because TSnakeGame.Create needs them for the wall below, and it
+	// comes earlier in the unit.
+	DEMO_INSET  = 2;
+	DEMO_LEFT   = DEMO_INSET;
+	DEMO_RIGHT  = BOARD_COLS - 1 - DEMO_INSET;
+	DEMO_TOP    = DEMO_INSET;
+	DEMO_BOTTOM = BOARD_ROWS - 1 - DEMO_INSET;
+
+	// A short wall across the middle of the circuit's interior, on the
+	// lava seed row and centred between the two pools - see
+	// TSnakeGame.Create. Placed so BOTH pools can reach it by creeping
+	// inward, without either seed landing on it.
+	DEMO_WALL_ROW   = (DEMO_TOP + DEMO_BOTTOM) div 2;
+	DEMO_WALL_HALF  = 3;
+	DEMO_WALL_LEFT  = ((DEMO_LEFT + DEMO_RIGHT) div 2) - DEMO_WALL_HALF;
+	DEMO_WALL_RIGHT = ((DEMO_LEFT + DEMO_RIGHT) div 2) + DEMO_WALL_HALF;
+
+	// --- Attract-mode hazard WAVES ---
+	//
+	// The attract screen runs a demo REEL (dengland, 2026-08-24):
+	// each mechanic gets the stage in turn, then the cycle repeats -
+	// lava, then bees, then food. Nothing like this is in the original,
+	// whose attract mode only ever shows two snakes driving around; it
+	// exists because an attract screen's job is to advertise what the
+	// game HAS, and a mechanic nobody sees might as well not be built.
+	//
+	// Waves are built one at a time. DEMO_WAVE_LAST is the only thing
+	// that needs changing to bring the next one into the rotation - the
+	// cycle runs DEMO_WAVE_FIRST..DEMO_WAVE_LAST, so an unimplemented
+	// wave is simply not in the reel yet rather than dead air on screen.
+	//
+	// DEMO_LAVA_SEEDS (2) and DEMO_LAVA_CELLS_CAP have to be
+	// declared ahead of the type block - see the top of the unit.
+	// DEMO_LAVA_SEEDS = 2 puts one pool either side of centre, which is
+	// dengland's layout for the ATTRACT screen; the seeding code spaces
+	// any count evenly.
+	//
+	// Real play gets ONE pool at a time (dengland, 2026-08-24). Two here
+	// is a showcase decision - it fills the idle board and shows the
+	// spread reading from both sides - not the game rule. Whatever
+	// drives lava in real play should seed a single pool.
+	//
+	// How far a pool spreads, scaled by level progress the same way the
+	// original scales bees (`iLevelBeesMax = 5 + iLevelProgress * 3`).
+	// On the original's 5-point difficulty scale that gives:
+	//
+	//     training 12   easy 14   normal 16   hard 18   expert 20
+	//
+	// which is dengland's own calibration (2026-08-24): expert/"insane"
+	// at 20-21, hard/"bad" three below that, normal two below again.
+	// Progress keeps climbing as levels are cleared, so late levels go
+	// past expert until DEMO_LAVA_CELLS_CAP stops them.
+	DEMO_LAVA_CELLS_BASE = 12;
+	DEMO_LAVA_CELLS_PER_LEVEL = 2;
+
+	// Lava is confined to the INSIDE of the demo circuit, one cell clear
+	// of it, so it can never overwrite a snake. That matters because the
+	// demo has no collision at all: a lava cell landing on a snake would
+	// sit there looking like corruption until that snake's tail happened
+	// to pass over and clear it. Confining it is simpler and more
+	// honest than trying to arbitrate.
+
+	// Ticks between growth (and recession) steps, and how many cells
+	// move per step per blob. The cap is what makes it CREEP rather than
+	// pop, and it also bounds the delta burst: 2 blobs x 2 cells = 4
+	// cells a step, against the 12 the snakes can already produce.
+	//
+	// Was 3 cells every 3 ticks (9 cells/sec) - "spreads a little fast
+	// maybe" (dengland, 2026-08-24). Now 2 every 5, so a pool takes
+	// about 4.5s to reach full extent instead of 2.5s.
+	DEMO_LAVA_STEP_TICKS = 5;
+	DEMO_LAVA_PER_STEP = 2;
+
+	// Spread only from the most recently added cells, not from anywhere
+	// in the pool. Picking a source uniformly means the cells around the
+	// seed keep getting chosen, so the pool fills itself in as a solid
+	// disc - "too dense in the middle" (dengland, 2026-08-24).
+	// Restricting the source to the advancing front makes it creep
+	// outward in lobes and tendrils, which is what actually reads as
+	// spreading rather than inflating.
+	DEMO_LAVA_FRONTIER = 8;
+
+	// Cells of clearance lava keeps from any live snake's HEAD, as a
+	// box (+/- this on both axes) - the original's checkPlaceBee idea,
+	// applied to spreading instead of spawning. 2 matches the original's
+	// figure.
+	//
+	// This does not change anything in the attract demo, where lava is
+	// already confined well inside the circuit and can never come near a
+	// snake. It is here so the rule is correct and in force the moment
+	// lava is let out into real play, rather than being remembered then.
+	DEMO_LAVA_HEAD_CLEAR = 2;
+
+	// How long the pool sits at full extent before draining.
+	DEMO_LAVA_HOLD_TICKS = 3000 div TICK_MS;
+
+	// Gap after a wave finishes, before the next one starts - the same
+	// reasoning as DEMO_INVUN_GAP_TICKS: back-to-back effects read as
+	// noise, a beat of nothing makes each one an event.
+	DEMO_WAVE_GAP_TICKS = 2000 div TICK_MS;
 
 
 
@@ -2054,6 +2326,12 @@ constructor TSnakeGame.Create;
 	Lock:= TCriticalSection.Create;
 	Watchers:= TList<TPlayer>.Create;
 
+	// Every board is normal until boards carry their own difficulty -
+	// see the field declarations. The original seeds progress from
+	// difficulty the same way (`iLevelProgress = iGameDifficulty`).
+	Difficulty:= gdNormal;
+	LevelProgress:= Ord(Difficulty);
+
 	// Placeholder board - a plain bordered room (wall around the edge,
 	// empty floor inside). No real level/tile simulation exists yet
 	// (see the TODO below) - this just gives the row-fetch protocol
@@ -2066,6 +2344,19 @@ constructor TSnakeGame.Create;
 				Board[r][c]:= TILE_WALL
 			else
 				Board[r][c]:= TILE_FLOOR;
+
+	// A short wall across the middle, on the lava seed row and between
+	// the two pools. Demo scaffolding, not a real level: lava has always
+	// refused to spread through anything that is not bare floor, but
+	// with an empty interior there was nothing for it to refuse AT, so
+	// the rule was invisible. dengland asked for something to show the
+	// pattern against (2026-08-24) - a tendril creeping inward along
+	// this row now visibly stops dead and flows around it instead.
+	//
+	// Real level geometry comes from the original's levelGenA..D, which
+	// still need reworking for 4 corners.
+	for c:= DEMO_WALL_LEFT to DEMO_WALL_RIGHT do
+		Board[DEMO_WALL_ROW][c]:= TILE_WALL;
 
 	// Lay the demo snakes onto that board. State starts at gsWaiting (the
 	// TGameState default, Ord 0) - attract/demo mode is "gsWaiting with 0
@@ -2140,20 +2431,7 @@ procedure TSnakeGame.SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TT
 	APlayer.AddSendMessage(m);
 	end;
 
-// The demo circuit - a rectangle inset TWO cells from the board edge,
-// i.e. one clear cell between the snakes and the wall (user's own call,
-// 2026-08-24: "can we move them one tile in from the edge though?").
-// The original's snakeMenu() hard-codes the equivalent numbers for its
-// own 28x16 playfield; deriving them from the board size instead means
-// neither the growth to 20 rows nor this inset needed anything else
-// changed.
 const
-	DEMO_INSET  = 2;
-	DEMO_LEFT   = DEMO_INSET;
-	DEMO_RIGHT  = BOARD_COLS - 1 - DEMO_INSET;
-	DEMO_TOP    = DEMO_INSET;
-	DEMO_BOTTOM = BOARD_ROWS - 1 - DEMO_INSET;
-
 	// Lap length in cells, walking the rectangle's perimeter.
 	DEMO_RUN_H  = DEMO_RIGHT - DEMO_LEFT;
 	DEMO_RUN_V  = DEMO_BOTTOM - DEMO_TOP;
@@ -2174,6 +2452,18 @@ const
 	{$ERROR DEMO_SNAKE_LEN exceeds DEMO_SNAKE_MAX_LEN}
 {$ENDIF}
 
+// A tile value has to fit the single byte a TTileDelta carries, and the
+// client's lookup tables are indexed by it with no bounds check.
+{$IF TILE_COUNT > 256}
+	{$ERROR TILE_COUNT exceeds the one byte a TileDelta tile value has}
+{$ENDIF}
+
+// A burst that rounds to nothing would leave the flash permanently off
+// with no other symptom - TICK_MS could grow enough to do that.
+{$IF DEMO_INVUN_TICKS < 1}
+	{$ERROR DEMO_INVUN_TICKS rounded to zero - check TICK_MS}
+{$ENDIF}
+
 // Tile value for one snake segment - see the SHAPE_*/SNAKE_ROLE_*
 // constants for the encoding.
 function SnakeTile(APlayer, ARole, AShape: Integer): Byte;
@@ -2181,6 +2471,19 @@ function SnakeTile(APlayer, ARole, AShape: Integer): Byte;
 	Result:= TILE_SNAKE_BASE
 			+ (((APlayer * SNAKE_ROLE_COUNT) + ARole) * SHAPE_COUNT)
 			+ AShape;
+	end;
+
+// Tile value for one BODY segment, honouring the invulnerability flash.
+// Only the body ever flashes - the head keeps its own look tile
+// throughout, exactly as the original does it: realiseSnake draws
+// body[1] (the head) from tSnakeLook BEFORE testing invun at all, and
+// the flash loop starts at i = 2.
+function SnakeBodyTile(APlayer, AShape: Integer; AFlashing: Boolean): Byte;
+	begin
+	if  AFlashing then
+		Result:= TILE_SNAKE_FLASH_BASE + AShape
+	else
+		Result:= SnakeTile(APlayer, SNAKE_ROLE_BODY, AShape);
 	end;
 
 // The shape of a cell a snake entered travelling ADirIn and left
@@ -2289,7 +2592,7 @@ procedure CircuitAt(ADist: Integer; out ARow, ACol: Byte; out ADir: TSnakeDir);
 
 procedure TSnakeGame.InitDemoSnakes;
 	var
-	i, s, d, spacing: Integer;
+	b, i, s, d, spacing: Integer;
 	dirIn, dirOut: TSnakeDir;
 	r, c,
 	rPrev, cPrev: Byte;
@@ -2303,11 +2606,27 @@ procedure TSnakeGame.InitDemoSnakes;
 	// shows all four player colours on the attract screen.
 	spacing:= DEMO_LAP div Length(DemoSnakes);
 
+	// Open on a quiet gap rather than an immediate flash - the attract
+	// screen should establish what a normal snake looks like before it
+	// shows one behaving unusually, or the flash reads as the default.
+	DemoInvunNext:= DEMO_INVUN_GAP_TICKS;
+
+	// The reel starts on the first wave, after the same settling beat.
+	DemoWave:= dwLava;
+	DemoLavaPhase:= dlpIdle;
+	DemoLavaStep:= 0;
+	DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
+
+	for b:= 0 to High(DemoLava) do
+		DemoLava[b].Count:= 0;
+
 	for s:= 0 to High(DemoSnakes) do
 		begin
 		DemoSnakes[s].Len:= DEMO_SNAKE_LEN;
 		DemoSnakes[s].MoveTick:= 0;
 		DemoSnakes[s].Player:= s;
+		DemoSnakes[s].InvunTicks:= 0;
+		DemoSnakes[s].FlashOn:= False;
 
 		// Head at its own offset, body trailing back along the circuit.
 		for i:= 0 to DEMO_SNAKE_LEN - 1 do
@@ -2351,39 +2670,97 @@ procedure TSnakeGame.InitDemoSnakes;
 							SNAKE_ROLE_BODY, Shape);
 	end;
 
+// Record one changed cell into both Board and the outgoing delta list.
+// Silently drops the delta if the caller's array is full - Board stays
+// authoritative either way, so the worst case is a cell that looks
+// stale until the next full sync, not a desync.
+procedure TSnakeGame.EmitCell(ARow, ACol, ATile: Byte;
+		var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+	begin
+	Board[ARow][ACol]:= ATile;
+
+	if  ADeltaCount <= High(ADeltas) then
+		begin
+		ADeltas[ADeltaCount].Row:= ARow;
+		ADeltas[ADeltaCount].Col:= ACol;
+		ADeltas[ADeltaCount].Tile:= ATile;
+		Inc(ADeltaCount);
+		end;
+	end;
+
 procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 		var ADeltaCount: Integer);
 	var
 	i, s: Integer;
 	head: TSnakeSeg;
 	prevDir: TSnakeDir;
+	wantFlash, repaint: Boolean;
 
-	// Record one changed cell into both Board and the outgoing delta
-	// list. Silently drops the delta if the caller's array is full -
-	// Board stays authoritative either way, so the worst case is a cell
-	// that looks stale until the next full sync, not a desync.
 	procedure Emit(ARow, ACol, ATile: Byte);
 		begin
-		Board[ARow][ACol]:= ATile;
+		EmitCell(ARow, ACol, ATile, ADeltas, ADeltaCount);
+		end;
 
-		if  ADeltaCount <= High(ADeltas) then
-			begin
-			ADeltas[ADeltaCount].Row:= ARow;
-			ADeltas[ADeltaCount].Col:= ACol;
-			ADeltas[ADeltaCount].Tile:= ATile;
-			Inc(ADeltaCount);
-			end;
+	// Re-emit every BODY segment of snake ASnake at its current flash
+	// phase. Only called when the phase actually flipped (or a burst
+	// started/ended), since the movement path alone never touches
+	// segments behind Body[1] - they'd otherwise keep whatever colour
+	// they were painted with when they were laid down.
+	procedure RepaintBody(ASnake: Integer);
+		var
+		j: Integer;
+
+		begin
+		for j:= 1 to DemoSnakes[ASnake].Len - 1 do
+			with DemoSnakes[ASnake].Body[j] do
+				Emit(Row, Col, SnakeBodyTile(DemoSnakes[ASnake].Player,
+						Shape, DemoSnakes[ASnake].FlashOn));
 		end;
 
 	begin
+	// Hand a fresh burst to a randomly chosen snake when the last one
+	// has run its course and the gap after it has elapsed. One at a
+	// time by construction: the next countdown covers the whole burst
+	// plus the gap, so it can't start a second while one is running.
+	if  DemoInvunNext > 0 then
+		Dec(DemoInvunNext)
+	else
+		begin
+		DemoSnakes[Random(Length(DemoSnakes))].InvunTicks:= DEMO_INVUN_TICKS;
+		DemoInvunNext:= DEMO_INVUN_TICKS + DEMO_INVUN_GAP_TICKS;
+		end;
+
 	for s:= 0 to High(DemoSnakes) do
 		begin
+		// Invulnerability runs on the TICK, not on the step - it has to
+		// count down and flash even on ticks where this snake doesn't
+		// move, so it sits above the MoveTick early-out below. The
+		// original separates them the same way (snakeInvunExp is called
+		// per tick, independently of the moveTick countdown).
+		if  DemoSnakes[s].InvunTicks > 0 then
+			Dec(DemoSnakes[s].InvunTicks);
+
+		wantFlash:= (DemoSnakes[s].InvunTicks > 0)
+				and (((DemoSnakes[s].InvunTicks div DEMO_INVUN_FLASH_TICKS)
+					and 1) = 0);
+
+		// Comparing wanted against painted catches the burst ENDING for
+		// free: InvunTicks hits 0, wantFlash goes False, and the body
+		// gets repainted back to the player's own colour by the same
+		// path that flips it mid-burst.
+		repaint:= wantFlash <> DemoSnakes[s].FlashOn;
+		DemoSnakes[s].FlashOn:= wantFlash;
+
 		// Per-snake countdown, not one shared timer - the original does
 		// the same (objectsTick), which is what will let food speed-ups
 		// give one snake a different pace from the other later.
 		if  DemoSnakes[s].MoveTick > 0 then
 			begin
 			Dec(DemoSnakes[s].MoveTick);
+
+			if  repaint then
+				RepaintBody(s);
+
 			Continue;
 			end;
 
@@ -2419,8 +2796,8 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 		// left travelling the (possibly new) Dir.
 		DemoSnakes[s].Body[1].Shape:= SegShape(prevDir, DemoSnakes[s].Dir);
 		with DemoSnakes[s].Body[1] do
-			Emit(Row, Col, SnakeTile(DemoSnakes[s].Player,
-					SNAKE_ROLE_BODY, Shape));
+			Emit(Row, Col, SnakeBodyTile(DemoSnakes[s].Player, Shape,
+					DemoSnakes[s].FlashOn));
 
 		// Decide the NEXT turn immediately on arrival - the original's
 		// early head turn (user, 2026-08-24: "I wanted the head to turn
@@ -2449,7 +2826,7 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 		// Shape the head by where it came FROM and where it's turning
 		// toward, so it shows the CORNER piece rather than a bare bar
 		// on the new axis, which wouldn't join the body behind it
-		// (user's own correction: "it shouldn't be the new direction so
+		// (dengland's own correction: "it shouldn't be the new direction so
 		// much as the turning into it one... the same that would have
 		// been there for going around the corner, just earlier").
 		//
@@ -2461,6 +2838,292 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 		DemoSnakes[s].Body[0]:= head;
 		Emit(head.Row, head.Col, SnakeTile(DemoSnakes[s].Player,
 				SNAKE_ROLE_HEAD, head.Shape));
+
+		// After the move, so it paints the segments where they now ARE
+		// rather than where they were - and so the tail cell that just
+		// got cleared isn't painted white on its way out.
+		if  repaint then
+			RepaintBody(s);
+		end;
+	end;
+
+// How far one pool spreads at this level progress - see
+// DEMO_LAVA_CELLS_BASE. Clamped to the array bound so a long game can't
+// walk off the end of TDemoLava.Cells.
+function LavaMaxCells(AProgress: Integer): Integer;
+	begin
+	Result:= DEMO_LAVA_CELLS_BASE + AProgress * DEMO_LAVA_CELLS_PER_LEVEL;
+
+	if  Result > DEMO_LAVA_CELLS_CAP then
+		Result:= DEMO_LAVA_CELLS_CAP;
+	end;
+
+// The colour tier for the AGE-th cell of a lava pool. Fixed when the
+// cell is laid down and never repainted: earliest third is the hot
+// core, latest third the cooling crust, so the pool paints itself into
+// a bullseye as it spreads without any repainting at all.
+//
+// Tiered against the pool's ACTUAL extent, not the array bound, or an
+// easy level would come out all core and never show the ramp.
+function LavaTile(AAge, AMax: Integer): Byte;
+	var
+	tier: Integer;
+
+	begin
+	if  AMax < 1 then
+		AMax:= 1;
+
+	tier:= (AAge * LAVA_TIER_COUNT) div AMax;
+
+	if  tier >= LAVA_TIER_COUNT then
+		tier:= LAVA_TIER_COUNT - 1;
+
+	Result:= TILE_LAVA_BASE + tier;
+	end;
+
+procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	b, i, n, tries, grown: Integer;
+	full: Boolean;
+	r, c, maxcells: Integer;
+
+	// True if (ARow, ACol) is too close to any live snake's head for
+	// lava to be allowed to appear there - see the call site.
+	function LavaBlockedNearHead(ARow, ACol: Integer): Boolean;
+		var
+		k: Integer;
+
+		begin
+		Result:= True;
+
+		for k:= 0 to High(DemoSnakes) do
+			with DemoSnakes[k].Body[0] do
+				if  (Abs(ARow - Row) <= DEMO_LAVA_HEAD_CLEAR)
+				and (Abs(ACol - Col) <= DEMO_LAVA_HEAD_CLEAR) then
+					Exit;
+
+		Result:= False;
+		end;
+
+	// Try once to grow pool b by one cell: pick a random cell already in
+	// it and a random orthogonal neighbour. Deliberately NOT a true
+	// Game-of-Life rule - a real one is unpredictable enough to either
+	// die out or run away across the whole board, and neither is what an
+	// attract screen wants. This gives the same organic creeping look
+	// with a hard bound.
+	function GrowOnce(APool: Integer): Boolean;
+		var
+		src: TDemoCell;
+		have, nr, nc: Integer;
+
+		begin
+		Result:= False;
+
+		have:= DemoLava[APool].Count;
+
+		if  have >= maxcells then
+			Exit;
+
+		// Source from the advancing FRONT, not the whole pool - see
+		// DEMO_LAVA_FRONTIER. Cells are in creation order, so the front
+		// is simply the tail of the array.
+		if  have > DEMO_LAVA_FRONTIER then
+			src:= DemoLava[APool].Cells[have - 1 - Random(DEMO_LAVA_FRONTIER)]
+		else
+			src:= DemoLava[APool].Cells[Random(have)];
+		nr:= src.Row;
+		nc:= src.Col;
+
+		case Random(4) of
+			0: Dec(nr);
+			1: Inc(nr);
+			2: Dec(nc);
+		else
+			Inc(nc);
+			end;
+
+		// Stay one clear cell INSIDE the demo circuit - see
+		// DEMO_LAVA_CELLS_BASE's comment for why lava must never be
+		// able to reach a snake.
+		if  (nr <= DEMO_TOP) or (nr >= DEMO_BOTTOM)
+		or (nc <= DEMO_LEFT) or (nc >= DEMO_RIGHT) then
+			Exit;
+
+		// Only ever claim empty floor. This one test is what stops lava
+		// spreading THROUGH walls, over snake bodies and tails, or onto
+		// food - anything that is not bare floor simply refuses it, with
+		// no per-hazard special cases. Cheaper and more robust than
+		// searching our own cell list too.
+		if  Board[nr][nc] <> TILE_FLOOR then
+			Exit;
+
+		// ...but a cell being empty right now is not enough on its own:
+		// lava appearing directly in front of a snake would be an
+		// unavoidable death nobody could have read. Keep clear of every
+		// live head, the way the original keeps bee spawns clear
+		// (checkPlaceBee).
+		//
+		// NOTE the original's rule is not the 5x5 box it looks like:
+		// isOutsideRect ANDs the two axis tests, so it actually blocks
+		// the whole 5-wide row band AND column band through the head, a
+		// cross spanning the board. Fine for a bee, which spawns once -
+		// far too much for lava, which would be locked out of most of
+		// the board by four snakes at once. So this is the box the
+		// original reads as intending.
+		if  LavaBlockedNearHead(nr, nc) then
+			Exit;
+
+		with DemoLava[APool] do
+			begin
+			Cells[Count].Row:= nr;
+			Cells[Count].Col:= nc;
+			EmitCell(nr, nc, LavaTile(Count, maxcells), ADeltas, ADeltaCount);
+			Inc(Count);
+			end;
+
+		Result:= True;
+		end;
+
+	begin
+	// Everything below moves on a STEP, not on every tick - the pool
+	// would otherwise reach full extent in well under a second.
+	if  DemoLavaStep > 0 then
+		begin
+		Dec(DemoLavaStep);
+		Exit;
+		end;
+
+	DemoLavaStep:= DEMO_LAVA_STEP_TICKS - 1;
+
+	// How far the pools spread on THIS board, at its current progress.
+	maxcells:= LavaMaxCells(LevelProgress);
+
+	case DemoLavaPhase of
+	dlpIdle:
+		begin
+		// Seed the pools: DEMO_LAVA_SEEDS of them, evenly spaced across
+		// the middle of the circuit's interior. Two lands them left and
+		// right of centre, which is dengland's layout; the
+		// spacing generalises if that count ever changes.
+		for b:= 0 to High(DemoLava) do
+			begin
+			DemoLava[b].Count:= 0;
+
+			r:= (DEMO_TOP + DEMO_BOTTOM) div 2;
+			c:= DEMO_LEFT
+					+ ((DEMO_RIGHT - DEMO_LEFT) * (2 * b + 1))
+						div (2 * DEMO_LAVA_SEEDS);
+
+			if  Board[r][c] = TILE_FLOOR then
+				begin
+				DemoLava[b].Cells[0].Row:= r;
+				DemoLava[b].Cells[0].Col:= c;
+				DemoLava[b].Count:= 1;
+				EmitCell(r, c, LavaTile(0, maxcells), ADeltas, ADeltaCount);
+				end;
+			end;
+
+		DemoLavaPhase:= dlpGrow;
+		end;
+
+	dlpGrow:
+		begin
+		full:= True;
+
+		for b:= 0 to High(DemoLava) do
+			begin
+			grown:= 0;
+			tries:= 0;
+
+			// Bounded retries, not "keep going until it fits": a pool
+			// hemmed in on all sides would otherwise spin here forever.
+			while (grown < DEMO_LAVA_PER_STEP)
+			and (tries < DEMO_LAVA_PER_STEP * 8) do
+				begin
+				if  GrowOnce(b) then
+					Inc(grown);
+
+				Inc(tries);
+				end;
+
+			if  DemoLava[b].Count < maxcells then
+				full:= False;
+			end;
+
+		if  full then
+			begin
+			DemoLavaPhase:= dlpHold;
+			DemoWaveWait:= DEMO_LAVA_HOLD_TICKS;
+			end;
+		end;
+
+	dlpHold:
+		begin
+		Dec(DemoWaveWait, DEMO_LAVA_STEP_TICKS);
+
+		if  DemoWaveWait <= 0 then
+			DemoLavaPhase:= dlpRecede;
+		end;
+
+	dlpRecede:
+		begin
+		n:= 0;
+
+		// Newest-first, so the pool drains back toward its own bright
+		// centre rather than hollowing out from the middle.
+		for b:= 0 to High(DemoLava) do
+			for i:= 1 to DEMO_LAVA_PER_STEP do
+				if  DemoLava[b].Count > 0 then
+					begin
+					Dec(DemoLava[b].Count);
+
+					// Only clear a cell that is still OURS. Lava writes
+					// its own tiles, so anything else standing there now
+					// means something took the cell over since (a snake
+					// moving through it, once lava is allowed near the
+					// path at all) - and blanking it would erase that
+					// instead, which reads as corruption. Cheap
+					// insurance: the pool just gives the cell up.
+					with DemoLava[b].Cells[DemoLava[b].Count] do
+						if  (Board[Row][Col] >= TILE_LAVA_BASE)
+						and (Board[Row][Col] < TILE_LAVA_BASE + LAVA_TIER_COUNT) then
+							EmitCell(Row, Col, TILE_FLOOR, ADeltas, ADeltaCount);
+
+					Inc(n);
+					end;
+
+		if  n = 0 then
+			begin
+			DemoLavaPhase:= dlpIdle;
+			DemoWave:= dwBees;			// next in the reel
+			DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
+			end;
+		end;
+		end;
+	end;
+
+procedure TSnakeGame.TickDemoWave(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	begin
+	// The beat between waves.
+	if  DemoWaveWait > 0 then
+		begin
+		Dec(DemoWaveWait);
+		Exit;
+		end;
+
+	case DemoWave of
+	dwLava:
+		TickDemoLava(ADeltas, ADeltaCount);
+
+	// Not built yet. Rather than leave dead air on the attract screen,
+	// an unimplemented wave hands straight back to the start of the
+	// reel - so bringing one into rotation means implementing it here
+	// and nothing else.
+	dwBees,
+	dwFood:
+		DemoWave:= dwLava;
 		end;
 	end;
 
@@ -2473,10 +3136,17 @@ procedure TSnakeGame.Tick;
 
 	begin
 	// 3 cells per moving snake (tail vacated, old head demoted to body,
-	// new head), so 12 with all four moving on the same tick - rounded
-	// up for headroom. TickDemoSnakes drops anything past the end rather
-	// than overrunning, so this is a ceiling, not an assumption.
-	SetLength(deltas, 16);
+	// new head), so 12 with all four moving on the same tick. On a tick
+	// where the invulnerability flash also flips phase, the ONE snake
+	// that can be flashing repaints its whole body on top of that -
+	// another DEMO_SNAKE_LEN - 1 cells. The hazard wave adds up to
+	// DEMO_LAVA_SEEDS x DEMO_LAVA_PER_STEP on a step tick. 48 covers
+	// the lot with room to spare, and stays well under the ~70 deltas
+	// that would overflow one TCP payload (the count is a single byte,
+	// but the stack caps a payload at 235 = 1 + 78 x 3).
+	// TickDemoSnakes drops anything past the end rather than
+	// overrunning, so this is a ceiling, not an assumption.
+	SetLength(deltas, 48);
 	Lock.Acquire;
 		try
 		claimed:= False;
@@ -2496,9 +3166,11 @@ procedure TSnakeGame.Tick;
 			deltaCount:= 0;
 
 			TickDemoSnakes(deltas, deltaCount);
+			TickDemoWave(deltas, deltaCount);
 
-			// Nothing moved this tick (both snakes still counting down
-			// to their next step) - don't send an empty broadcast.
+			// Nothing changed this tick (snakes still counting down to
+			// their next step, and no hazard cell moved) - don't send
+			// an empty broadcast.
 			if deltaCount = 0 then
 				Exit;
 
@@ -2753,7 +3425,7 @@ procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
 // responsible for validating/clamping, this just trusts it. Payload is
 // [AStartRow, 30 bytes of row AStartRow, 30 bytes of row AStartRow+1] -
 // 61 bytes total, comfortably under the 254-byte cap even with room to
-// grow. Two rows/message was the user's own call (2026-08-24), over
+// grow. Two rows/message was dengland's own call (2026-08-24), over
 // 1 row (simpler but slower to fully sync) or more than 2 (marginal
 // speed gain, not worth the complexity).
 procedure TSnakeGame.SendBoardRows(APlayer: TPlayer; AStartRow: Integer);

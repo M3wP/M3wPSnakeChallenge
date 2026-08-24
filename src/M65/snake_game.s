@@ -375,7 +375,7 @@ boardRowOffsetHi:
 ;	Snakes are drawn as a CONNECTED PIPE - each cell's character
 ;	depends on which way the snake entered it and which way it left,
 ;	so turning leaves a corner piece behind. The six shapes are named
-;	by the compass directions the pipe OPENS TOWARD, after the user's
+;	by the compass directions the pipe OPENS TOWARD, after dengland's
 ;	own point (2026-08-24) that describing them as left/right turns
 ;	"is a bit odd" - which turn it is depends on which way you were
 ;	already going, but what the pipe connects to never changes:
@@ -398,21 +398,29 @@ boardRowOffsetHi:
 ;
 ;	Tile value = TILE_SNAKE_BASE + ((player * 2) + role) * 6 + shape
 ;	(SnakeServer.pas) - 8 blocks of 6 in player order, body block then
-;	head block. The order here must match that numbering exactly:
-;	these are indexed by raw tile value with no bounds check on this
-;	side (gameProcTileDeltaMsg's range check on row/col is what
+;	head block, followed by ONE more block of 6 (51-56) for the
+;	invulnerability flash. The order here must match that numbering
+;	exactly: these are indexed by raw tile value with no bounds check
+;	on this side (gameProcTileDeltaMsg's range check on row/col is what
 ;	guarantees only real board cells ever reach a lookup). All 48 are
 ;	reachable - heads take corner shapes too, one step before turning.
 ;
-;	Colours are the user's own pick (2026-08-24), light body / dark
+;	57 entries total, and the server has a TILE_COUNT constant that
+;	must agree - if a block is added there, add it here too.
+;
+;	Colours are dengland's own pick (2026-08-24), light body / dark
 ;	head per player: P1 $0E/$06, P2 $0A/$02, P3 $0D/$05, P4 $07/$08.
 gameTileChars:
 ;		floor  wall   attract
 		.byte	$20,   $66,   $66
-;	The same six shapes for every one of the 8 player/role blocks.
-		.repeat	8
+;	The same six shapes for every one of the 8 player/role blocks,
+;	then once more for the invulnerability flash block (51-56).
+		.repeat	9
 		.byte	$C0, $DD, $C9, $CA, $CB, $D5
 		.endrepeat
+;	Lava (57-59) - three age tiers, same character, colour only.
+;	$AA is dengland's pick (2026-08-24).
+		.byte	$AA, $AA, $AA
 
 gameTileColrs:
 		.byte	CLR_LOG_C64_BLACK
@@ -444,6 +452,28 @@ gameTileColrs:
 		.repeat	6
 		.byte	CLR_LOG_C64_ORANGE		;$08 - P4 head
 		.endrepeat
+
+;	Invulnerability flash body (51-56) - white, and deliberately NOT
+;	per player: the whole point is that it overrides the player colour
+;	while it's on. Same six characters as any other body block, so a
+;	flashing snake keeps its pipe joints instead of coming apart into
+;	loose blocks for half of every cycle. Only the BODY ever uses these
+;	- the head keeps its own colour throughout, as in the original.
+		.repeat	6
+		.byte	CLR_LOG_C64_WHITE		;$01 - invulnerable body
+		.endrepeat
+
+;	Spreading lava (57-59), oldest cell to newest: hot core through
+;	cooling crust. Character $AA for all three, so they never read as
+;	snake pipe even though P4 shares the yellow and orange. The three
+;	COLOURS here are still mine, not dengland's - easy to respecify,
+;	they're three bytes.
+;
+;	Bees, when that wave lands, are character $DA in colour $04
+;	(purple) - both dengland's, 2026-08-24.
+		.byte	CLR_LOG_C64_YELLOW		;$07 - core (laid down first)
+		.byte	CLR_LOG_C64_ORANGE		;$08 - mid
+		.byte	CLR_LOG_C64_BROWN		;$09 - crust (newest, goes first)
 
 
 ;-------------------------------------------------------------------------------
@@ -858,7 +888,7 @@ gameProcSlotStatusMsg:
 ;	(row, col, tile) * count] (see TSnakeGame.SendTileDeltas/Tick,
 ;	SnakeServer.pas) - the general "these cells changed" broadcast; the
 ;	attract-mode bounce is its first real use, not a bespoke message of
-;	its own (user's own correction, 2026-08-24: "why is this in the
+;	its own (dengland's own correction, 2026-08-24: "why is this in the
 ;	client, shouldn't it just be getting tile deltas from the
 ;	server?"). Updates boardTiles and redraws each named cell directly
 ;	- single-cell STCELL16/STCOLR16 writes via the same gameTileChars/
@@ -1022,7 +1052,7 @@ gameProcBoardRowsMsg:
 ; BOARD RENDER - hand-drawn straight to screen RAM, not through the ctrls
 ; widget engine at all ("we don't need a proper control for the board,
 ; we'll just write there" - user, 2026-08-24). Board occupies screen cols
-; 0-29, rows 5-24 (30x20, starting at row 5 per the user's own layout
+; 0-29, rows 5-24 (30x20, starting at row 5 per dengland's own layout
 ; call, and grown from the original's 18 rows to fill the screen down to
 ; page_detail's last row) - deliberately outside panel_detail_hud's
 ; own rect (cols 30-39), so the two never fight over the same screen cells
