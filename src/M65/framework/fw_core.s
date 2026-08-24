@@ -836,6 +836,11 @@ msgsdat1 = $34
 
 ;senddat0:
 ;			.res	1
+;	FREE since 2026-08-25 - was inetSendData's loop index, which the
+;	non-blocking send state machine replaced with sendmsgsent (it has
+;	to survive across main-loop passes, so zero page scratch was the
+;	wrong home for it). Kept reserved rather than reused immediately:
+;	this is zero page and worth allocating deliberately.
 senddat0 = $35
 
 ;sendptr0:

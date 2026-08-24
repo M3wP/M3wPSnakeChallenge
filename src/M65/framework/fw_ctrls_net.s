@@ -209,7 +209,7 @@ inetInitialise:
 ;		JSR 	drv_init
 
 		LDA	eth_init_value
-		JSR 	ip65_init
+		JSR 	netInit
 		BCC	:+
 
 		JSR	clientOutputInetError
@@ -221,7 +221,7 @@ inetInitialise:
 
 		LDA	#INET_ERR_INTRN
 		STA	ineterrk
-		LDA	ip65_error
+		LDA	netError
 		STA	ineterrc
 		
 		JSR	clientOutputInetError
@@ -413,7 +413,7 @@ inetConnect:
 
 		BCC 	:+
 
-;	ip65_error is dead (never written anywhere), so it was always $00
+;	netError is dead (never written anywhere), so it was always $00
 ;	here regardless of which of the 3 stages below actually failed -
 ;	every connect failure looked identical. Each stage now sets
 ;	ineterrc to its own code before jumping here instead.
@@ -767,7 +767,7 @@ inetExecute:
 ;: 
 		LDA 	#0
 		STA 	data_received
-		JSR 	ip65_process
+		JSR 	netPoll
 		
 		LDA 	connection_close_requested
 		BEQ 	@tstclosed
@@ -791,12 +791,11 @@ inetExecute:
 		LDA 	connection_closed
 		BNE 	@closed
 		
-		LDA	sendmsgscnt
-		BNE	@send
-
-		JMP	@done
-
-		
+;	Called unconditionally, where this used to be gated on sendmsgscnt.
+;	inetSendData is a state machine now: with the queue fully sent it
+;	folds the table's offsets back to zero, and that has to happen on a
+;	pass where nothing is outstanding - exactly the case the old gate
+;	skipped.
 @send:
 		JSR	inetSendData
 		JMP	@done
@@ -876,20 +875,58 @@ inetGetNextSend:
 
 	.export	inetSendData
 ;-------------------------------------------------------------------------------
+;	inetSendData - transmit AT MOST ONE queued message, then return.
+;
+;	This used to loop over every queued message, each send followed by
+;	a blocking inetWaitTxIdle spin. That was right for ip65, which
+;	really is half-duplex, and it is STILL right about the mega-ip
+;	stack's TX discipline: the stack is stop-and-wait, one unacked
+;	segment in flight, so a second message must not be handed over
+;	until the first is acknowledged or they pile up unsent and can be
+;	silently coalesced. That constraint is unchanged and still enforced
+;	below.
+;
+;	What was wrong was WHERE the wait happened. The old spin polled
+;	MIP_TCP_TX_IDLE without ever calling netPoll, so for the whole
+;	send-plus-ACK round trip the application drained nothing: incoming
+;	frames piled up in the stack's ring buffer and then arrived in a
+;	clump, which is the stutter dengland saw in play (2026-08-25).
+;
+;	The mega-ip stack is NOT half-duplex - ETH_STATUS_POLL burst-drains
+;	RX on every poll, and its own comment names streaming clients as
+;	the reason (eth.asm). The serialisation was ours, inherited from an
+;	ip65-shaped assumption that no longer holds.
+;
+;	So the wait now happens BETWEEN main-loop passes rather than inside
+;	a spin: send one message if and only if TX is idle, and return
+;	either way. inetExecute calls this once per pass, right after
+;	netPoll, so receive keeps draining at full rate while a segment is
+;	in flight. Exactly one unacked segment, as before - it just no
+;	longer costs the receive path anything.
+;-------------------------------------------------------------------------------
 inetSendData:
 ;-------------------------------------------------------------------------------
-		LDY	#$00
-		STY	senddat0
+		LDA	sendmsgsent
+		CMP	sendmsgscnt
+		BEQ	@drained
 
-@loop:
+;	One segment in flight at a time. If the last one hasn't been
+;	acknowledged yet, come back next pass instead of spinning - this is
+;	the same condition the old inetWaitTxIdle looped on, just tested
+;	once per pass rather than continuously.
+		JSR	MIP_TCP_TX_IDLE
+		CMP	#$01
+		BNE	@busy
+
+		LDY	sendmsgsent
 		LDA	sendmsgtable, Y
 		STA	sendptr0
 		INY
 		LDA	sendmsgtable, Y
 		STA	sendptr0 + 1
 		INY
-		
-		STY	senddat0
+
+		STY	sendmsgsent
 
 		LDY	#$00
 		LDA	(sendptr0), Y
@@ -905,19 +942,26 @@ inetSendData:
 		JSR tcp_send
 		BCS @error
 
-		JSR	inetWaitTxIdle
-
 		JSR	clientDispInetHealth
 
-		LDY	senddat0
-		CPY	sendmsgscnt
-		BNE	@loop
+@busy:
+		RTS
 
-		JMP	@exit
+@drained:
+;	Everything queued has gone out, so fold the table back to the
+;	start. Both counters have to reset together: sendmsgscnt is an
+;	OFFSET that inetGetNextSend only ever advances, so without this it
+;	would keep climbing and start refusing new messages at 6 with the
+;	whole table already sent and idle.
+		LDA	#$00
+		STA	sendmsgscnt
+		STA	sendmsgsent
+
+		RTS
 
 
 @error:
-		LDA 	ip65_error
+		LDA 	netError
 		CMP 	#IP65_ERROR_CONNECTION_CLOSED
 		BNE 	@errother
 
@@ -938,25 +982,22 @@ inetSendData:
 		LDA	#INET_ERR_INTRN
 		STA	ineterrk
 
-		LDA	ip65_error
+		LDA	netError
 		STA	ineterrc
 		
 		JSR	clientOutputInetError
 
 @exit:
+;	Drop the whole queue on error - the connection is going down, so
+;	anything still waiting is undeliverable. Both counters, or the
+;	table would look permanently full afterwards.
 		LDA	#$00
 		STA	sendmsgscnt
+		STA	sendmsgsent
 
 		RTS
 
 
-;-------------------------------------------------------------------------------
-; The mega-ip TCP stack is stop-and-wait (one unacked segment in flight at a
-; time); anything enqueued while a segment is outstanding just sits in the TX
-; queue until a later poll notices the ACK. Block here until that queue has
-; actually drained before letting the caller enqueue the next message, so
-; back-to-back sends don't pile up unsent (or get silently coalesced together
-; whenever the queue finally does flush).
 ;-------------------------------------------------------------------------------
 ;	Stashes TERMINAL_EVENT (TCP_EVENT_FLAG's sticky-OR'd EV_* bits, see
 ;	the mirrored defines near tcp_connect) into discEventFlags, so
@@ -975,30 +1016,19 @@ inetRecordDiscEvent:
 
 
 ;-------------------------------------------------------------------------------
-inetWaitTxIdle:
+;	inetWaitTxIdle is GONE (2026-08-25). It spun on MIP_TCP_TX_IDLE
+;	without ever calling netPoll, so nothing was received for the whole
+;	duration of a send plus its ACK - see inetSendData, which now tests
+;	the same condition once per main-loop pass instead.
+;
+;	Its connection-close check is not lost: netPoll runs
+;	TERMINAL_POLL_STATUS and handles TERMINAL_EVENT on every pass
+;	anyway, so a close is noticed at the same rate or better.
+;
+;	Don't reintroduce a blocking wait here. If a future caller needs to
+;	know TX has drained, give it a state to sit in and let the main
+;	loop keep turning.
 ;-------------------------------------------------------------------------------
-		LDA	#$00
-		STA	TERMINAL_EVENT
-
-		JSR	TERMINAL_POLL_STATUS
-
-		LDA	TERMINAL_EVENT
-		BNE	@closed
-
-		JSR	MIP_TCP_TX_IDLE
-		CMP	#$01
-		BNE	inetWaitTxIdle
-
-		RTS
-
-@closed:
-		JSR	inetRecordDiscEvent
-
-		LDA	#$01
-		STA	connection_close_requested
-		STA	connection_closed
-
-		RTS
 
 
 
@@ -7515,6 +7545,24 @@ ctrlsPageKeyPress:
 		STA	msgsdat0
 		STX	msgsdat1
 
+;	GAME HOOK, ahead of everything - the game gets first refusal on
+;	every key. Returns carry SET if it consumed the key, in which case
+;	nothing below runs.
+;
+;	Ahead of even the mouse-capture check on purpose. A game that is
+;	being actively steered owns the keyboard: the cursor keys are the
+;	controls, and letting them fall through to navigate between widgets
+;	(the TAB/cursor block below) would move the focus ring around while
+;	the player is trying to turn. The game hook is expected to consume
+;	only what it genuinely needs and only while it needs it - see
+;	gameKeyPress in snake_game.s, which claims the cursor keys strictly
+;	while this client holds a corner.
+		JSR	gameKeyPress
+		BCC	@notgamekey
+
+		RTS
+
+@notgamekey:
 ;	A mouse-captured control (see userCaptureMouse) takes priority
 ;	over everything below - TAB/cursor-key page navigation, accelerator
 ;	lookup, all of it - since a panel like panel_detail_board can only
@@ -8489,8 +8537,8 @@ sprPointer0:
 
 
 
-;	.import ip65_error
-ip65_error:
+;	.import netError
+netError:
     .byte $00
 
 ;;	.import eth_driver_name
@@ -8758,8 +8806,8 @@ CUR_MUL10_ADD_DIGIT:
 
 
 
-;	.import ip65_init
-ip65_init:
+;	.import netInit
+netInit:
 
     LDA #0
     STA ARG_A_VAR
@@ -8772,8 +8820,8 @@ ip65_init:
     RTS
 
 
-;	.import ip65_process
-ip65_process:
+;	.import netPoll
+netPoll:
     LDA #$00
     STA TERMINAL_EVENT
 
@@ -9476,6 +9524,14 @@ discEventFlags:
 			.res	1
 
 sendmsgscnt:
+			.res 	1
+
+;	How far through sendmsgtable inetSendData has actually transmitted,
+;	as a byte offset, matching sendmsgscnt's units. Persists ACROSS
+;	main-loop passes - the send path is a state machine now, sending
+;	one message per pass while TX is idle, rather than a loop that
+;	drained the queue in one go (see inetSendData).
+sendmsgsent:
 			.res 	1
 
 readmsgbuflen:

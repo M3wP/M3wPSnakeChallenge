@@ -29,7 +29,7 @@ const
 	// Upper bound on a snake body, so the body array can be a fixed
 	// record field rather than a dynamic array reallocated per growth.
 	// Demo snakes never grow; this is headroom for real play. Up here
-	// for the same reason as the board size - TDemoSnake needs it.
+	// for the same reason as the board size - TSnake needs it.
 	MAX_SNAKE_LEN = 64;
 
 	// The 4 corners/players. Up here for the same reason -
@@ -204,8 +204,17 @@ type
 		Player: TPlayer;
 		Name: AnsiString;
 		State: TPlayerState;
-		// TODO: score/lives/body-position fields land here once the
-		// tile-grid/movement model is designed (see SnakeClasses.pas).
+
+		// Lives left on this corner's current run. Set when the corner
+		// is claimed, spent on death, and when it hits zero the corner
+		// is released back to spectator - see KillPlayerSnake.
+		//
+		// On the SLOT and not on the snake: a snake is torn down and
+		// rebuilt on every respawn, so anything that has to outlive a
+		// death cannot live there.
+		Lives: Integer;
+
+		// TODO: score/body-position fields land here with food.
 	end;
 
 	// One cell of a TileDelta broadcast (mcPlay/$09 - see
@@ -244,7 +253,7 @@ type
 	// in the same rotational direction, started half a lap apart, which
 	// is why they never catch each other and no collision handling is
 	// needed here at all.
-	TDemoSnake = record
+	TSnake = record
 		Body: array[0..MAX_SNAKE_LEN - 1] of TSnakeSeg;
 		Len: Integer;
 
@@ -282,6 +291,11 @@ type
 		// invun/invunTicks (initSnakes, snakeInvunExp).
 		InvunTicks: Integer;
 		FlashOn: Boolean;
+
+		// Real play only. The demo never sets this - its snakes run a
+		// fixed circuit with no collision at all (see the comment above
+		// this record), so there is nothing there that can die.
+		Alive: Boolean;
 	end;
 
 	// Which mechanic the attract reel is currently showing off. See
@@ -380,7 +394,27 @@ type
 		// (2026-08-24) - the bounce was scaffolding for the wire format,
 		// this is the original's actual attract mode (server.lua's
 		// iGameMode = tGAMEMODE.attract, driven by snakeMenu).
-		DemoSnakes: array[0..SNAKE_PLAYER_COUNT - 1] of TDemoSnake;
+		DemoSnakes: array[0..SNAKE_PLAYER_COUNT - 1] of TSnake;
+
+		// REAL PLAY. One snake per corner, indexed the same way Slots is
+		// - PlaySnakes[i] belongs to Slots[i], always, so a corner and
+		// its snake never need mapping between them.
+		//
+		// Separate from DemoSnakes rather than reusing it: the two are
+		// live at mutually exclusive times, but keeping them apart means
+		// the attract reel's state is still intact when play ends and
+		// the board falls back to it, instead of having to be rebuilt.
+		PlaySnakes: array[0..SNAKE_PLAYER_COUNT - 1] of TSnake;
+
+		// Ticks until a dead corner's snake respawns, 0 when it is
+		// either alive or unclaimed.
+		PlayRespawn: array[0..SNAKE_PLAYER_COUNT - 1] of Integer;
+
+		// True while at least one corner is claimed - i.e. the board is
+		// playing rather than attracting. Held as state, not recomputed,
+		// so Tick can spot the EDGE and do the changeover work (build a
+		// real level, push the board out) exactly once.
+		Playing: Boolean;
 
 		// Ticks until the next invulnerability burst is handed to a
 		// randomly chosen demo snake. One counter for the whole board,
@@ -473,6 +507,27 @@ type
 		// Tell a watcher to shake its screen for AFrames frames - see
 		// the implementation for why duration, not per-frame offsets.
 		procedure SendShake(APlayer: TPlayer; AFrames: Integer);
+
+		// REAL PLAY. StartPlay/StopPlay handle the changeover between
+		// attract and play (see Tick's edge detect); SpawnPlayerSnake
+		// puts one corner's snake on the board; TickPlaySnakes advances
+		// them; KillPlayerSnake wipes one off it. PushBoardToWatchers
+		// resends the whole board, for when a level changes wholesale
+		// and deltas would be the wrong tool.
+		procedure StartPlay;
+		procedure StopPlay;
+		procedure SpawnPlayerSnake(ASlot: Integer;
+				var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+		procedure KillPlayerSnake(ASlot: Integer;
+				var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+		procedure TickPlaySnakes(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure PushBoardToWatchers;
+
+		// Apply a direction request from a player. Rejects the reverse
+		// of the way the snake is actually travelling - see the
+		// implementation.
+		procedure SetPlayerLook(APlayer: TPlayer; ADir: TSnakeDir);
 
 		// SLOT CLAIM/RELEASE - a spectator taking or giving up one of the
 		// four corners. Both return the slot affected, or -1 if nothing
@@ -772,7 +827,7 @@ const
 	// Head and body use the SAME six shapes and differ only in COLOUR.
 	// Every segment is shaped by where the snake entered that cell and
 	// where it leaves it - for the head, "leaves" means the turn it has
-	// already committed to but not yet made (see TDemoSnake.Look), so a
+	// already committed to but not yet made (see TSnake.Look), so a
 	// turning head shows the corner piece one step EARLY. When it then
 	// moves on, that cell keeps the identical character and only
 	// changes colour to the body's, making the hand-off invisible.
@@ -889,15 +944,32 @@ const
 	// TICK_MS=83 that's ~6 steps/sec for the demo, ~4 for normal play
 	// and ~12 flat out.
 	//
-	// The gear names, in ticks-per-step (SMALLER is faster). These are
-	// the original's tGAMESPEED values exactly:
-	//   {slow = 4, normal = 3, fast = 2, turbo1 = 1, turbo2 = 0}
-	// turbo2 is deliberately absent - server.lua:46 says "DO NOT USE
-	// turbo settings, especially turbo2!", so TOP is the floor here.
-	SNAKE_SPEED_SLOW   = 4;
-	SNAKE_SPEED_NORMAL = 3;
-	SNAKE_SPEED_FAST   = 2;
-	SNAKE_SPEED_TOP    = 1;
+	// The gear names, in ticks-per-step (SMALLER is faster).
+	//
+	// RESCALED 2026-08-25 (dengland: "we need slow (5), normal (4),
+	// fast (3), fastest (2) and top (1)"). The original's tGAMESPEED
+	// was {slow=4, normal=3, fast=2, turbo1=1, turbo2=0}; every gear
+	// has moved one step slower, and a sixth has been added below.
+	//
+	// Why slower than the original: QUADRO puts FOUR snakes on one
+	// board rather than two, so the same cell is contested far more
+	// often and a player needs longer to read the board before
+	// committing. The original's normal was simply too quick here -
+	// play started at 4 steps/sec and felt hurried.
+	//
+	// VERY SLOW (6) exists because it makes the ladder line up exactly
+	// one gear per difficulty, with no two tiers sharing a gear. The
+	// old scale ran out at the bottom and clamped training and easy
+	// both onto SLOW; now every tier is distinct - see SnakeStepTicks.
+	//
+	// turbo2 (0) is still deliberately absent - server.lua:46 says "DO
+	// NOT USE turbo settings, especially turbo2!", so TOP is the floor.
+	SNAKE_SPEED_VSLOW   = 6;		//  2.0 steps/sec
+	SNAKE_SPEED_SLOW    = 5;		//  2.4
+	SNAKE_SPEED_NORMAL  = 4;		//  3.0
+	SNAKE_SPEED_FAST    = 3;		//  4.0
+	SNAKE_SPEED_FASTEST = 2;		//  6.0
+	SNAKE_SPEED_TOP     = 1;		// 12.0
 	//
 	// The original also modulates this per snake via moveFast (food
 	// speed-ups and slow-downs, +30..-12, decaying 1/tick back toward
@@ -905,18 +977,25 @@ const
 	// eat. When food lands, that becomes a per-snake offset applied to
 	// this base, exactly as objectsTick does it.
 	//
-	// Attract mode runs at FAST: quicker than normal play so the demo
-	// looks lively, but never TOP. Both halves are dengland's own rules
+	// Attract mode runs quicker than normal play so the demo looks
+	// lively, but never TOP. Both halves are dengland's own rules
 	// (2026-08-24), guarded below rather than left to a comment.
 	//
-	// NORMAL and TOP were each run briefly to judge the turn telegraph,
-	// which lasts exactly one step - so its duration IS the step
-	// duration: 250ms at NORMAL, 166ms at FAST, 83ms at TOP. Top speed
-	// measured 12.1 cells/sec with four snakes and the client tracking
-	// it perfectly, so the limit there is human rather than technical:
-	// 83ms is below visual reaction time, making the top gear something
-	// played from anticipation. User's verdict: "that's deadly with 4p".
-	SNAKE_MOVE_TICKS = SNAKE_SPEED_FAST;
+	// FASTEST, not FAST, since the 2026-08-25 rescale. The demo has
+	// always run at 2 ticks / 6 steps per second, which is the speed
+	// that was judged to look right on hardware - and 2 ticks is what
+	// FASTEST names now that every gear has shifted one slower. Left
+	// as FAST this would have quietly dropped the attract screen to 4
+	// steps/sec, changing something already tuned by eye.
+	//
+	// The turn telegraph lasts exactly one step, so its duration IS the
+	// step duration: 333ms at NORMAL now, 166ms at FASTEST, 83ms at
+	// TOP. Top speed measured 12.1 cells/sec with four snakes and the
+	// client tracking it perfectly, so the limit there is human rather
+	// than technical: 83ms is below visual reaction time, making the
+	// top gear something played from anticipation. dengland's verdict:
+	// "that's deadly with 4p".
+	SNAKE_MOVE_TICKS = SNAKE_SPEED_FASTEST;
 
 	// Top speed is what a powered-up player earns; an attract screen
 	// handing it out for free undercuts that.
@@ -1168,8 +1247,14 @@ const
 	// running straight is the same character as its body).
 	DEMO_BOSS_LEN = 8;
 
-	// Slower than the demo snakes' FAST, so it reads as heavy.
-	DEMO_BOSS_STEP_TICKS = SNAKE_SPEED_NORMAL;
+	// Slower than the demo snakes, so it reads as heavy - one gear
+	// down from them, which is 3 ticks.
+	//
+	// FAST, not NORMAL, since the 2026-08-25 rescale: 3 ticks is what
+	// the boss has always run at and what was judged right on hardware,
+	// and FAST is the name 3 carries now. Left as NORMAL it would have
+	// silently dropped to 4 and changed a wave already tuned by eye.
+	DEMO_BOSS_STEP_TICKS = SNAKE_SPEED_FAST;
 
 	// Longer than the other waves (dengland, 2026-08-25). It moves at
 	// NORMAL speed round a 28-cell loop, so 9s was barely a lap and a
@@ -1285,6 +1370,52 @@ const
 	// Half-width, so the box is 2x this on each axis - the centre of an
 	// even-sided board falls between cells and has no single middle.
 	LEVEL_CENTRE_CLEAR = 2;
+
+
+	// --- REAL PLAY -----------------------------------------------------
+	//
+	// Where a claimed corner's snake starts: EXACTLY where the demo puts
+	// that corner's snake. There is no separate spawn geometry - see
+	// SpawnPlayerSnake, which walks the demo's own circuit.
+	//
+	// So the spawn inherits the demo circuit's properties rather than
+	// restating them: DEMO_INSET keeps all four snakes in the lane that
+	// LEVEL_INSET guarantees free of generated walls at every
+	// difficulty, and they circulate the same way round it, so a
+	// head-on between neighbours needs somebody to turn in first.
+	//
+	// Starting length is the demo's, for the same reason the position
+	// is: one number, not two that can drift. Changing DEMO_SNAKE_LEN
+	// now moves both, and its existing compile-time guard against
+	// DEMO_SPACING keeps covering both as well.
+
+	// Spawn shield. Long enough to get clear of the corner at the
+	// slowest step rate; the flash is the same one the food effect uses,
+	// so this costs no new tiles (see SnakeBodyTile).
+	PLAY_SPAWN_INVUN_MS = 3000;
+	PLAY_SPAWN_INVUN_TICKS = PLAY_SPAWN_INVUN_MS div TICK_MS;
+
+	// How much room around a spawn is swept clear of hazards, as a
+	// half-width box. A joiner must not arrive inside a lava pool that
+	// spread over their corner while they were spectating.
+	PLAY_SPAWN_CLEAR = 3;
+
+	// Ticks a dead snake stays gone before it respawns. Long enough to
+	// register as a death rather than a stutter.
+	PLAY_RESPAWN_MS = 2000;
+	PLAY_RESPAWN_TICKS = PLAY_RESPAWN_MS div TICK_MS;
+
+	// Lives on a corner's run. The original gives 3 in single play and
+	// 2 in battle (gameUpdateMode); QUADRO has no such modes - every
+	// corner is its own independent run on a shared board, whether one
+	// person is playing or four - so it takes the solo figure.
+	//
+	// Running out does NOT end anything for anyone else. The corner is
+	// released back to spectator and the board carries on with whoever
+	// is left, down to zero corners, which is attract mode. That is the
+	// "0-4 corners on one continuously-running board" design doing its
+	// job: there is no game-wide game-over to declare.
+	PLAY_START_LIVES = 3;
 
 
 procedure DoDestroyListMessages;
@@ -2715,6 +2846,7 @@ function TSnakeGame.ClaimSlot(APlayer: TPlayer; ASlot: Integer): Integer;
 		Slots[ASlot].Player:= APlayer;
 		Slots[ASlot].Name:= APlayer.Name;
 		Slots[ASlot].State:= psPlaying;
+		Slots[ASlot].Lives:= PLAY_START_LIVES;
 
 		Result:= ASlot;
 
@@ -2963,10 +3095,21 @@ constructor TSnakeGame.Create;
 	Lock:= TCriticalSection.Create;
 	Watchers:= TList<TPlayer>.Create;
 
-	// Every board is normal until boards carry their own difficulty -
-	// see the field declarations. The original seeds progress from
+	// Every board is EASY until boards carry their own difficulty - see
+	// the field declarations. The original seeds progress from
 	// difficulty the same way (`iLevelProgress = iGameDifficulty`).
-	Difficulty:= gdNormal;
+	//
+	// Was gdNormal, dropped 2026-08-25: dengland found play started too
+	// quick. Easy is 5 ticks (2.4 steps/sec) against normal's 4 (3.0),
+	// and progress still climbs from there as levels are cleared, so
+	// this sets the OPENING pace rather than capping it.
+	//
+	// One value for all boards is the remaining shortcut here. The real
+	// design is per-board difficulty - "the differences between the
+	// game boards can be the initial difficulty/speed" - which wants a
+	// difficulty alongside the name in ARR_SNAKE_BOARDS rather than a
+	// constant in the constructor.
+	Difficulty:= gdEasy;
 	LevelProgress:= Ord(Difficulty);
 
 	// A plain bordered room - wall around the edge, empty floor inside.
@@ -3812,19 +3955,559 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 // makes the boards themselves the difficulty tiers, so a harder board
 // is a faster one. Anchored so normal progress gives SNAKE_SPEED_NORMAL.
 //
-// The clamp is NOT optional. A plain (4 - progress) lands expert on 0,
-// which is the original's turbo2 - "DO NOT USE turbo settings,
-// especially turbo2!" (server.lua:46) - and progress keeps climbing
-// past expert as levels are cleared, so it would go negative after.
+// Since the 2026-08-25 rescale this lands EXACTLY ONE GEAR PER TIER,
+// with nothing shared and nothing clamped away in the middle:
+//
+//   training 0 -> 6 VSLOW     easy    1 -> 5 SLOW
+//   normal   2 -> 4 NORMAL    hard    3 -> 3 FAST
+//   expert   4 -> 2 FASTEST
+//
+// and progress climbing past expert as levels are cleared reaches TOP
+// and stops there. That tidiness is the whole reason VSLOW (6) was
+// worth adding: on the old scale the arithmetic ran off the bottom and
+// the clamp put training and easy both on SLOW, so the gentlest tier
+// wasn't actually gentler than the one above it.
+//
+// The clamp is NOT optional at either end. Without the floor, progress
+// past expert reaches 0 - the original's turbo2, "DO NOT USE turbo
+// settings, especially turbo2!" (server.lua:46) - and then goes
+// negative, which would be a step every zero ticks.
 function SnakeStepTicks(AProgress: Integer): Integer;
 	begin
 	Result:= SNAKE_SPEED_NORMAL + 2 - AProgress;
 
-	if  Result > SNAKE_SPEED_SLOW then
-		Result:= SNAKE_SPEED_SLOW;
+	if  Result > SNAKE_SPEED_VSLOW then
+		Result:= SNAKE_SPEED_VSLOW;
 
 	if  Result < SNAKE_SPEED_TOP then
 		Result:= SNAKE_SPEED_TOP;
+
+	end;
+// --- REAL PLAY ---------------------------------------------------------
+
+// SpawnPlayerSnake - lay corner ASlot's snake on the board, shielded,
+// with the ground around it swept clear. Caller holds Lock.
+//
+// PLACEMENT IS THE DEMO'S, EXACTLY: same circuit, same inset, same
+// quarter-lap spacing, walked out by the same CircuitAt pair that
+// InitDemoSnakes uses. dengland's own answer when asked where the
+// corners should be (2026-08-25): "they should just be the same as the
+// demo".
+//
+// Right in a way none of the three layouts I offered were. The attract
+// screen has been showing players exactly where they start all along,
+// so the demo doubles as the explanation - and there is now only ONE
+// definition of where a corner is. The invented second one had already
+// drifted from it (inset 1, head five cells along the wall) and would
+// have drifted again the moment either moved.
+procedure TSnakeGame.SpawnPlayerSnake(ASlot: Integer;
+		var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+	var
+	i, d, r, c, spacing: Integer;
+	hr, hc: Byte;
+	cr, cc, rPrev, cPrev: Byte;
+	dirIn, dirOut: TSnakeDir;
+
+	begin
+	spacing:= DEMO_LAP div SNAKE_PLAYER_COUNT;
+
+	// The head's cell, needed up front for the hazard sweep below.
+	CircuitAt(ASlot * spacing, hr, hc, dirOut);
+
+	// Sweep the area clear first - a corner can easily have lava or a
+	// bee sitting on it from the attract reel, or from another player's
+	// hazard, and spawning into that would be an instant and
+	// unattributable death. Only floor-and-hazard is cleared; WALLS
+	// stay, since the spawn lane is guaranteed clear of them anyway and
+	// punching holes in the level would be worse than the problem.
+	for r:= Integer(hr) - PLAY_SPAWN_CLEAR to Integer(hr) + PLAY_SPAWN_CLEAR do
+		for c:= Integer(hc) - PLAY_SPAWN_CLEAR to Integer(hc) + PLAY_SPAWN_CLEAR do
+			if  (r > 0) and (r < BOARD_ROWS - 1)
+			and (c > 0) and (c < BOARD_COLS - 1)
+			and (Board[r][c] <> TILE_FLOOR)
+			and (Board[r][c] <> TILE_WALL) then
+				EmitCell(r, c, TILE_FLOOR, ADeltas, ADeltaCount);
+
+	with PlaySnakes[ASlot] do
+		begin
+		Len:= DEMO_SNAKE_LEN;
+		Player:= ASlot;
+		MoveTick:= SnakeStepTicks(LevelProgress);
+		InvunTicks:= PLAY_SPAWN_INVUN_TICKS;
+		FlashOn:= True;
+		Alive:= True;
+
+		// Head at its own offset, body trailing back along the circuit -
+		// InitDemoSnakes' loop verbatim. Walking the circuit rather than
+		// stepping back along one axis is what lets a snake spawn ON a
+		// corner and bend round it correctly, instead of running off the
+		// board or drawing a straight line through the wall.
+		for i:= 0 to Len - 1 do
+			begin
+			d:= (ASlot * spacing) - i;
+
+			// dirOut is the way the snake leaves this cell; dirIn the way
+			// it arrived, i.e. the step from the cell before it.
+			CircuitAt(d, cr, cc, dirOut);
+			CircuitAt(d - 1, rPrev, cPrev, dirIn);
+
+			Body[i].Row:= cr;
+			Body[i].Col:= cc;
+			Body[i].Shape:= SegShape(dirIn, dirOut);
+
+			if  i = 0 then
+				begin
+				Dir:= dirIn;		// how it got here
+				Look:= dirOut;		// where it is going
+				end;
+			end;
+
+		EmitCell(Body[0].Row, Body[0].Col,
+				SnakeTile(Player, SNAKE_ROLE_HEAD, Body[0].Shape),
+				ADeltas, ADeltaCount);
+
+		for i:= 1 to Len - 1 do
+			EmitCell(Body[i].Row, Body[i].Col,
+					SnakeBodyTile(Player, Body[i].Shape, FlashOn),
+					ADeltas, ADeltaCount);
+		end;
+
+	PlayRespawn[ASlot]:= 0;
+	end;
+
+// KillPlayerSnake - wipe one snake off the board, spend a life, and
+// either queue a respawn or give the corner up. Caller holds Lock.
+procedure TSnakeGame.KillPlayerSnake(ASlot: Integer;
+		var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+	var
+	i: Integer;
+
+	begin
+	if  not PlaySnakes[ASlot].Alive then
+		Exit;
+
+	for i:= 0 to PlaySnakes[ASlot].Len - 1 do
+		with PlaySnakes[ASlot].Body[i] do
+			EmitCell(Row, Col, TILE_FLOOR, ADeltas, ADeltaCount);
+
+	PlaySnakes[ASlot].Alive:= False;
+
+	if  Slots[ASlot].Lives > 0 then
+		Dec(Slots[ASlot].Lives);
+
+	if  Slots[ASlot].Lives > 0 then
+		begin
+		PlayRespawn[ASlot]:= PLAY_RESPAWN_TICKS;
+		SlotStatusToAll(ASlot);
+
+		Exit;
+		end;
+
+	// Out of lives - the run is over and the corner goes back to the
+	// pool. Deliberately NOT a call to ReleaseSlot: that acquires Lock,
+	// and everything on this path is already holding it. The three
+	// assignments are the same ones ReleaseSlot and Remove make.
+	PlayRespawn[ASlot]:= 0;
+
+	Slots[ASlot].Player:= nil;
+	Slots[ASlot].Name:= '';
+	Slots[ASlot].State:= psNone;
+
+	SlotStatusToAll(ASlot);
+	end;
+
+// SetPlayerLook - a player asked to turn. Caller must NOT hold Lock.
+//
+// A reversal onto the snake's own neck is refused rather than obeyed.
+// The original does the same thing implicitly by dying on it, but with
+// four players and a shared board an accidental reverse is far more
+// often a fumbled input than an intent, and eating yourself for it is a
+// bad-feeling death. Refusing costs the player nothing they wanted.
+//
+// Note this tests Dir, the direction actually TRAVELLED, not Look. Two
+// quick turns inside one step would otherwise let a player reverse via
+// an intermediate direction that never happened on the board.
+procedure TSnakeGame.SetPlayerLook(APlayer: TPlayer; ADir: TSnakeDir);
+	var
+	i: Integer;
+	bad: TSnakeDir;
+
+	begin
+	Lock.Acquire;
+		try
+		for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+			if  (Slots[i].Player = APlayer) and PlaySnakes[i].Alive then
+				begin
+				case PlaySnakes[i].Dir of
+					sdUp:    bad:= sdDown;
+					sdDown:  bad:= sdUp;
+					sdLeft:  bad:= sdRight;
+					else     bad:= sdLeft;
+					end;
+
+				if  ADir <> bad then
+					PlaySnakes[i].Look:= ADir;
+
+				Break;
+				end;
+
+		finally
+		Lock.Release;
+		end;
+	end;
+
+// TickPlaySnakes - advance every live player snake one tick. Caller
+// holds Lock.
+//
+// The movement is deliberately the same shape as TickDemoSnakes: tail
+// vacates first, body shifts, Body[1] becomes the corner piece, the
+// head telegraphs its next turn. The differences are only the two the
+// demo does not need - the direction comes from the player rather than
+// DemoLookFrom, and the target cell is TESTED before it is entered.
+procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	i, s, t: Integer;
+	head: TSnakeSeg;
+	prevDir: TSnakeDir;
+	wantFlash, repaint: Boolean;
+
+	// Resolved in a PRE-PASS, before anything moves. Stepping[] is who
+	// is due a step this tick, TgtRow/TgtCol where their head would
+	// land, and Mutual[] is set on every snake sharing a target with
+	// another.
+	//
+	// The pre-pass exists to remove a slot-order bias a single loop
+	// cannot avoid: whoever is processed first enters the disputed cell
+	// and paints it, and everyone after reads a snake there and dies.
+	// Corner 0 would win every head-on on the board. The original
+	// resolves it the same way and for the same reason - objectsTick
+	// computes tPos1 and tPos2 up front, then tests them against each
+	// other before either moves.
+	Stepping, Mutual: array[0..SNAKE_PLAYER_COUNT - 1] of Boolean;
+	TgtRow, TgtCol: array[0..SNAKE_PLAYER_COUNT - 1] of Byte;
+
+	// The direction each stepping snake ARRIVED at its current cell
+	// with, captured in the pre-pass because committing the turn
+	// (Dir := Look) destroys it, and the resolve pass still needs it to
+	// shape the corner the head leaves behind.
+	ArrivedDir: array[0..SNAKE_PLAYER_COUNT - 1] of TSnakeDir;
+
+	// Whether this snake's flash phase flipped this tick, and so owes a
+	// whole-body repaint. Per-snake for the same reason PrevDir is: the
+	// phase is decided in the pre-pass but acted on after the move, and
+	// a single shared variable would hand every snake the LAST one's
+	// answer.
+	NeedRepaint: array[0..SNAKE_PLAYER_COUNT - 1] of Boolean;
+
+	procedure Emit(ARow, ACol, ATile: Byte);
+		begin
+		EmitCell(ARow, ACol, ATile, ADeltas, ADeltaCount);
+		end;
+
+	procedure RepaintBody(ASnake: Integer);
+		var
+		j: Integer;
+
+		begin
+		for j:= 1 to PlaySnakes[ASnake].Len - 1 do
+			with PlaySnakes[ASnake].Body[j] do
+				Emit(Row, Col, SnakeBodyTile(PlaySnakes[ASnake].Player,
+						Shape, PlaySnakes[ASnake].FlashOn));
+		end;
+
+	begin
+	for s:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		begin
+		Stepping[s]:= False;
+		Mutual[s]:= False;
+		end;
+
+	for s:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		begin
+		// An unclaimed corner has no snake and no respawn pending.
+		if  not Assigned(Slots[s].Player) then
+			Continue;
+
+		if  not PlaySnakes[s].Alive then
+			begin
+			if  PlayRespawn[s] > 0 then
+				begin
+				Dec(PlayRespawn[s]);
+
+				if  PlayRespawn[s] = 0 then
+					begin
+					SpawnPlayerSnake(s, ADeltas, ADeltaCount);
+
+					// Tell the corner's owner it is back, so the client
+					// can forget the direction it last sent. The snake
+					// respawns on a heading WE chose, and a player who
+					// held a direction through the respawn would
+					// otherwise have it deduped away client-side and
+					// never actually turn (dengland, 2026-08-25).
+					SlotStatusToAll(s);
+					end;
+				end;
+
+			Continue;
+			end;
+
+		// Invulnerability runs on the TICK, not the step - same reason
+		// as the demo's: it has to flash even on ticks where this snake
+		// is standing still waiting for its next move.
+		if  PlaySnakes[s].InvunTicks > 0 then
+			Dec(PlaySnakes[s].InvunTicks);
+
+		wantFlash:= (PlaySnakes[s].InvunTicks > 0)
+				and (((PlaySnakes[s].InvunTicks div DEMO_INVUN_FLASH_TICKS)
+					and 1) = 0);
+
+		repaint:= wantFlash <> PlaySnakes[s].FlashOn;
+		PlaySnakes[s].FlashOn:= wantFlash;
+		NeedRepaint[s]:= repaint;
+
+		if  PlaySnakes[s].MoveTick > 0 then
+			begin
+			Dec(PlaySnakes[s].MoveTick);
+
+			if  repaint then
+				RepaintBody(s);
+
+			Continue;
+			end;
+
+		PlaySnakes[s].MoveTick:= SnakeStepTicks(LevelProgress) - 1;
+
+		// Due a step. Work out WHERE, but move nothing yet - see the
+		// pre-pass note on the declarations above.
+		ArrivedDir[s]:= PlaySnakes[s].Dir;
+		PlaySnakes[s].Dir:= PlaySnakes[s].Look;
+
+		head:= PlaySnakes[s].Body[0];
+		StepCell(head.Row, head.Col, PlaySnakes[s].Dir);
+
+		Stepping[s]:= True;
+		TgtRow[s]:= head.Row;
+		TgtCol[s]:= head.Col;
+		end;
+
+	// Two snakes stepping into the SAME cell is a head-on, and neither
+	// of them is at fault for it. Mark both (or all of them) so the
+	// resolve pass below treats it as a draw rather than letting
+	// whichever slot happens to be lower take the cell and kill the
+	// rest.
+	for s:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		if  Stepping[s] then
+			for t:= s + 1 to SNAKE_PLAYER_COUNT - 1 do
+				if  Stepping[t]
+				and (TgtRow[s] = TgtRow[t]) and (TgtCol[s] = TgtCol[t]) then
+					begin
+					Mutual[s]:= True;
+					Mutual[t]:= True;
+					end;
+
+	// --- resolve and move ---
+	for s:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		begin
+		if  not Stepping[s] then
+			Continue;
+
+		// A head-on costs nobody anything except their momentum and
+		// their power-ups, and buys both parties a shield to get clear
+		// with. This is the original's own rule (snakeApplyCollide,
+		// server.lua:1064): in battle mode a snake only loses a life
+		// "if not tSnake2P.collide", so when both collide neither is
+		// penalised and no loser is announced - they are just reset and
+		// made invulnerable for a while.
+		//
+		// dengland asked whether a head-on should kill both instead
+		// (2026-08-25). His own game says no, and it is the better
+		// rule for four players: with everyone circulating a shared
+		// board, head-ons are frequent and often nobody's mistake.
+		// To make it lethal instead, replace this branch with
+		// KillPlayerSnake.
+		if  Mutual[s] then
+			begin
+			PlaySnakes[s].InvunTicks:= PLAY_SPAWN_INVUN_TICKS;
+
+			if  not PlaySnakes[s].FlashOn then
+				begin
+				PlaySnakes[s].FlashOn:= True;
+				RepaintBody(s);
+				end;
+
+			Continue;
+			end;
+
+		prevDir:= ArrivedDir[s];
+		repaint:= NeedRepaint[s];
+
+		head:= PlaySnakes[s].Body[0];
+		head.Row:= TgtRow[s];
+		head.Col:= TgtCol[s];
+
+		// THE COLLISION TEST. Anything that is not bare floor stops the
+		// snake dead - wall, another snake, its own body, a hazard. One
+		// test covers the lot, exactly as lava spreading and bees
+		// stepping already only accept TILE_FLOOR, so no case analysis
+		// and nothing to forget when a new tile type is added.
+		//
+		// The border ring means there is no bounds check to write: a
+		// head cannot leave the board without hitting the wall first.
+		// (The original, having no border, relies on a range test that
+		// is commented out - see the LEVEL_* notes.)
+		// The snake's OWN TAIL is exempt. It is still painted on the
+		// board here but vacates below in the same step, so the cell is
+		// genuinely free by the time the head lands on it. Without this
+		// a snake dies for turning tightly enough to follow itself -
+		// which is legal, common, and takes more skill than a loose
+		// turn, so it would punish exactly the wrong thing.
+		//
+		// Only the LAST segment. When growth lands, a growing snake
+		// keeps its tail that step and this exemption must go with it.
+		if  (Board[head.Row][head.Col] <> TILE_FLOOR)
+		and not ((head.Row = PlaySnakes[s].Body[PlaySnakes[s].Len - 1].Row)
+			 and (head.Col = PlaySnakes[s].Body[PlaySnakes[s].Len - 1].Col)) then
+			begin
+			// A shielded snake shrugs it off and simply does not move,
+			// rather than passing through. Passing through would let a
+			// spawn shield be used to cut corners across walls, which
+			// is a different game.
+			if  PlaySnakes[s].InvunTicks > 0 then
+				begin
+				if  repaint then
+					RepaintBody(s);
+
+				Continue;
+				end;
+
+			KillPlayerSnake(s, ADeltas, ADeltaCount);
+			Continue;
+			end;
+
+		with PlaySnakes[s].Body[PlaySnakes[s].Len - 1] do
+			Emit(Row, Col, TILE_FLOOR);
+
+		for i:= PlaySnakes[s].Len - 1 downto 1 do
+			PlaySnakes[s].Body[i]:= PlaySnakes[s].Body[i - 1];
+
+		PlaySnakes[s].Body[1].Shape:= SegShape(prevDir, PlaySnakes[s].Dir);
+		with PlaySnakes[s].Body[1] do
+			Emit(Row, Col, SnakeBodyTile(PlaySnakes[s].Player, Shape,
+					PlaySnakes[s].FlashOn));
+
+		// No telegraph decision here, unlike the demo - a player's next
+		// turn is whatever they press, and Look already holds it. The
+		// head is still shaped from Dir toward Look for exactly the
+		// same reason though, so a turn already pressed shows on the
+		// head a step before the body follows it.
+		head.Shape:= SegShape(PlaySnakes[s].Dir, PlaySnakes[s].Look);
+		PlaySnakes[s].Body[0]:= head;
+		Emit(head.Row, head.Col, SnakeTile(PlaySnakes[s].Player,
+				SNAKE_ROLE_HEAD, head.Shape));
+
+		if  repaint then
+			RepaintBody(s);
+		end;
+	end;
+
+// PushBoardToWatchers - resend the WHOLE board to everyone watching,
+// row-pair at a time. Caller holds Lock.
+//
+// For a wholesale change - a level appearing, the attract reel being
+// swept away - where deltas would be both enormous and pointless. The
+// client's BoardRowsData handler is address-driven, not request-driven:
+// it uses the row number in the message and does not check that it
+// asked for it, so an unsolicited push lands correctly.
+procedure TSnakeGame.PushBoardToWatchers;
+	var
+	i, r: Integer;
+
+	begin
+	for i:= 0 to Watchers.Count - 1 do
+		try
+		r:= 0;
+		while r <= BOARD_ROWS - 2 do
+			begin
+			SendBoardRows(Watchers[i], r);
+			Inc(r, 2);
+			end;
+
+		except
+		on E: Exception do
+			AddLogMessage(slkError,
+					'PushBoardToWatchers: failed for watcher - ' + E.Message);
+		end;
+	end;
+
+// StartPlay - the board stops attracting and starts playing. Caller
+// holds Lock.
+//
+// Builds a real level and pushes the whole board rather than trying to
+// delta the attract reel away: the demo leaves snakes, lava, bees and
+// food scattered over the board, and every one of those cells would
+// need clearing individually. A level change is exactly the case whole-
+// board resend exists for.
+procedure TSnakeGame.StartPlay;
+	var
+	i, deltaCount: Integer;
+	deltas: array of TTileDelta;
+
+	begin
+	Playing:= True;
+
+	// LevelProgress seeds from the board's difficulty, as the original
+	// does (iLevelProgress = iGameDifficulty).
+	LevelProgress:= Ord(Difficulty);
+
+	BuildLevel(0, LevelProgress);
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		begin
+		PlaySnakes[i].Alive:= False;
+		PlayRespawn[i]:= 0;
+		end;
+
+	// Spawns are written straight into Board here and go out with the
+	// board push below, so the deltas they generate are thrown away
+	// rather than sent - EmitCell writes both, and the push carries the
+	// result.
+	SetLength(deltas, 64);
+	deltaCount:= 0;
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		if  Assigned(Slots[i].Player) then
+			SpawnPlayerSnake(i, deltas, deltaCount);
+
+	PushBoardToWatchers;
+	end;
+
+// StopPlay - the last corner was given up; back to the attract reel.
+// Caller holds Lock.
+procedure TSnakeGame.StopPlay;
+	var
+	i: Integer;
+
+	begin
+	Playing:= False;
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		begin
+		PlaySnakes[i].Alive:= False;
+		PlayRespawn[i]:= 0;
+		end;
+
+	// Back to the demo's own board - its bar, and its snakes laid out
+	// on the circuit. InitDemoSnakes writes them into Board, so the
+	// push below carries them out with everything else.
+	BuildLevelBase;
+
+	for i:= DEMO_WALL_LEFT to DEMO_WALL_RIGHT do
+		Board[DEMO_WALL_ROW][i]:= TILE_WALL;
+
+	InitDemoSnakes;
+
+	PushBoardToWatchers;
 	end;
 
 procedure TSnakeGame.TickDemoBees(var ADeltas: array of TTileDelta;
@@ -4314,11 +4997,39 @@ procedure TSnakeGame.Tick;
 
 		// Attract/demo mode is "0 corners claimed", not a separate
 		// TGameState value (see the project's own design-decision
-		// notes) - once a slot-claim protocol exists, a corner being
-		// claimed mid-lap will just stop new deltas going out; nothing
-		// currently resets whatever a client last drew, since there's
-		// no way to claim a slot yet to actually exercise that case
-		// (button_detail_start0-3 are still TODO stubs).
+		// notes). The EDGE is what matters here: the changeover in
+		// either direction rebuilds the board wholesale and pushes it,
+		// so it must happen exactly once, not every tick.
+		if  claimed <> Playing then
+			begin
+			if  claimed then
+				StartPlay
+			else
+				StopPlay;
+			end;
+
+		if  claimed then
+			begin
+			deltaCount:= 0;
+
+			TickPlaySnakes(deltas, deltaCount);
+
+			if  deltaCount = 0 then
+				Exit;
+
+			for i:= 0 to Watchers.Count - 1 do
+				try
+				SendTileDeltas(Watchers[i], Copy(deltas, 0, deltaCount));
+
+				except
+				on E: Exception do
+					AddLogMessage(slkError,
+							'Tick: SendTileDeltas failed for watcher - ' + E.Message);
+				end;
+
+			Exit;
+			end;
+
 		if not claimed then
 			begin
 			deltaCount:= 0;
@@ -4557,6 +5268,27 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 					end;
 				end;
 			end
+		else if  AMessage.Method = $0E then
+			begin
+			// Direction - the player wants to turn. Payload is [dir],
+			// one TSnakeDir ordinal.
+			//
+			// The highest-frequency message in the protocol, so it is
+			// deliberately the smallest thing that works: no sequence
+			// number, no acknowledgement, no coordinates. A lost or
+			// stale turn is self-correcting, because the next one
+			// replaces it entirely - there is no state to resynchronise.
+			//
+			// Silently ignored if malformed or if this player holds no
+			// live snake: direction spam from a spectator is not worth
+			// an error round-trip, unlike a slot claim which is a
+			// deliberate one-off action.
+			AHandled:= True;
+
+			if  (Length(AMessage.Data) >= 1)
+			and (AMessage.Data[0] <= Ord(High(TSnakeDir))) then
+				SetPlayerLook(APlayer, TSnakeDir(AMessage.Data[0]));
+			end
 		else if  AMessage.Method = $08 then
 			begin
 			// SlotRelease - give up a corner, back to spectating.
@@ -4702,7 +5434,7 @@ procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
 	// told something different, and the payload had 252 spare bytes.
 	// Appending also keeps it backward-compatible - the client reads
 	// fixed offsets and ignores trailing data.
-	SetLength(m.Data, 3);
+	SetLength(m.Data, 4);
 	m.Data[0]:= ASlot;
 	m.Data[1]:= Ord(Slots[ASlot].State);
 
@@ -4710,6 +5442,11 @@ procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
 		m.Data[2]:= 1
 	else
 		m.Data[2]:= 0;
+
+	// Lives, appended 2026-08-25 for the same reason isyou was: the
+	// payload had room and the client reads fixed offsets, so growing
+	// this message costs nothing and spends no method number.
+	m.Data[3]:= Slots[ASlot].Lives;
 
     APlayer.AddSendMessage(m);
 	end;

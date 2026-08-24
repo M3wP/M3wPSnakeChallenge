@@ -31,11 +31,32 @@ userProcessMouse:
 		EOR	#%11111111		;Bit goes up when button goes down
 		STA	Buttons
 
+;	Port 2's direction bits, kept for the game (see gamePollJoystick,
+;	snake_game.s). They were already being read into X here and thrown
+;	away - this is the only point in the frame where DDRA is set to
+;	input, so reading them anywhere else would mean repeating the whole
+;	port dance and risking the keyboard looking like a joystick.
+;	Active low on the wire, so the EOR leaves a set bit meaning
+;	"pushed": bit0 up, bit1 down, bit2 left, bit3 right.
+		TXA
+		EOR	#%11111111
+		AND	#%00001111
+		STA	joyDirs
+
+;	Fire doubles as a left click only while joyAsMouse says so - see its
+;	own comment. A game that is steering with the stick clears it, so
+;	fire can't also press whatever control has focus.
+		LDA	joyAsMouse
+		BEQ	@nojoybtn
+
 		TXA
 		EOR	#%11111111
 		AND	#buttonLeft		;Only the joystick fire bit counts
 		ORA	Buttons			;	- merge into mouse buttons
 		STA	Buttons
+
+@nojoybtn:
+		LDA	Buttons
 
 		BEQ	@L0
 		DEC	CIA1_DDRB		;Mouse won't look like keyboard

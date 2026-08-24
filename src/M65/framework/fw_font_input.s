@@ -42,10 +42,24 @@ XMax:
 YMax:           
 	.word    	199           		;Y2 value of bounding box
 	
-Buttons:        
+Buttons:
 	.byte    	0               	;button status bits
 ButtonsOld:
 	.byte		0
+;	Control port 2's direction bits, sampled by userProcessMouse
+;	(mouse.inc) at the one moment per frame the ports are set up for it.
+;	Set bit = pushed: bit0 up, bit1 down, bit2 left, bit3 right.
+joyDirs:
+	.byte		0
+;	Whether control port 2's FIRE button also counts as a left mouse
+;	click. It normally does - that is how the joystick drives the UI on
+;	a machine with no mouse. A game clears this while the stick is
+;	steering something, or every shot at the fire button also re-presses
+;	whatever control currently has focus (caught live 2026-08-25: fire
+;	re-pressed the corner's own START, which released the corner and
+;	ended the game).
+joyAsMouse:
+	.byte		1
 ButtonLClick:
 	.byte		0
 ButtonRClick:

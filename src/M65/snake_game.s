@@ -102,6 +102,10 @@ gameStateInit:
 		STA	gameSlotWanted
 		STA	gameMySlot
 
+		LDA	#SNAKE_DIR_NONE
+		STA	gameLastDir
+		STA	gameJoyLast
+
 		RTS
 
 
@@ -211,6 +215,41 @@ BOARD_ROWS      = 20
 SLOT_CLAIM_ANY  = $FF
 SLOT_CLAIM_NONE = $FF
 
+;	Direction ordinals - MUST match TSnakeDir's declaration order in
+;	SnakeServer.pas (sdUp, sdDown, sdLeft, sdRight), since the ordinal
+;	itself is what goes on the wire. NONE is this client's own "stick
+;	centred, nothing sent yet" marker and never leaves the machine.
+SNAKE_DIR_UP    = 0
+SNAKE_DIR_DOWN  = 1
+SNAKE_DIR_LEFT  = 2
+SNAKE_DIR_RIGHT = 3
+SNAKE_DIR_NONE  = $FF
+
+;	LIVES PIPS. dengland picked $DC (2026-08-25) and asked for up to 10,
+;	drawn right to left.
+;
+;	Drawn straight to screen RAM rather than put in the label's text,
+;	because it CANNOT go through a label: screenCharXlat maps ASCII to
+;	screen codes and folds everything from $7F up onto $66, so the
+;	reachable output range is only $00..$3F. $DC is not expressible as
+;	label text at all.
+;
+;	10 fits the HUD column exactly (each block is $0A wide).
+LIVES_PIP_CHAR  = $DC
+LIVES_PIP_MAX   = 10
+
+;	TPlayerState's psPlaying ordinal (SnakeClasses.pas: psNone, psIdle,
+;	psReady, psPreparing, psWaiting, psPlaying, ...) - what SlotStatus
+;	reports for a claimed corner.
+PLAYER_STATE_PLAYING = 5
+
+;	First snake tile - TILE_SNAKE_BASE in SnakeServer.pas, and the same
+;	3 non-snake tiles (floor, wall, attract) that gameTileChars/
+;	gameTileColrs open with. Only needed to find a player's own body
+;	colour in those tables; the board render itself never needs it,
+;	since it indexes by the raw tile value the server sends.
+TILE_SNAKE_BASE = 3
+
 BOARD_ROW_PAIRS = 10			;BOARD_ROWS / 2 - fetched 2 rows at a time.
 					;	BOARD_ROWS is deliberately EVEN so this
 					;	divides exactly and no short final
@@ -285,6 +324,38 @@ gameMySlot:
 ;	which one it is. A can't carry it: the STATE_DOWN gate has to read
 ;	the element and call ctrlsControlDefChanged in between.
 gameSlotPressed:
+		.byte	$00
+
+;	Scratch for gameSendDirection's payload byte, for the same reason
+;	gameSendRowTmp exists - A doesn't survive inetGetNextSend.
+gameSendDirTmp:
+		.byte	$00
+
+;	The last direction actually SENT, by either input. Shared between
+;	gamePollJoystick and gameKeyPress so the two can't each spend a
+;	message saying what the other already said.
+gameLastDir:
+		.byte	$FF
+
+;	The stick's own last position, for edge detection - kept apart from
+;	gameLastDir because the stick reads centred the whole time somebody
+;	is playing on the keys, and letting that clear the shared record
+;	would put a message on the wire for every key auto-repeat.
+gameJoyLast:
+		.byte	$FF
+
+;	Lives remaining on each corner, from SlotStatus's 4th payload byte
+;	(see gameProcSlotStatusMsg). Drawn as pips by gameLivesPresent.
+slotLives:
+		.res	$04
+
+;	Scratch for gameLivesPresent - it has to hold the corner index and
+;	the pip count across the screen-pointer setup.
+gameLivesTmp:
+		.byte	$00
+gameLivesCol:
+		.byte	$00
+gameLivesClr:
 		.byte	$00
 
 ;	1 once WatchStart (mcPlay/$0C) has been sent to the server - i.e.
@@ -669,6 +740,22 @@ gamePollTick:
 ;	permanently offset by a few pixels with nothing to correct it.
 		JSR	gameShakeTick
 
+;	The joystick stops doubling as a mouse the moment this client holds
+;	a corner, and starts again the moment it doesn't. Recomputed every
+;	pass rather than toggled on the transitions, so there is no path -
+;	disconnect, drop, refused claim - that can leave the pointer
+;	permanently dead. Above the connection gate for that same reason:
+;	losing the connection while playing must still give the mouse back.
+		LDA	#$01
+		LDX	gameMySlot
+		CPX	#SLOT_CLAIM_NONE
+		BEQ	@setjoymouse
+
+		LDA	#$00
+
+@setjoymouse:
+		STA	joyAsMouse
+
 		LDA	inetproc
 		CMP	#INET_PROC_EXEC
 		BEQ	@connected
@@ -682,6 +769,21 @@ gamePollTick:
 		RTS
 
 @connected:
+;	Steer the snake, but only while this client actually holds a corner.
+;	Gated on gameMySlot rather than on the page, so the stick is live
+;	the moment the server confirms the claim and dead the moment it is
+;	given up - a spectator's joystick must not be able to turn anyone.
+;
+;	Above the page test on purpose: a player who tabs away from the
+;	board page is still ON the board, and their snake keeps moving. If
+;	their controls went dead with the page they'd come back to a corpse.
+		LDA	gameMySlot
+		CMP	#SLOT_CLAIM_NONE
+		BEQ	@nojoy
+
+		JSR	gamePollJoystick
+
+@nojoy:
 		LDA	pageptr0
 		CMP	#<page_detail
 		BNE	@notwatching
@@ -801,6 +903,176 @@ gameDetailBkgPresent:
 
 
 ;-------------------------------------------------------------------------------
+;	gameLivesInvalidate - mark one corner's lives row for redraw.
+;	Preserves X, which the caller (gameProcSlotStatusMsg) is still using
+;	as the corner index afterwards.
+;	IN	.X		corner 0..3
+;-------------------------------------------------------------------------------
+gameLivesInvalidate:
+;-------------------------------------------------------------------------------
+		CPX	#$04
+		BCS	@exit				;defensive - shouldn't happen
+
+		TXA
+		PHA
+
+		ASL	A				;word table
+		TAX
+
+		LDA	gameLivesCtrls, X
+		STA	elemptr0
+		LDA	gameLivesCtrls + 1, X
+		STA	elemptr0 + 1
+
+		JSR	ctrlsControlInvalidate
+
+		PLA
+		TAX
+
+@exit:
+		RTS
+
+gameLivesCtrls:
+		.word	label_detail_pwr1_0
+		.word	label_detail_pwr1_1
+		.word	label_detail_pwr1_2
+		.word	label_detail_pwr1_3
+
+
+;-------------------------------------------------------------------------------
+;	gameLivesPresent - the four corners' PWR1 rows draw the corner's
+;	remaining lives as pips instead of label text. One handler for all
+;	four; each control's TAG byte says which corner it is.
+;
+;	A present hook rather than a one-off draw, because the HUD panel
+;	repaints its own background on every dirty pass - anything painted
+;	over the top from outside would be wiped by the next repaint. This
+;	way the pips are redrawn by the same pass that would have erased
+;	them, which is also how the label they replace worked.
+;
+;	Pips fill RIGHT TO LEFT from the end of the block (dengland,
+;	2026-08-25), so the row reads as a gauge draining toward the left
+;	rather than a string growing rightward.
+;-------------------------------------------------------------------------------
+gameLivesPresent:
+;-------------------------------------------------------------------------------
+		LDY	#ELEMENT::tag
+		LDA	(elemptr0), Y
+		TAX
+		CPX	#$04
+		BCS	@present			;bad tag - just present as-is
+
+;	Colour this row as that corner's snake BODY before presenting, so
+;	the framework's own erase/draw paints in it and nothing here has to
+;	touch colour RAM by hand.
+;
+;	CLR_SPEC_TEXT is the escape hatch for exactly this: control colours
+;	are normally SCHEME indices remapped through current_clrs, but
+;	screenCtrlToLogClr tests BIT #$30 first and, if either CLR_SPEC_*
+;	bit is set, masks to the low nibble and returns it untouched. So a
+;	raw palette colour can be carried in a control's own colour byte.
+;	(dengland pointed this out - I had gone and written colour RAM
+;	directly, which worked but bypassed the framework for no reason.)
+;
+;	Taken from gameTileColrs rather than hardcoded per control, so a
+;	palette change moves the HUD and the board together. Body tile for
+;	player p is TILE_SNAKE_BASE + (p * SNAKE_ROLE_COUNT +
+;	SNAKE_ROLE_BODY) * SHAPE_COUNT; every shape in the block shares one
+;	colour, and SNAKE_ROLE_BODY is 0, so that reduces to base + p * 12.
+		TXA
+		ASL	A				;p * 2
+		ASL	A				;p * 4
+		ASL	A				;p * 8
+		STA	gameLivesClr
+		TXA
+		ASL	A
+		ASL	A				;p * 4
+		CLC
+		ADC	gameLivesClr			;p * 12
+		CLC
+		ADC	#TILE_SNAKE_BASE
+		TAY
+
+		LDA	gameTileColrs, Y
+		ORA	#CLR_SPEC_TEXT
+		LDY	#ELEMENT::colour
+		STA	(elemptr0), Y
+
+@present:
+		JSR	ctrlsControlDefPresent
+
+;	Only paint pips for a corner that is actually being played. An
+;	unclaimed corner shows nothing at all - a row of zero pips, which
+;	the erase above has already left behind.
+		LDY	#ELEMENT::tag
+		LDA	(elemptr0), Y
+		TAX
+		CPX	#$04
+		BCS	@bail
+
+		LDA	slotStates, X
+		CMP	#PLAYER_STATE_PLAYING
+		BNE	@bail
+
+		LDA	slotLives, X
+		BNE	@havelives
+
+;	Nothing to draw. Its own RTS rather than a branch to the one at the
+;	end - the pip setup below is long enough that @exit is out of
+;	branch range from up here.
+@bail:
+		RTS
+
+@havelives:
+		CMP	#LIVES_PIP_MAX + 1
+		BCC	@count
+
+		LDA	#LIVES_PIP_MAX			;clamp - the block is only 10 wide
+
+@count:
+		STA	gameLivesTmp
+
+;	Screen row for this control, via the same row tables the board
+;	render uses. Only the CHARACTERS are written here - the colour is
+;	already correct, painted by the present above from this control's
+;	own colour byte (see the CLR_SPEC_TEXT note at the top).
+		LDY	#ELEMENT::posy
+		LDA	(elemptr0), Y
+		TAY
+
+		LDA	screenRowsLo, Y
+		STA	tempptr0
+		LDA	screenRowsHi, Y
+		STA	tempptr0 + 1
+		LDA	#$01				;bank - screen RAM is at $010000
+		STA	tempptr0 + 2
+		LDA	#$00				;top
+		STA	tempptr0 + 3
+
+;	Start at the RIGHTMOST cell of the control and walk left, so the
+;	pips are anchored to the end of the block however many there are.
+		LDY	#ELEMENT::posx
+		LDA	(elemptr0), Y
+		LDY	#ELEMENT::width
+		CLC
+		ADC	(elemptr0), Y
+		SEC
+		SBC	#$01
+		STA	gameLivesCol
+
+@loop:
+		LDA	#LIVES_PIP_CHAR
+		STCELL16 tempptr0, gameLivesCol
+
+		DEC	gameLivesCol
+		DEC	gameLivesTmp
+		BNE	@loop
+
+@exit:
+		RTS
+
+
+;-------------------------------------------------------------------------------
 ;	gameSendBoardRowsReq - sends mcPlay/$0A (BoardRowsReq), the client
 ;	half of the row-paginated full-board sync (see SendBoardRows,
 ;	SnakeServer.pas). Payload is just the requested pair's starting row
@@ -832,6 +1104,185 @@ gameSendBoardRowsReq:
 @failed:
 		JSR	clientNotifyFail
 
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameSendDirection - sends mcPlay/$0E (Direction), payload [dir],
+;	one TSnakeDir ordinal (SNAKE_DIR_UP/DOWN/LEFT/RIGHT).
+;
+;	The highest-frequency message this client sends, so it is the
+;	smallest thing that works - no sequence number and no reply. A lost
+;	turn needs no recovery because the next one replaces it outright;
+;	there is no accumulated state to drift.
+;	IN	.A		direction 0..3
+;-------------------------------------------------------------------------------
+gameSendDirection:
+;-------------------------------------------------------------------------------
+		STA	gameSendDirTmp
+
+		JSR	inetGetNextSend
+		BCC	@failed
+
+		LDA	#MSG_CATG_PLAY
+		ORA	#$0E
+		JSR	strsAppendChar
+
+		LDA	gameSendDirTmp
+		JSR	strsAppendChar
+
+		DEC	tempdat0
+		LDA	tempdat0
+		LDY	#$00
+		STA	(tempptr0), Y
+
+		RTS
+
+@failed:
+;	Deliberately does NOT call clientNotifyFail. A direction is sent on
+;	every change while playing, so a transient send failure here would
+;	spray the log during exactly the moment the player is busiest. The
+;	next turn re-sends anyway.
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameKeyPress - GAME HOOK, called from ctrlsPageKeyPress
+;	(fw_ctrls_net.s) before any framework key handling at all.
+;	IN	.A		key code (also parked in msgsdat0)
+;	OUT	carry set if the key was consumed
+;
+;	While this client holds a corner the cursor keys ARE the controls,
+;	and are sent as Directions instead of navigating the UI. dengland
+;	asked for this because his joystick is forty years old and showing
+;	it (2026-08-25) - it also makes the game playable on a machine with
+;	nothing plugged into port 2 at all.
+;
+;	Gated on gameMySlot, so a spectator's cursor keys still navigate
+;	normally and nothing is stolen from the UI when there is no snake
+;	to steer. Every other key falls straight through, so accelerators,
+;	TAB and chat typing all keep working while playing.
+;-------------------------------------------------------------------------------
+gameKeyPress:
+;-------------------------------------------------------------------------------
+		LDX	gameMySlot
+		CPX	#SLOT_CLAIM_NONE
+		BEQ	@notours
+
+		CMP	#KEY_C64_CUP
+		BEQ	@up
+		CMP	#KEY_C64_CDOWN
+		BEQ	@down
+		CMP	#KEY_C64_CLEFT
+		BEQ	@left
+		CMP	#KEY_C64_CRIGHT
+		BEQ	@right
+
+@notours:
+		CLC					;not ours - let the UI have it
+		RTS
+
+@up:
+		LDA	#SNAKE_DIR_UP
+		JMP	@send
+
+@down:
+		LDA	#SNAKE_DIR_DOWN
+		JMP	@send
+
+@left:
+		LDA	#SNAKE_DIR_LEFT
+		JMP	@send
+
+@right:
+		LDA	#SNAKE_DIR_RIGHT
+
+@send:
+;	Keys auto-repeat and the server would only re-apply the heading it
+;	already has, so drop a repeat of whatever was last sent. Shares
+;	gameLastDir with gamePollJoystick deliberately - the stick and the
+;	keys are two ways of saying the same thing, and one record of what
+;	actually went out stops them fighting over it.
+		CMP	gameLastDir
+		BEQ	@done
+
+		STA	gameLastDir
+
+		JSR	gameSendDirection
+
+@done:
+		SEC					;consumed either way
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gamePollJoystick - turn control port 2 into Direction messages.
+;	Called from gamePollTick while this client holds a corner.
+;
+;	Sends only on CHANGE, not every frame: at 50Hz a held stick would
+;	otherwise be ~50 messages a second per player, which is both
+;	pointless (the server keeps the last one) and enough to matter on a
+;	board with four of them.
+;
+;	Diagonals resolve to whichever axis is tested first rather than
+;	being rejected. Rejecting them makes a stick feel dead in the
+;	corners, where a player rolling from one direction to the next
+;	passes through a diagonal every single time.
+;-------------------------------------------------------------------------------
+gamePollJoystick:
+;-------------------------------------------------------------------------------
+		LDA	joyDirs
+		AND	#%00001111
+		BEQ	@centred			;stick at rest - nothing to send
+
+		LDX	#SNAKE_DIR_UP
+		LSR	A				;bit0 - up
+		BCS	@have
+
+		LDX	#SNAKE_DIR_DOWN
+		LSR	A				;bit1 - down
+		BCS	@have
+
+		LDX	#SNAKE_DIR_LEFT
+		LSR	A				;bit2 - left
+		BCS	@have
+
+		LDX	#SNAKE_DIR_RIGHT		;bit3 - right, all that's left
+
+@have:
+;	Stick unmoved since the last poll - nothing to do. This is the
+;	STICK's own edge detection and is separate from gameLastDir below,
+;	which records what was actually transmitted.
+		CPX	gameJoyLast
+		BEQ	@done
+
+		STX	gameJoyLast
+
+;	Moved, but possibly onto a heading already sent (by the keys, or by
+;	the stick before a release). The server would only re-apply what it
+;	has, so don't spend a message on it.
+		CPX	gameLastDir
+		BEQ	@done
+
+		STX	gameLastDir
+
+		TXA
+		JMP	gameSendDirection
+;		RTS
+
+@centred:
+;	Releasing the stick doesn't stop the snake - it keeps its heading,
+;	as snakes do. Only the stick's own edge state is cleared here.
+;
+;	gameLastDir is deliberately NOT touched: it is shared with
+;	gameKeyPress, and the stick sits centred the entire time somebody
+;	is playing on the cursor keys. Clearing it here would defeat the
+;	keys' repeat suppression completely and put a message on the wire
+;	for every auto-repeat.
+		LDA	#SNAKE_DIR_NONE
+		STA	gameJoyLast
+
+@done:
 		RTS
 
 
@@ -1084,6 +1535,33 @@ gameProcSlotStatusMsg:
 
 		LDA	readmsg0 + 3			;state
 		STA	slotStates, X
+
+		LDA	readmsg0 + 5			;lives
+		STA	slotLives, X
+
+;	The pips live on this corner's PWR1 row and are only redrawn by its
+;	present hook, so a life lost has to invalidate that control or the
+;	row keeps showing the old count until something else dirties it.
+		JSR	gameLivesInvalidate
+
+;	If this is OUR corner, forget what direction we last sent. A death
+;	respawns the snake on a fresh heading chosen by the server, and
+;	gameLastDir still holds whatever we were steering with when we
+;	died - so pressing that same direction again would be deduped away
+;	and the snake would keep the spawn heading instead of turning
+;	(dengland, 2026-08-25).
+;
+;	Done on any SlotStatus for our own corner rather than only on a
+;	death: claim, death and respawn all land here, and the worst case
+;	of over-triggering is one redundant direction message.
+		CPX	gameMySlot
+		BNE	@nodirreset
+
+		LDA	#SNAKE_DIR_NONE
+		STA	gameLastDir
+		STA	gameJoyLast
+
+@nodirreset:
 
 ;	Whatever the server says about this corner settles any claim we had
 ;	outstanding for it, granted or refused.
@@ -2072,7 +2550,7 @@ label_detail_score3:
 
 label_detail_pwr1_0:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameLivesPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2082,7 +2560,7 @@ label_detail_pwr1_0:
 			.byte	$07		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$00		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
 			.word	text_detail_pwr1	;textptr	.word
 			.byte	$00		;textoffx .byte
@@ -2092,7 +2570,7 @@ label_detail_pwr1_0:
 
 label_detail_pwr1_1:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameLivesPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2102,7 +2580,7 @@ label_detail_pwr1_1:
 			.byte	$0C		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$01		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
 			.word	text_detail_pwr1	;textptr	.word
 			.byte	$00		;textoffx .byte
@@ -2112,7 +2590,7 @@ label_detail_pwr1_1:
 
 label_detail_pwr1_2:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameLivesPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2122,7 +2600,7 @@ label_detail_pwr1_2:
 			.byte	$11		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$02		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
 			.word	text_detail_pwr1	;textptr	.word
 			.byte	$00		;textoffx .byte
@@ -2132,7 +2610,7 @@ label_detail_pwr1_2:
 
 label_detail_pwr1_3:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameLivesPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2142,7 +2620,7 @@ label_detail_pwr1_3:
 			.byte	$16		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$03		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
 			.word	text_detail_pwr1	;textptr	.word
 			.byte	$00		;textoffx .byte
@@ -2303,11 +2781,17 @@ gameSlotChanged:
 
 
 ;-------------------------------------------------------------------------------
-;	gameSlotPress - a corner's START control was pressed. Pressing the
-;	corner you already hold RELEASES it; pressing any other one tries
-;	to CLAIM it. One control per corner doing both directions, rather
-;	than a separate leave button, since a corner can only ever be in
-;	one of those two states from this client's point of view.
+;	gameSlotPress - a corner's START control was pressed. START only
+;	ever CLAIMS; it is not a toggle.
+;
+;	It was a toggle until 2026-08-25, and that was wrong twice over
+;	(dengland: "you shouldn't be able to claim an active player"). An
+;	occupied corner is not something to press - pressing your own
+;	dropped you out of a running game, and with the joystick's fire
+;	button still counting as a mouse click at the time, a shot at the
+;	fire button did exactly that by itself. Leaving a corner is what
+;	the PART control is for, which already releases the slot via the
+;	server's own Remove.
 ;
 ;	Nothing is assumed about the outcome - gameMySlot only ever moves
 ;	when the server's own SlotStatus says so (see
@@ -2317,8 +2801,12 @@ gameSlotChanged:
 ;-------------------------------------------------------------------------------
 gameSlotPress:
 ;-------------------------------------------------------------------------------
-		CMP	gameMySlot
-		BEQ	@release
+;	Already holding a corner - any START press is a no-op, including
+;	this corner's own. Checked client-side as well as server-side so a
+;	stray press never even reaches the wire as an error.
+		LDX	gameMySlot
+		CPX	#SLOT_CLAIM_NONE
+		BNE	@busy
 
 ;	Don't stack claims. Without this, holding the accelerator down (or
 ;	an impatient double-press while the first is still in flight) sends
@@ -2332,14 +2820,6 @@ gameSlotPress:
 		STA	gameSlotWanted
 
 		JMP	gameSendSlotClaim
-;		RTS
-
-@release:
-;	Deliberately does NOT clear gameMySlot here. The server's own
-;	SlotStatus broadcast clears it (isyou goes to 0), and doing it
-;	locally as well would mean a release whose SEND failed left this
-;	client believing it had left a corner it still holds.
-		JMP	gameSendSlotRelease
 ;		RTS
 
 @busy:
@@ -2370,7 +2850,8 @@ text_ovrvw_score4:
 text_detail_score:
 			.asciiz	"000000"
 text_detail_pwr1:
-			.asciiz	"PWR1:--"
+			.asciiz	"          "	;lives row - pips are drawn by
+							;	gameLivesPresent, not text
 text_detail_pwr2:
 			.asciiz	"PWR2:--"
 text_detail_start0:
