@@ -372,29 +372,78 @@ boardRowOffsetHi:
 ;	branches that could drift apart. Extend here, not with more
 ;	branches, when a real tile set exists.
 ;
-;	Both snakes use $A0 for head AND body for now - user's own call
-;	(2026-08-24): "use $00A0 for the snake tiles including the head
-;	tile for now, we'll need to find out what the look direction tiles
-;	are". The head is already a SEPARATE tile value on the wire, so
-;	when those direction tiles turn up only this table changes - the
-;	protocol and the server don't. Snake colours are the user's own
-;	pick: $0E light blue for snake 1, $0A light red for snake 2.
+;	Snakes are drawn as a CONNECTED PIPE - each cell's character
+;	depends on which way the snake entered it and which way it left,
+;	so turning leaves a corner piece behind. The six shapes are named
+;	by the compass directions the pipe OPENS TOWARD, after the user's
+;	own point (2026-08-24) that describing them as left/right turns
+;	"is a bit odd" - which turn it is depends on which way you were
+;	already going, but what the pipe connects to never changes:
 ;
-;	The order here must match the TILE_* numbering exactly - these are
-;	indexed by raw tile value, with no bounds check on this side (see
-;	gameProcTileDeltaMsg's own range check, which is what guarantees
-;	only real board cells ever reach a lookup).
+;		SHAPE_HORZ $C0	opens E-W	SHAPE_NE $CA	opens N+E
+;		SHAPE_VERT $DD	opens N-S	SHAPE_NW $CB	opens N+W
+;		SHAPE_WS   $C9	opens W+S	SHAPE_ES $D5	opens E+S
+;
+;	Head and body use the SAME six shapes and differ only in COLOUR.
+;	A turning head shows the CORNER piece one step early - the server
+;	shapes it by where the snake came from and the turn it's already
+;	committed to (TDemoSnake.Look), the way a Pac-Man ghost's eyes
+;	commit to a corner before its body does. When the head then moves
+;	on, that cell keeps the identical character and only changes to
+;	the body colour, so the hand-off is invisible.
+;
+;	That's why the character set has one "looking left or right" and
+;	one "looking up or down" rather than four facings - a head running
+;	straight is just a straight pipe.
+;
+;	Tile value = TILE_SNAKE_BASE + ((player * 2) + role) * 6 + shape
+;	(SnakeServer.pas) - 8 blocks of 6 in player order, body block then
+;	head block. The order here must match that numbering exactly:
+;	these are indexed by raw tile value with no bounds check on this
+;	side (gameProcTileDeltaMsg's range check on row/col is what
+;	guarantees only real board cells ever reach a lookup). All 48 are
+;	reachable - heads take corner shapes too, one step before turning.
+;
+;	Colours are the user's own pick (2026-08-24), light body / dark
+;	head per player: P1 $0E/$06, P2 $0A/$02, P3 $0D/$05, P4 $07/$08.
 gameTileChars:
-;		floor  wall   attract snake1  s1 head snake2  s2 head
-		.byte	$20,   $66,   $66,    $A0,    $A0,    $A0,    $A0
+;		floor  wall   attract
+		.byte	$20,   $66,   $66
+;	The same six shapes for every one of the 8 player/role blocks.
+		.repeat	8
+		.byte	$C0, $DD, $C9, $CA, $CB, $D5
+		.endrepeat
+
 gameTileColrs:
 		.byte	CLR_LOG_C64_BLACK
 		.byte	CLR_LOG_C64_LIGHTGREEN
 		.byte	CLR_LOG_C64_WHITE
-		.byte	CLR_LOG_C64_LIGHTBLUE		;$0E - snake 1 body
-		.byte	CLR_LOG_C64_LIGHTBLUE		;$0E - snake 1 head
-		.byte	CLR_LOG_C64_LIGHTRED		;$0A - snake 2 body
-		.byte	CLR_LOG_C64_LIGHTRED		;$0A - snake 2 head
+
+;	One colour per block of 6 shapes, in tile-value order.
+		.repeat	6
+		.byte	CLR_LOG_C64_LIGHTBLUE		;$0E - P1 body
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_BLUE		;$06 - P1 head
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_LIGHTRED		;$0A - P2 body
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_RED			;$02 - P2 head
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_LIGHTGREEN		;$0D - P3 body
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_GREEN		;$05 - P3 head
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_YELLOW		;$07 - P4 body
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_ORANGE		;$08 - P4 head
+		.endrepeat
 
 
 ;-------------------------------------------------------------------------------

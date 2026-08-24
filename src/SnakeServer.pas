@@ -32,6 +32,10 @@ const
 	// for the same reason as the board size - TDemoSnake needs it.
 	MAX_SNAKE_LEN = 64;
 
+	// The 4 corners/players. Up here for the same reason -
+	// TSnakeGame.DemoSnakes is declared in the type block below.
+	SNAKE_PLAYER_COUNT = 4;
+
 type
 
 	{ TServerDispatcher }
@@ -205,10 +209,17 @@ type
 	// 1/2/4/8 bit flags.
 	TSnakeDir = (sdUp, sdDown, sdLeft, sdRight);
 
-	// One body segment's board position. Body[0] is the head, matching
-	// the original's body[1]-is-head convention (1-based there).
+	// One body segment's board position, plus which pipe shape that cell
+	// renders as (a SHAPE_* value - see their comment). The shape is a
+	// property of the PATH through the cell, so once set it never
+	// changes as the segment moves down the body toward the tail; only
+	// the newly-vacated tail, the newly-demoted old head and the new
+	// head ever need repainting on a step.
+	// Body[0] is the head, matching the original's body[1]-is-head
+	// convention (1-based there).
 	TSnakeSeg = record
 		Row, Col: Byte;
+		Shape: Integer;
 	end;
 
 	// A demo-mode snake. The demo AI is the original's snakeMenu()
@@ -221,15 +232,31 @@ type
 	TDemoSnake = record
 		Body: array[0..MAX_SNAKE_LEN - 1] of TSnakeSeg;
 		Len: Integer;
+
+		// Dir is the way the snake ACTUALLY last travelled; Look is the
+		// way it intends to go next. Separate for exactly the reason the
+		// original separates move from look (server.lua): the head is
+		// drawn from LOOK, so it visibly turns the moment the turn is
+		// decided, one or more ticks before the body follows. The
+		// original repaints the head as soon as input arrives
+		// (playersTick) and only assigns move = look when the snake
+		// actually steps (snakeMove) - and snakeMenu, the attract AI,
+		// sets look too, so demo snakes get the same tell.
+		//
+		// Keeping Dir is not just bookkeeping: the corner left behind on
+		// a turn needs the direction actually travelled IN to that cell,
+		// which Look has already moved on from.
 		Dir: TSnakeDir;
+		Look: TSnakeDir;
 
 		// Ticks left before this snake's next step - the original's
 		// per-snake moveTick countdown (objectsTick), which is what
 		// lets snakes move at different speeds off one shared tick.
 		MoveTick: Integer;
 
-		// Tile values this snake's head and body render as.
-		HeadTile, BodyTile: Byte;
+		// Which of the 4 players this snake renders as (0-3) - decides
+		// its colours client-side, via SnakeTile.
+		Player: Integer;
 	end;
 
 	TSnakeGame = class(TZone)
@@ -285,7 +312,7 @@ type
 		// (2026-08-24) - the bounce was scaffolding for the wire format,
 		// this is the original's actual attract mode (server.lua's
 		// iGameMode = tGAMEMODE.attract, driven by snakeMenu).
-		DemoSnakes: array[0..1] of TDemoSnake;
+		DemoSnakes: array[0..SNAKE_PLAYER_COUNT - 1] of TDemoSnake;
 
 		constructor Create; override;
 		destructor  Destroy; override;
@@ -443,7 +470,18 @@ const
 		{$IFDEF LINUX}
    	LIT_SYS_PLATFRM: AnsiString = 'linux';
 		{$ELSE}
+		//	FPC defines UNIX and DARWIN for macOS, but NOT LINUX, so
+		//	without this macOS would fall through and report itself as
+		//	the generic 'unix' (spotted by the user, 2026-08-24 - "I
+		//	might have forgotten it since I can't build for it at all").
+		//	Untested: there's no Mac here to build on. It's a
+		//	compile-time string choice only, so on every other target
+		//	DARWIN simply isn't defined and nothing changes.
+			{$IFDEF DARWIN}
+   	LIT_SYS_PLATFRM: AnsiString = 'macos';
+			{$ELSE}
    	LIT_SYS_PLATFRM: AnsiString = 'unix';
+			{$ENDIF}
 		{$ENDIF}
 	{$ELSE}
 	LIT_SYS_PLATFRM: AnsiString = 'mswindows';
@@ -522,19 +560,49 @@ const
 	// disturbing anything already on the wire.
 	TILE_ATTRACT = 2;
 
-	// Demo-mode snake segments. Head and body are separate values even
-	// though both currently render as the same character ($A0) - the
-	// user's own call (2026-08-24): "use $00A0 for the snake tiles
-	// including the head tile for now, we'll need to find out what the
-	// look direction tiles are". When those are known only the CLIENT's
-	// lookup table changes; the wire protocol and this numbering don't.
-	// The original does the same split - server.lua's realiseSnake draws
-	// body[1] from tSnakeLook[look] and every other segment from a fixed
-	// index.
-	TILE_SNAKE1 = 3;
-	TILE_SNAKE1_HEAD = 4;
-	TILE_SNAKE2 = 5;
-	TILE_SNAKE2_HEAD = 6;
+	// Snake segments, drawn as a CONNECTED PIPE: each cell's character
+	// depends on which way the snake entered it and which way it left,
+	// so a turn leaves a corner piece behind. Shapes are named by the
+	// compass directions the pipe OPENS TOWARD, which is unambiguous -
+	// describing them as left/right turns depends on which way you were
+	// already going and reads as gibberish (user, 2026-08-24: "this and
+	// that way left and right is a bit odd").
+	//
+	// Characters (user-supplied, 2026-08-24): SHAPE_HORZ $C0,
+	// SHAPE_VERT $DD, SHAPE_WS $C9, SHAPE_NE $CA, SHAPE_NW $CB,
+	// SHAPE_ES $D5. The client owns the actual characters - see
+	// gameTileChars, snake_game.s.
+	SHAPE_HORZ = 0;			// opens E-W
+	SHAPE_VERT = 1;			// opens N-S
+	SHAPE_WS   = 2;			// opens W+S
+	SHAPE_NE   = 3;			// opens N+E
+	SHAPE_NW   = 4;			// opens N+W
+	SHAPE_ES   = 5;			// opens E+S
+	SHAPE_COUNT = 6;
+
+	// Head and body use the SAME six shapes and differ only in COLOUR.
+	// Every segment is shaped by where the snake entered that cell and
+	// where it leaves it - for the head, "leaves" means the turn it has
+	// already committed to but not yet made (see TDemoSnake.Look), so a
+	// turning head shows the corner piece one step EARLY. When it then
+	// moves on, that cell keeps the identical character and only
+	// changes colour to the body's, making the hand-off invisible.
+	//
+	// This is why the user's character list has one "looking left or
+	// right" and one "looking up or down" rather than four facings: a
+	// head running straight is just a straight pipe.
+	SNAKE_ROLE_BODY = 0;
+	SNAKE_ROLE_HEAD = 1;
+	SNAKE_ROLE_COUNT = 2;
+
+	// Tile value = TILE_SNAKE_BASE
+	//              + ((player * SNAKE_ROLE_COUNT) + role) * SHAPE_COUNT
+	//              + shape
+	// 4 players x 2 roles x 6 shapes = 48 values, 3..50 - comfortably
+	// inside the one byte a delta carries. All 48 are reachable: heads
+	// take corner shapes too, one step before they turn. See SnakeTile.
+	TILE_SNAKE_BASE = 3;
+
 
 	// 12 ticks/sec (1000 div 12 = 83ms) as of 2026-08-24 - raised from
 	// the original 6/sec once measurement showed the client keeping up
@@ -563,20 +631,63 @@ const
 	// TICK_MS=83 that's ~6 steps/sec for the demo, ~4 for normal play
 	// and ~12 flat out.
 	//
-	// This is the demo/attract value only. Real play will carry a
-	// per-snake period (the original's moveTick reset value) rather
-	// than sharing this constant.
+	// The gear names, in ticks-per-step (SMALLER is faster).
+	SNAKE_SPEED_NORMAL = 3;
+	SNAKE_SPEED_FAST   = 2;
+	SNAKE_SPEED_TOP    = 1;
 	//
 	// The original also modulates this per snake via moveFast (food
 	// speed-ups and slow-downs, +30..-12, decaying 1/tick back toward
 	// 0) - deliberately NOT implemented here, since demo snakes never
 	// eat. When food lands, that becomes a per-snake offset applied to
 	// this base, exactly as objectsTick does it.
-	SNAKE_MOVE_TICKS = 2;
+	//
+	// Attract mode runs at FAST: quicker than normal play so the demo
+	// looks lively, but never TOP. Both halves are the user's own rules
+	// (2026-08-24), guarded below rather than left to a comment.
+	//
+	// NORMAL and TOP were each run briefly to judge the turn telegraph,
+	// which lasts exactly one step - so its duration IS the step
+	// duration: 250ms at NORMAL, 166ms at FAST, 83ms at TOP. Top speed
+	// measured 12.1 cells/sec with four snakes and the client tracking
+	// it perfectly, so the limit there is human rather than technical:
+	// 83ms is below visual reaction time, making the top gear something
+	// played from anticipation. User's verdict: "that's deadly with 4p".
+	SNAKE_MOVE_TICKS = SNAKE_SPEED_FAST;
 
-	// Starting length of each demo snake, matching the original's
-	// non-battle initSnakes (5 segments).
-	DEMO_SNAKE_LEN = 5;
+	// Top speed is what a powered-up player earns; an attract screen
+	// handing it out for free undercuts that.
+{$IF SNAKE_MOVE_TICKS <= SNAKE_SPEED_TOP}
+	{$ERROR demo snakes must not run at top speed}
+{$ENDIF}
+{$IF SNAKE_MOVE_TICKS >= SNAKE_SPEED_NORMAL}
+	{$ERROR demo snakes must be faster than normal play}
+{$ENDIF}
+
+	// Hard ceiling on a DEMO snake, well under MAX_SNAKE_LEN (user,
+	// 2026-08-24: "much less say 8 or 10 so they don't collide too
+	// much").
+	//
+	// The real constraint is geometric: all the demo snakes share one
+	// circuit, evenly spaced, so the gap between them is
+	// DEMO_LAP div SNAKE_PLAYER_COUNT. On the current 30x20 board that
+	// lap is 80 cells and 4 snakes sit 20 apart, so anything from 20
+	// up would have a snake's tail reach the head behind it. 10 leaves
+	// half the gap clear. If the board, the inset or the player count
+	// change, re-check this against that division rather than assuming
+	// 10 is still safe - the compile-time guard further down does
+	// exactly that check.
+	DEMO_SNAKE_MAX_LEN = 10;
+
+	// Starting length of each demo snake. The original's non-battle
+	// initSnakes uses 5; kept at the ceiling here after the turn
+	// telegraph turned out to be hard to READ at 5, on the user's own
+	// diagnosis that the missing part was not seeing the snakes "moving
+	// straight ahead for long enough" rather than not seeing the turn
+	// early enough. A longer body makes the direction of travel legible
+	// at a glance, which is what a turn has to stand out against - and
+	// with it at 10 the telegraph reads clearly ("yes, its there").
+	DEMO_SNAKE_LEN = DEMO_SNAKE_MAX_LEN;
 
 
 
@@ -2029,61 +2140,215 @@ procedure TSnakeGame.SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TT
 	APlayer.AddSendMessage(m);
 	end;
 
-// The demo circuit - the interior rectangle, one cell inside the wall
-// border. The original's snakeMenu() hard-codes the equivalent numbers
-// for its own 28x16 playfield (1/26 horizontally, 1/14 vertically);
-// deriving them from the board size instead means the vertical growth
-// to 20 rows needed no change here at all.
+// The demo circuit - a rectangle inset TWO cells from the board edge,
+// i.e. one clear cell between the snakes and the wall (user's own call,
+// 2026-08-24: "can we move them one tile in from the edge though?").
+// The original's snakeMenu() hard-codes the equivalent numbers for its
+// own 28x16 playfield; deriving them from the board size instead means
+// neither the growth to 20 rows nor this inset needed anything else
+// changed.
 const
-	DEMO_LEFT   = 1;
-	DEMO_RIGHT  = BOARD_COLS - 2;
-	DEMO_TOP    = 1;
-	DEMO_BOTTOM = BOARD_ROWS - 2;
+	DEMO_INSET  = 2;
+	DEMO_LEFT   = DEMO_INSET;
+	DEMO_RIGHT  = BOARD_COLS - 1 - DEMO_INSET;
+	DEMO_TOP    = DEMO_INSET;
+	DEMO_BOTTOM = BOARD_ROWS - 1 - DEMO_INSET;
+
+	// Lap length in cells, walking the rectangle's perimeter.
+	DEMO_RUN_H  = DEMO_RIGHT - DEMO_LEFT;
+	DEMO_RUN_V  = DEMO_BOTTOM - DEMO_TOP;
+	DEMO_LAP    = 2 * DEMO_RUN_H + 2 * DEMO_RUN_V;
+
+	// Gap between consecutive snakes on the shared circuit.
+	DEMO_SPACING = DEMO_LAP div SNAKE_PLAYER_COUNT;
+
+// Enforced rather than left as a comment to re-check: the demo snakes
+// only stay clear of each other because they're evenly spaced on one
+// circuit, so a snake must be shorter than the gap or its tail reaches
+// the head behind it. Board size, DEMO_INSET and SNAKE_PLAYER_COUNT all
+// feed DEMO_SPACING, so any of them changing can break this silently.
+{$IF DEMO_SNAKE_MAX_LEN >= DEMO_SPACING}
+	{$ERROR DEMO_SNAKE_MAX_LEN must be less than DEMO_SPACING - demo snakes would collide}
+{$ENDIF}
+{$IF DEMO_SNAKE_LEN > DEMO_SNAKE_MAX_LEN}
+	{$ERROR DEMO_SNAKE_LEN exceeds DEMO_SNAKE_MAX_LEN}
+{$ENDIF}
+
+// Tile value for one snake segment - see the SHAPE_*/SNAKE_ROLE_*
+// constants for the encoding.
+function SnakeTile(APlayer, ARole, AShape: Integer): Byte;
+	begin
+	Result:= TILE_SNAKE_BASE
+			+ (((APlayer * SNAKE_ROLE_COUNT) + ARole) * SHAPE_COUNT)
+			+ AShape;
+	end;
+
+// The shape of a cell a snake entered travelling ADirIn and left
+// travelling ADirOut. A corner opens toward the REVERSE of the way it
+// came in, plus the way it went out - naming the shapes by the compass
+// directions they open toward (rather than by "turning left/right")
+// is what makes this table readable at all.
+function SegShape(ADirIn, ADirOut: TSnakeDir): Integer;
+	begin
+	if  ADirIn = ADirOut then
+		begin
+		if  ADirIn in [sdLeft, sdRight] then
+			Result:= SHAPE_HORZ
+		else
+			Result:= SHAPE_VERT;
+
+		Exit;
+		end;
+
+	// Reversing into itself is impossible for a snake, so only the four
+	// genuine corners can occur; SHAPE_HORZ is an inert default rather
+	// than a meaningful case.
+	Result:= SHAPE_HORZ;
+
+	if  ((ADirIn = sdRight) and (ADirOut = sdDown))
+	or  ((ADirIn = sdUp) and (ADirOut = sdLeft)) then
+		Result:= SHAPE_WS
+	else if ((ADirIn = sdDown) and (ADirOut = sdRight))
+	or      ((ADirIn = sdLeft) and (ADirOut = sdUp)) then
+		Result:= SHAPE_NE
+	else if ((ADirIn = sdRight) and (ADirOut = sdUp))
+	or      ((ADirIn = sdDown) and (ADirOut = sdLeft)) then
+		Result:= SHAPE_NW
+	else if ((ADirIn = sdLeft) and (ADirOut = sdDown))
+	or      ((ADirIn = sdUp) and (ADirOut = sdRight)) then
+		Result:= SHAPE_ES;
+	end;
+
+// Move one cell in ADir.
+procedure StepCell(var ARow, ACol: Byte; ADir: TSnakeDir);
+	begin
+	case ADir of
+		sdUp:    Dec(ARow);
+		sdDown:  Inc(ARow);
+		sdLeft:  Dec(ACol);
+		sdRight: Inc(ACol);
+		end;
+	end;
+
+// The whole demo AI, straight out of the original's snakeMenu(): turn
+// only when the head is sitting exactly on a circuit corner, otherwise
+// keep going. Returns the direction the snake should LOOK from the cell
+// it currently occupies - called the moment the head arrives somewhere,
+// not when it leaves, which is what produces the early head turn.
+function DemoLookFrom(ARow, ACol: Byte; ADir: TSnakeDir): TSnakeDir;
+	begin
+	Result:= ADir;
+
+	if  (ARow = DEMO_BOTTOM) and (ACol = DEMO_LEFT) then
+		Result:= sdRight
+	else if (ARow = DEMO_BOTTOM) and (ACol = DEMO_RIGHT) then
+		Result:= sdUp
+	else if (ARow = DEMO_TOP) and (ACol = DEMO_RIGHT) then
+		Result:= sdLeft
+	else if (ARow = DEMO_TOP) and (ACol = DEMO_LEFT) then
+		Result:= sdDown;
+	end;
+
+// Where a snake is after ADist steps around the circuit from the
+// bottom-left corner, and which way it leaves that cell. Making the
+// circuit parametric is what lets any number of snakes be spaced evenly
+// around it without hand-placing each one - including snakes whose
+// bodies straddle a corner at spawn, which hand-placement got wrong.
+procedure CircuitAt(ADist: Integer; out ARow, ACol: Byte; out ADir: TSnakeDir);
+	var
+	d: Integer;
+
+	begin
+	d:= ((ADist mod DEMO_LAP) + DEMO_LAP) mod DEMO_LAP;
+
+	if  d < DEMO_RUN_H then
+		begin					// along the bottom, heading right
+		ARow:= DEMO_BOTTOM;
+		ACol:= DEMO_LEFT + d;
+		ADir:= sdRight;
+		end
+	else if d < (DEMO_RUN_H + DEMO_RUN_V) then
+		begin					// up the right side
+		ARow:= DEMO_BOTTOM - (d - DEMO_RUN_H);
+		ACol:= DEMO_RIGHT;
+		ADir:= sdUp;
+		end
+	else if d < (2 * DEMO_RUN_H + DEMO_RUN_V) then
+		begin					// along the top, heading left
+		ARow:= DEMO_TOP;
+		ACol:= DEMO_RIGHT - (d - DEMO_RUN_H - DEMO_RUN_V);
+		ADir:= sdLeft;
+		end
+	else
+		begin					// down the left side
+		ARow:= DEMO_TOP + (d - 2 * DEMO_RUN_H - DEMO_RUN_V);
+		ACol:= DEMO_LEFT;
+		ADir:= sdDown;
+		end;
+	end;
 
 procedure TSnakeGame.InitDemoSnakes;
 	var
-	i, s: Integer;
+	i, s, d, spacing: Integer;
+	dirIn, dirOut: TSnakeDir;
+	r, c,
+	rPrev, cPrev: Byte;
 
 	begin
-	// Snake 1 runs along the bottom edge heading right, snake 2 along the
-	// top edge heading left - both on the SAME circuit in the same
-	// rotational direction, started half a lap apart, exactly as the
-	// original's initSnakes lays them out. That's why they can chase each
-	// other forever without ever meeting.
-	DemoSnakes[0].Len:= DEMO_SNAKE_LEN;
-	DemoSnakes[0].Dir:= sdRight;
-	DemoSnakes[0].MoveTick:= 0;
-	DemoSnakes[0].HeadTile:= TILE_SNAKE1_HEAD;
-	DemoSnakes[0].BodyTile:= TILE_SNAKE1;
+	// All four snakes run the SAME circuit in the same rotational
+	// direction, spaced evenly around it - so they chase each other
+	// forever and never meet, which is why the demo needs no collision
+	// handling at all. The original runs two, half a lap apart
+	// (initSnakes); four at quarter-lap spacing is the same idea, and
+	// shows all four player colours on the attract screen.
+	spacing:= DEMO_LAP div Length(DemoSnakes);
 
-	for i:= 0 to DEMO_SNAKE_LEN - 1 do
+	for s:= 0 to High(DemoSnakes) do
 		begin
-		DemoSnakes[0].Body[i].Row:= DEMO_BOTTOM;
-		DemoSnakes[0].Body[i].Col:= DEMO_LEFT + DEMO_SNAKE_LEN - 1 - i;
+		DemoSnakes[s].Len:= DEMO_SNAKE_LEN;
+		DemoSnakes[s].MoveTick:= 0;
+		DemoSnakes[s].Player:= s;
+
+		// Head at its own offset, body trailing back along the circuit.
+		for i:= 0 to DEMO_SNAKE_LEN - 1 do
+			begin
+			d:= (s * spacing) - i;
+
+			// dirOut is the way the snake leaves this cell; dirIn is the
+			// way it arrived, which is the direction of the step from the
+			// cell BEFORE it.
+			CircuitAt(d, r, c, dirOut);
+			CircuitAt(d - 1, rPrev, cPrev, dirIn);
+
+			DemoSnakes[s].Body[i].Row:= r;
+			DemoSnakes[s].Body[i].Col:= c;
+
+			// Every segment, head included, is shaped the same way: by
+			// where the snake came from and where it goes next. For the
+			// head that means a snake spawned exactly on a corner starts
+			// already showing the corner, the same tell it gets in play.
+			DemoSnakes[s].Body[i].Shape:= SegShape(dirIn, dirOut);
+
+			if  i = 0 then
+				begin
+				DemoSnakes[s].Dir:= dirIn;	// how it got here
+				DemoSnakes[s].Look:= dirOut;	// where it's going
+				end;
+			end;
 		end;
 
-	DemoSnakes[1].Len:= DEMO_SNAKE_LEN;
-	DemoSnakes[1].Dir:= sdLeft;
-	DemoSnakes[1].MoveTick:= 0;
-	DemoSnakes[1].HeadTile:= TILE_SNAKE2_HEAD;
-	DemoSnakes[1].BodyTile:= TILE_SNAKE2;
-
-	for i:= 0 to DEMO_SNAKE_LEN - 1 do
-		begin
-		DemoSnakes[1].Body[i].Row:= DEMO_TOP;
-		DemoSnakes[1].Body[i].Col:= DEMO_RIGHT - DEMO_SNAKE_LEN + 1 + i;
-		end;
-
-	// Paint both onto Board itself, not just into the snake state - a
+	// Paint them onto Board itself, not just into the snake state - a
 	// client syncing via SendBoardRows has to see the same thing a
 	// TileDelta would have told it (see Board's own comment).
 	for s:= 0 to High(DemoSnakes) do
 		for i:= 0 to DemoSnakes[s].Len - 1 do
 			with DemoSnakes[s].Body[i] do
 				if  i = 0 then
-					Board[Row][Col]:= DemoSnakes[s].HeadTile
+					Board[Row][Col]:= SnakeTile(DemoSnakes[s].Player,
+							SNAKE_ROLE_HEAD, Shape)
 				else
-					Board[Row][Col]:= DemoSnakes[s].BodyTile;
+					Board[Row][Col]:= SnakeTile(DemoSnakes[s].Player,
+							SNAKE_ROLE_BODY, Shape);
 	end;
 
 procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
@@ -2091,6 +2356,7 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 	var
 	i, s: Integer;
 	head: TSnakeSeg;
+	prevDir: TSnakeDir;
 
 	// Record one changed cell into both Board and the outgoing delta
 	// list. Silently drops the delta if the caller's array is full -
@@ -2123,25 +2389,20 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 
 		DemoSnakes[s].MoveTick:= SNAKE_MOVE_TICKS - 1;
 
-		// The whole demo AI, straight out of the original's snakeMenu():
-		// turn only when the head is sitting exactly on a circuit corner.
+		// The direction the head ARRIVED at its current cell with - what
+		// decides whether the cell it's about to leave becomes a
+		// straight or a corner.
+		prevDir:= DemoSnakes[s].Dir;
+
+		// Commit the turn that was already decided when the head landed
+		// here (see the end of this loop), the original's
+		// "move = look" in snakeMove. Nothing is chosen at this point;
+		// the head has been visibly looking this way for a tick or more
+		// already, which is the whole point.
+		DemoSnakes[s].Dir:= DemoSnakes[s].Look;
+
 		head:= DemoSnakes[s].Body[0];
-
-		if  (head.Row = DEMO_BOTTOM) and (head.Col = DEMO_LEFT) then
-			DemoSnakes[s].Dir:= sdRight
-		else if (head.Row = DEMO_BOTTOM) and (head.Col = DEMO_RIGHT) then
-			DemoSnakes[s].Dir:= sdUp
-		else if (head.Row = DEMO_TOP) and (head.Col = DEMO_RIGHT) then
-			DemoSnakes[s].Dir:= sdLeft
-		else if (head.Row = DEMO_TOP) and (head.Col = DEMO_LEFT) then
-			DemoSnakes[s].Dir:= sdDown;
-
-		case DemoSnakes[s].Dir of
-			sdUp:    Dec(head.Row);
-			sdDown:  Inc(head.Row);
-			sdLeft:  Dec(head.Col);
-			sdRight: Inc(head.Col);
-			end;
+		StepCell(head.Row, head.Col, DemoSnakes[s].Dir);
 
 		// Tail vacates first, so a snake exactly as long as the circuit
 		// still can't collide with the cell it's about to leave.
@@ -2151,15 +2412,55 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 		for i:= DemoSnakes[s].Len - 1 downto 1 do
 			DemoSnakes[s].Body[i]:= DemoSnakes[s].Body[i - 1];
 
-		// Body[1] is the old head - it stops being the head this step, so
-		// it has to be repainted as a body segment. Cheap now (both
-		// render as $A0) but essential once the head has its own
-		// direction tiles.
+		// Body[1] is the old head. It stops being the head this step, so
+		// it repaints as a body segment - and THIS is the cell that
+		// becomes a corner when the snake turned, since the head itself
+		// has already moved out of the turn. Entered travelling prevDir,
+		// left travelling the (possibly new) Dir.
+		DemoSnakes[s].Body[1].Shape:= SegShape(prevDir, DemoSnakes[s].Dir);
 		with DemoSnakes[s].Body[1] do
-			Emit(Row, Col, DemoSnakes[s].BodyTile);
+			Emit(Row, Col, SnakeTile(DemoSnakes[s].Player,
+					SNAKE_ROLE_BODY, Shape));
 
+		// Decide the NEXT turn immediately on arrival - the original's
+		// early head turn (user, 2026-08-24: "I wanted the head to turn
+		// before the actual moment", and later "like the ghosts in
+		// pacman?" - yes, the same telegraph: the eyes commit to the
+		// corner a beat before the body does). Costs nothing extra, the
+		// head's tile is emitted this step regardless.
+		//
+		// The telegraph lasts EXACTLY ONE STEP, and only ever appears
+		// on the turn cell itself. Two longer variants were tried and
+		// both rejected: showing it a whole cell early (2 steps) and on
+		// the last tick before the step (3 ticks) both put the corner
+		// in the cell BEFORE the turn, which is simply the wrong cell -
+		// "its happening in the wrong cell really" (user).
+		//
+		// One step is also right for gameplay, not just a limitation:
+		// the preview is a fixed number of STEPS, so its duration
+		// shrinks as the snake speeds up. "It should be harder to see
+		// the faster you are. But still controllable at the fastest
+		// speed" (user). Reaction time getting shorter with speed is
+		// what makes the top gear demanding - so DON'T decouple this
+		// from the step rate to make it more visible.
+		DemoSnakes[s].Look:= DemoLookFrom(head.Row, head.Col,
+				DemoSnakes[s].Dir);
+
+		// Shape the head by where it came FROM and where it's turning
+		// toward, so it shows the CORNER piece rather than a bare bar
+		// on the new axis, which wouldn't join the body behind it
+		// (user's own correction: "it shouldn't be the new direction so
+		// much as the turning into it one... the same that would have
+		// been there for going around the corner, just earlier").
+		//
+		// At the corner itself this also makes the hand-off seamless:
+		// next step the head moves on and this cell becomes Body[1]
+		// with SegShape(prevDir, Dir) - the SAME corner. The character
+		// never changes, only the colour, head -> body.
+		head.Shape:= SegShape(DemoSnakes[s].Dir, DemoSnakes[s].Look);
 		DemoSnakes[s].Body[0]:= head;
-		Emit(head.Row, head.Col, DemoSnakes[s].HeadTile);
+		Emit(head.Row, head.Col, SnakeTile(DemoSnakes[s].Player,
+				SNAKE_ROLE_HEAD, head.Shape));
 		end;
 	end;
 
@@ -2172,10 +2473,10 @@ procedure TSnakeGame.Tick;
 
 	begin
 	// 3 cells per moving snake (tail vacated, old head demoted to body,
-	// new head), so 6 with both moving on the same tick - rounded up for
-	// headroom. TickDemoSnakes drops anything past the end rather than
-	// overrunning, so this is a ceiling, not an assumption.
-	SetLength(deltas, 8);
+	// new head), so 12 with all four moving on the same tick - rounded
+	// up for headroom. TickDemoSnakes drops anything past the end rather
+	// than overrunning, so this is a ceiling, not an assumption.
+	SetLength(deltas, 16);
 	Lock.Acquire;
 		try
 		claimed:= False;
