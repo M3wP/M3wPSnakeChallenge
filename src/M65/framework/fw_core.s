@@ -250,6 +250,23 @@ VICXPOSMSB 	=	VIC + $10      		; BIT 0 IS HIGH ORDER X POS
 VAL_VIC_CTRLREG	=	$D011
 VAL_VIC_RSTRVAL	=	$D012
 VAL_VIC_SPRENAB	= 	$D015
+;	Bits 0-2 of CTRLREG ($D011) and CTRL2REG ($D016) are the C64 smooth
+;	scroll offsets, Y and X. They are written correctly by the screen
+;	shake and have NO visible effect in this client's VIC-IV 16-bit
+;	character mode - verified on hardware 2026-08-25 by reading the
+;	registers back at their real I/O addresses mid-shake and watching
+;	the low bits change while the display stayed put. Kept equated
+;	because the fact they're inert here is worth not rediscovering.
+VAL_VIC_CTRL2REG =	$D016
+VAL_VIC_SCROLLMASK =	%00000111
+VAL_VIC_SCROLLKEEP =	%11111000
+
+;	VIC-IV character generator position, 12-bit each (low byte here,
+;	high nibble in the following register). Moving these shifts the
+;	WHOLE character display, which is what the screen shake actually
+;	uses - the C64 scroll bits above do nothing in this video mode.
+VAL_VIC_TEXTXPOS =	$D04C
+VAL_VIC_TEXTYPOS =	$D04E
 VAL_VIC_SPREXPY	=	$D017
 VAL_VIC_MEMCTRL	=	$D018
 VAL_VIC_IRQFLGS	=	$D019

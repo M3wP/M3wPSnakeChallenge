@@ -284,6 +284,60 @@ inetInitialise:
 ;	to get going, which is all this needs.
 ;	USED	.A, .X, .Y
 ;-------------------------------------------------------------------------------
+;	Total connect attempts before giving up and showing an error - so 2
+;	means "one automatic retry", which is what dengland asked for
+;	(2026-08-25). Raise it if the flakiness turns out to need more, but
+;	be aware each failed attempt costs a full CONNECT_TIMEOUT_FRAMES
+;	when the failure is a TIMEOUT rather than a refusal, and the user is
+;	staring at a frozen page for all of it.
+INET_CONNECT_TRIES	= 2
+
+;	Pause between attempts, in frames (~0.6s at 50Hz).
+INET_CONNECT_SETTLE_FRAMES = 30
+
+;	Attempts left in the current inetConnect - see its retry loop.
+inetConnectTries:
+		.byte	$00
+inetConnectTmp:
+		.byte	$00
+
+
+;-------------------------------------------------------------------------------
+;	inetConnectSettle - short pause between connect attempts.
+;
+;	Paced off FRAMECOUNT rather than a cycle-counted loop so it takes
+;	the same real time whatever the CPU is doing. Bounded by a plain
+;	counter as well: if FRAMECOUNT ever stopped advancing, a wait for a
+;	frame that never comes would hang the client on a cosmetic delay.
+;	USED	.A, .X, .Y
+;-------------------------------------------------------------------------------
+inetConnectSettle:
+		LDX	#INET_CONNECT_SETTLE_FRAMES
+
+@nextframe:
+		LDA	FRAMECOUNT
+		STA	inetConnectTmp
+
+		LDY	#$00
+
+@wait:
+		LDA	FRAMECOUNT
+		CMP	inetConnectTmp
+		BNE	@ticked
+
+		INY
+		BNE	@wait
+
+		RTS					;frame counter stalled - give up waiting
+
+@ticked:
+		DEX
+		BNE	@nextframe
+
+		RTS
+
+
+;-------------------------------------------------------------------------------
 inetSeedLocalPort:
 		JSR	@randbyte
 		AND	#$3F
@@ -402,10 +456,43 @@ inetConnect:
 		DEX
 		BPL 	:-
 
+;	Automatic retry. The refusal this covers (ineterrc=$05, peer RST on
+;	the first attempt) has outlived the LOCAL_PORT byte-swap fix that
+;	explained the ORIGINAL version of it - see inetSeedLocalPort - and
+;	it was still turning up on roughly every other boot as of
+;	2026-08-25, with the source port verified random each time. Best
+;	current theory (dengland's) is the environment rather than us:
+;	Windows ICS in the middle, plus a MEGA65 ethernet stack that is
+;	itself new and under test.
+;
+;	A retry costs nothing and works every time, because the stack bumps
+;	LOCAL_PORT on each fresh attempt, so attempt 2 is a different
+;	4-tuple. The test harness has been papering over this all along;
+;	putting it in the client means a real user gets the same treatment
+;	instead of an error page they can do nothing useful about.
+;
+;	This is a WORKAROUND, deliberately. It does not explain the RST and
+;	should not stop anyone chasing it - it just stops it being the
+;	user's problem.
+		LDA	#INET_CONNECT_TRIES
+		STA	inetConnectTries
+
+@tryconnect:
 		LDAX 	inet_port
 		JSR 	tcp_connect
 		BCC 	:+
 
+		DEC	inetConnectTries
+		BEQ	@tcpfail_report
+
+;	Let it settle before going again. A refusal comes back as a fast
+;	RST, so without this the retry would go out within a frame or two
+;	of the failure - into whatever transient just refused us.
+		JSR	inetConnectSettle
+
+		JMP	@tryconnect
+
+@tcpfail_report:
 		LDA	#$03
 		LDX	TCP_CONNECT_FAIL_WAS_RST
 		BEQ 	@tcpfail_chk_synack
@@ -3059,8 +3146,9 @@ clientProcServerMsg:
 
 ;-------------------------------------------------------------------------------
 ;	clientProcPlayMsg - clientMsgProcs' mcPlay category entry (see the
-;	table above). Method $0E (GameChat) is handled generically right
+;	table above). Method $04 (GameChat) is handled generically right
 ;	here, same as room/lobby chat - see clientProcPlayGameChatMsg.
+;	$04 and not $0E since 2026-08-25 - see clientSendGameChat for why.
 ;	Everything else is game-specific wire shape (chess's original also
 ;	dispatched join/part/game status/slot status/starting-colours/
 ;	board sync/available moves/move made here) - GAME HOOK
@@ -3070,7 +3158,7 @@ clientProcServerMsg:
 clientProcPlayMsg:
 ;-------------------------------------------------------------------------------
 		LDA	imsgdat2
-		CMP	#$0E
+		CMP	#$04
 		BEQ	@gamechat
 
 		JMP	gameProcPlayMsg
@@ -4970,12 +5058,18 @@ clientPlayTextChng:
 		RTS
 
 ;-------------------------------------------------------------------------------
-;	clientSendGameChat - sends mcPlay/$0E (GameChat), payload is
+;	clientSendGameChat - sends mcPlay/$04 (GameChat), payload is
 ;	edit_play_text_buf verbatim (page_play's in-game chat box - see
-;	clientPlayTextChng above) - no room name or username needed
-;	(unlike clientSendRoomPeer/mcLoby/$04), since ProcessPlayerMessage
-;	is only ever reached for players already in this game, and the
-;	server stamps the sender name itself (see SendGameChat).
+;	clientPlayTextChng above) - no room name or username needed, since
+;	ProcessPlayerMessage is only ever reached for players already in
+;	this game, and the server stamps the sender name itself before
+;	echoing it back.
+;
+;	$04, matching clientSendRoomPeer/mcLobby/$04 above - chat is chat,
+;	and it now carries the same method number in both categories. Was
+;	$0E until 2026-08-25 (dengland: "I'd prefer the standard message
+;	methods be lower in value"), which was also why chat never worked
+;	end-to-end: the server had always listened on 4.
 ;-------------------------------------------------------------------------------
 clientSendGameChat:
 ;-------------------------------------------------------------------------------
@@ -4983,7 +5077,7 @@ clientSendGameChat:
 		BCC	@failed
 
 		LDA	#MSG_CATG_PLAY
-		ORA	#$0E
+		ORA	#$04
 		JSR	strsAppendChar
 
 		LDAX	#edit_play_text_buf

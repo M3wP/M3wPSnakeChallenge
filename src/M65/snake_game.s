@@ -96,6 +96,12 @@ gameStateInit:
 		DEX
 		BPL	@clrslots
 
+;	Not zero - $FF is "none" for both of these, and slot 0 is a real
+;	corner. See gameSlotWanted/gameMySlot.
+		LDA	#SLOT_CLAIM_NONE
+		STA	gameSlotWanted
+		STA	gameMySlot
+
 		RTS
 
 
@@ -156,8 +162,14 @@ gameProcPlayMsg:
 		CMP	#$0B
 		BEQ	@boardrows
 
+		CMP	#$0C
+		BEQ	@shake
+
 		JMP	clientProcUnknownMsg
 ;		RTS
+
+@shake:
+		JMP	gameProcShakeMsg
 
 @gamestat:
 		JMP	gameProcGameStatusMsg
@@ -190,6 +202,15 @@ gameProcPlayMsg:
 ;===============================================================================
 BOARD_COLS      = 30
 BOARD_ROWS      = 20
+
+;	SlotClaim payload values (see gameSendSlotClaim). ANY asks the
+;	server for whichever corner is free; NONE is this client's own
+;	"nothing outstanding" marker for gameSlotWanted and never goes on
+;	the wire. Same value - they can't be confused because one is only
+;	ever sent and the other only ever stored.
+SLOT_CLAIM_ANY  = $FF
+SLOT_CLAIM_NONE = $FF
+
 BOARD_ROW_PAIRS = 10			;BOARD_ROWS / 2 - fetched 2 rows at a time.
 					;	BOARD_ROWS is deliberately EVEN so this
 					;	divides exactly and no short final
@@ -235,6 +256,35 @@ boardSyncReqFrame:
 ;	inetGetNextSend, so the row index it's asked to send has to be
 ;	parked somewhere across that call.
 gameSendRowTmp:
+		.byte	$00
+
+;	Same scratch problem for gameSendSlotClaim's [slot] payload byte.
+;	Deliberately NOT sharing gameSendRowTmp: gamePollTick reuses that
+;	one as a timeout scratch, and a claim landing between those two
+;	uses would corrupt it.
+gameSendSlotTmp:
+		.byte	$00
+
+;	Which corner this client has asked the server for, or $FF if none is
+;	outstanding. Only used to avoid firing a second claim while one is
+;	still unanswered - the authoritative answer is always gameMySlot,
+;	filled in from the server's own SlotStatus broadcast.
+gameSlotWanted:
+		.byte	$FF
+
+;	Which corner this client actually HOLDS (0..3), or $FF for none.
+;	Set only from SlotStatus's "isyou" byte - never optimistically on
+;	send, because a claim can be refused (the corner may have been taken
+;	between the press and the message arriving) and a client that
+;	assumed success would then show a corner it does not own.
+gameMySlot:
+		.byte	$FF
+
+;	Which corner's START control is being handled right now - parked by
+;	the four per-corner handlers so gameSlotChanged's shared tail knows
+;	which one it is. A can't carry it: the STATE_DOWN gate has to read
+;	the element and call ctrlsControlDefChanged in between.
+gameSlotPressed:
 		.byte	$00
 
 ;	1 once WatchStart (mcPlay/$0C) has been sent to the server - i.e.
@@ -326,6 +376,41 @@ gameDeltaCount:
 gameDeltaScreenRow:
 		.byte	$00
 
+;	SCREEN SHAKE (mcPlay/$0C). The server sends a DURATION and nothing
+;	else - one message, then the client owns the whole effect and stops
+;	on its own. Sending per-frame offsets from the server instead would
+;	put a 50Hz visual on a 12Hz tick and spend the delta budget on
+;	something that can be generated here for free (dengland's own call,
+;	2026-08-25: "we can just send a message 'shake now' and have it
+;	last that long on the client").
+;
+;	gameShakeFrames counts DOWN once per frame; gameShakeLastFrame is
+;	the FRAMECOUNT snapshot that paces it, since gamePollTick runs once
+;	per main-loop iteration and that is not the same thing as once per
+;	frame. gameShakeSaveY/X hold the scroll bits from before the shake
+;	started, so the display goes back exactly where it was rather than
+;	to an assumed default.
+gameShakeFrames:
+		.byte	$00
+gameShakeLastFrame:
+		.byte	$00
+gameShakeSaveY:
+		.byte	$00
+gameShakeSaveX:
+		.byte	$00
+gameShakeActive:
+		.byte	$00
+gameShakeTmp:
+		.byte	$00
+gameShakeTmp2:
+		.byte	$00
+
+;	Shake amplitude, in pixels, as a mask on the random offset. The
+;	registers take 0-7, but dengland's call (2026-08-25) is the low TWO
+;	bits only - 0-3 - "to make the shake not too dramatic". Raise to
+;	VAL_VIC_SCROLLMASK for the full 8-pixel throw.
+GAME_SHAKE_AMP		= %00000011
+
 ;	This game's own GameState byte from GameStatus (mcPlay/$06) -
 ;	stored but not acted on yet, no UI distinguishes gsWaiting/
 ;	gsPlaying/etc for QUADRO's spectator model (see SnakeClasses.pas'
@@ -413,14 +498,21 @@ boardRowOffsetHi:
 gameTileChars:
 ;		floor  wall   attract
 		.byte	$20,   $66,   $66
-;	The same six shapes for every one of the 8 player/role blocks,
-;	then once more for the invulnerability flash block (51-56).
-		.repeat	9
+;	The same six shapes for all 11 snake-ish blocks: 4 players x
+;	body/head, then the BOSS's body/head, then the invulnerability
+;	flash block.
+		.repeat	11
 		.byte	$C0, $DD, $C9, $CA, $CB, $D5
 		.endrepeat
-;	Lava (57-59) - three age tiers, same character, colour only.
+;	Lava (69-71) - three age tiers, same character, colour only.
 ;	$AA is dengland's pick (2026-08-24).
 		.byte	$AA, $AA, $AA
+;	Bee (72) - dengland's pick.
+		.byte	$DA
+;	Food (73-76) in the original's type order: no-grow+fast,
+;	grow+slow, speed burst, invulnerability. dengland's characters,
+;	bit 7 CLEAR - the plain forms, not the reversed ones.
+		.byte	$58, $51, $57, $53
 
 gameTileColrs:
 		.byte	CLR_LOG_C64_BLACK
@@ -453,7 +545,18 @@ gameTileColrs:
 		.byte	CLR_LOG_C64_ORANGE		;$08 - P4 head
 		.endrepeat
 
-;	Invulnerability flash body (51-56) - white, and deliberately NOT
+;	The BOSS (51-62) - purple body, cyan head (dengland swapped these
+;	2026-08-25). A fifth render slot after the four players, so it
+;	renders through exactly the same encoding and shaping as a player
+;	snake. Note purple is also the bee, but the characters differ.
+		.repeat	6
+		.byte	CLR_LOG_C64_PURPLE		;$04 - boss body
+		.endrepeat
+		.repeat	6
+		.byte	CLR_LOG_C64_CYAN		;$03 - boss head
+		.endrepeat
+
+;	Invulnerability flash body (63-68) - white, and deliberately NOT
 ;	per player: the whole point is that it overrides the player colour
 ;	while it's on. Same six characters as any other body block, so a
 ;	flashing snake keeps its pipe joints instead of coming apart into
@@ -463,17 +566,29 @@ gameTileColrs:
 		.byte	CLR_LOG_C64_WHITE		;$01 - invulnerable body
 		.endrepeat
 
-;	Spreading lava (57-59), oldest cell to newest: hot core through
+;	Spreading lava (69-71), oldest cell to newest: hot core through
 ;	cooling crust. Character $AA for all three, so they never read as
 ;	snake pipe even though P4 shares the yellow and orange. The three
 ;	COLOURS here are still mine, not dengland's - easy to respecify,
 ;	they're three bytes.
-;
-;	Bees, when that wave lands, are character $DA in colour $04
-;	(purple) - both dengland's, 2026-08-24.
 		.byte	CLR_LOG_C64_YELLOW		;$07 - core (laid down first)
 		.byte	CLR_LOG_C64_ORANGE		;$08 - mid
 		.byte	CLR_LOG_C64_BROWN		;$09 - crust (newest, goes first)
+
+;	Bee (72) - one tile, no shapes and no ageing, it just moves.
+;	Purple $04 is also the BOSS head, but the characters differ ($DA vs
+;	a pipe shape) so the two never read as each other. Worth knowing if
+;	either is ever recoloured.
+		.byte	CLR_LOG_C64_PURPLE		;$04
+
+;	Food (73-76). These COLOURS are mine, not dengland's - he picked
+;	the characters only. Chosen to stay clear of the player colours
+;	where it matters; the heart shares P2's light red, but a heart
+;	against a pipe segment is never ambiguous.
+		.byte	CLR_LOG_C64_LIGHTGREY		;$0F - clubs, no-grow + fast
+		.byte	CLR_LOG_C64_GREY		;$0C - solid circle, grow + slow
+		.byte	CLR_LOG_C64_CYAN		;$03 - open circle, speed burst
+		.byte	CLR_LOG_C64_LIGHTRED		;$0A - heart, invulnerability
 
 
 ;-------------------------------------------------------------------------------
@@ -547,6 +662,13 @@ gamePollTick:
 ;	connection comes back while page_detail is still up, since
 ;	gameWatching being 0 is exactly what makes the entry block below
 ;	run again.
+;	The shake runs ABOVE the connection gate on purpose. It's a purely
+;	local visual with a duration already in hand, so losing the
+;	connection mid-shake must still let it finish and put the scroll
+;	registers back - bailing out early would leave the whole display
+;	permanently offset by a few pixels with nothing to correct it.
+		JSR	gameShakeTick
+
 		LDA	inetproc
 		CMP	#INET_PROC_EXEC
 		BEQ	@connected
@@ -698,6 +820,83 @@ gameSendBoardRowsReq:
 		JSR	strsAppendChar
 
 		LDA	gameSendRowTmp
+		JSR	strsAppendChar
+
+		DEC	tempdat0
+		LDA	tempdat0
+		LDY	#$00
+		STA	(tempptr0), Y
+
+		RTS
+
+@failed:
+		JSR	clientNotifyFail
+
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameSendSlotClaim - sends mcPlay/$05 (SlotClaim), asking the server
+;	for one of the 4 corners. Payload is a single [slot] byte: 0..3 for
+;	a specific corner, or SLOT_CLAIM_ANY ($FF) for whichever is free.
+;
+;	$05 and not $04, which would be the obvious next free number: the
+;	server still has method 4 bound to the dead chess-era RoomPeer chat
+;	handler, which matches FIRST and would swallow the claim. See
+;	ProcessPlayerMessage (SnakeServer.pas).
+;
+;	The reply is a SlotStatus broadcast (mcPlay/$07) if it worked, or a
+;	server error if it didn't - nothing is assumed here, so slotStates
+;	only ever reflects what the server actually confirmed.
+;	IN	.A		slot 0..3, or SLOT_CLAIM_ANY
+;-------------------------------------------------------------------------------
+gameSendSlotClaim:
+;-------------------------------------------------------------------------------
+		STA	gameSendSlotTmp
+
+		JSR	inetGetNextSend
+		BCC	@failed
+
+		LDA	#MSG_CATG_PLAY
+		ORA	#$05
+		JSR	strsAppendChar
+
+		LDA	gameSendSlotTmp
+		JSR	strsAppendChar
+
+		DEC	tempdat0
+		LDA	tempdat0
+		LDY	#$00
+		STA	(tempptr0), Y
+
+		RTS
+
+@failed:
+;	The claim never left, so nothing will ever come back to settle it -
+;	drop the outstanding marker here or gameSlotPress's don't-stack
+;	guard would block every future claim for the rest of the session.
+		LDA	#SLOT_CLAIM_NONE
+		STA	gameSlotWanted
+
+		JSR	clientNotifyFail
+
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameSendSlotRelease - sends mcPlay/$08 (SlotRelease), giving up
+;	whichever corner this client holds. Payload-less, same shape as
+;	WatchStop below - the server knows who we are and looks the slot up
+;	itself, and it stays silent if we held none, so this is safe to fire
+;	without tracking whether a claim ever succeeded.
+;-------------------------------------------------------------------------------
+gameSendSlotRelease:
+;-------------------------------------------------------------------------------
+		JSR	inetGetNextSend
+		BCC	@failed
+
+		LDA	#MSG_CATG_PLAY
+		ORA	#$08
 		JSR	strsAppendChar
 
 		DEC	tempdat0
@@ -866,8 +1065,15 @@ gameProcGameStatusMsg:
 
 ;-------------------------------------------------------------------------------
 ;	gameProcSlotStatusMsg - mcPlay/$07 (SlotStatus). Payload is [slot,
-;	state] (see TSnakeGame.SendSlotStatus) - just stored for now, see
-;	slotStates' own comment above.
+;	state, isyou] (see TSnakeGame.SendSlotStatus) - the state is stored
+;	in slotStates (see its own comment above), and the third byte is
+;	what maintains gameMySlot.
+;
+;	The isyou byte is per-RECIPIENT, not per-slot: the server sends this
+;	message once to each player in the zone and sets the flag only for
+;	whoever actually holds the corner. So this is the only place that
+;	ever learns which corner is ours, and it is authoritative - a claim
+;	is never assumed to have worked at the point of sending.
 ;-------------------------------------------------------------------------------
 gameProcSlotStatusMsg:
 ;-------------------------------------------------------------------------------
@@ -879,7 +1085,152 @@ gameProcSlotStatusMsg:
 		LDA	readmsg0 + 3			;state
 		STA	slotStates, X
 
+;	Whatever the server says about this corner settles any claim we had
+;	outstanding for it, granted or refused.
+		CPX	gameSlotWanted
+		BNE	@notours
+
+		LDA	#SLOT_CLAIM_NONE
+		STA	gameSlotWanted
+
+@notours:
+		LDA	readmsg0 + 4			;isyou
+		BEQ	@notmine
+
+		STX	gameMySlot
+
+		RTS
+
+@notmine:
+;	Not ours. Only clear gameMySlot if this message is about the very
+;	corner we thought we held - a report about somebody else's corner
+;	says nothing about ours, and clearing on it would drop our own the
+;	moment any other player claimed one.
+		CPX	gameMySlot
+		BNE	@bad
+
+		LDA	#SLOT_CLAIM_NONE
+		STA	gameMySlot
+
 @bad:
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameProcShakeMsg - mcPlay/$0C (Shake). Payload is [frames], and that
+;	is the whole message: the server says how long, the client does the
+;	rest. Zero frames stops a shake early.
+;-------------------------------------------------------------------------------
+gameProcShakeMsg:
+		LDA	readmsg0 + 2
+		BEQ	@stop
+
+		LDX	gameShakeActive
+		BNE	@setlen
+
+;	Starting fresh - snapshot the character-generator position so the
+;	display can be put back exactly where it was, rather than to an
+;	assumed default. The framework sets these up during its own video
+;	init and nothing here knows what it chose, so guessing would leave
+;	the whole screen permanently offset.
+		LDA	VAL_VIC_TEXTYPOS
+		STA	gameShakeSaveY
+
+		LDA	VAL_VIC_TEXTXPOS
+		STA	gameShakeSaveX
+
+		LDA	#$01
+		STA	gameShakeActive
+
+		LDA	FRAMECOUNT
+		STA	gameShakeLastFrame
+
+@setlen:
+		LDA	readmsg0 + 2
+		STA	gameShakeFrames
+
+		RTS
+
+@stop:
+		JMP	gameShakeRestore
+
+
+;-------------------------------------------------------------------------------
+;	gameShakeTick - advance the shake by at most one frame. Called from
+;	gamePollTick, which runs once per MAIN LOOP iteration - that is NOT
+;	once per frame, so the countdown is paced off FRAMECOUNT instead of
+;	off call count, or the shake would run at whatever speed the loop
+;	happens to be going.
+;	USED	.A, .X
+;-------------------------------------------------------------------------------
+gameShakeTick:
+		LDA	gameShakeActive
+		BNE	@active
+
+		RTS
+
+@active:
+		LDA	FRAMECOUNT
+		CMP	gameShakeLastFrame
+		BNE	@newframe
+
+		RTS					;same frame - nothing to do yet
+
+@newframe:
+		STA	gameShakeLastFrame
+
+		DEC	gameShakeFrames
+		BEQ	gameShakeRestore
+
+;	EOR with FRAMECOUNT as well as reading the hardware RNG: the RNG is
+;	not checked for readiness here (a bounded wait every frame would be
+;	silly for a cosmetic effect), and an unready RNG hands back the same
+;	byte repeatedly - which would freeze the screen at one offset and
+;	look like a bug rather than a shake.
+		LDA	VAL_M65_RANDOM
+		EOR	FRAMECOUNT
+		STA	gameShakeTmp
+
+;	Offsets are added to the SAVED position rather than written
+;	absolutely, so the shake is about wherever the framework put the
+;	display rather than about a hardcoded origin. GAME_SHAKE_AMP keeps
+;	the throw small.
+		AND	#GAME_SHAKE_AMP
+		CLC
+		ADC	gameShakeSaveY
+		STA	VAL_VIC_TEXTYPOS
+
+;	X takes DIFFERENT bits of the same random byte, so the two axes
+;	don't move in lockstep - together they'd read as a diagonal slide
+;	rather than a shake.
+		LDA	gameShakeTmp
+		LSR
+		LSR
+		LSR
+		AND	#GAME_SHAKE_AMP
+		CLC
+		ADC	gameShakeSaveX
+		STA	VAL_VIC_TEXTXPOS
+
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameShakeRestore - put the scroll bits back and stop shaking. Safe
+;	to call when no shake is running.
+;	USED	.A
+;-------------------------------------------------------------------------------
+gameShakeRestore:
+		LDA	#$00
+		STA	gameShakeFrames
+		STA	gameShakeActive
+
+		LDA	gameShakeSaveY
+		STA	VAL_VIC_TEXTYPOS
+
+		LDA	gameShakeSaveX
+		STA	VAL_VIC_TEXTXPOS
+
 		RTS
 
 
@@ -1018,6 +1369,24 @@ gameProcBoardRowsMsg:
 		LSR	A				;pairIndex = startRow / 2
 		TAX
 
+;	Ignore a pair index that isn't on the board. boardPairOffsetLo/Hi
+;	are exactly BOARD_ROW_PAIRS entries long, so an out-of-range index
+;	reads past them and hands the 60-byte copy below a junk
+;	destination - the same class of wild write the missing boardTiles
+;	base caused. gameProcTileDeltaMsg has always range checked its
+;	row/col; this path never did.
+;
+;	It matters more than it used to: the server will no longer only
+;	send these in answer to a request. A level or screen transition
+;	pushes whole-board chunks unprompted (cheaper than sending the
+;	change as deltas), so this side must not assume the row named is
+;	one it asked for.
+		CPX	#BOARD_ROW_PAIRS
+		BCC	@inrange
+
+		RTS
+
+@inrange:
 		LDA	boardPairOffsetLo, X
 		CLC
 		ADC	#<boardTiles
@@ -1864,42 +2233,116 @@ label_detail_pwr2_3:
 ;-------------------------------------------------------------------------------
 ;	clientDetailStart0Chng/1/2/3 - one handler per corner (explicit,
 ;	not a tag-driven shared dispatch - matches this codebase's
-;	established style of simple per-control handlers). Standard
-;	changed-handler boilerplate (redraw on state change) for now; each
-;	is a placeholder for what will become a slot-claim send once
-;	gameProcPlayMsg exists.
+;	established style of simple per-control handlers). Each does the
+;	standard changed-handler redraw, then hands its own corner number
+;	to gameSlotPress below.
 ;-------------------------------------------------------------------------------
 clientDetailStart0Chng:
 ;-------------------------------------------------------------------------------
-		JSR	ctrlsControlDefChanged
+		LDA	#$00
+		STA	gameSlotPressed
 
-;	TODO: claim corner 0 - send a slot-claim message once the wire
-;	protocol for it is designed (see gameProcPlayMsg above).
-
-		RTS
+		JMP	gameSlotChanged
+;		RTS
 
 clientDetailStart1Chng:
 ;-------------------------------------------------------------------------------
-		JSR	ctrlsControlDefChanged
+		LDA	#$01
+		STA	gameSlotPressed
 
-;	TODO: claim corner 1 - see clientDetailStart0Chng.
-
-		RTS
+		JMP	gameSlotChanged
+;		RTS
 
 clientDetailStart2Chng:
 ;-------------------------------------------------------------------------------
-		JSR	ctrlsControlDefChanged
+		LDA	#$02
+		STA	gameSlotPressed
 
-;	TODO: claim corner 2 - see clientDetailStart0Chng.
-
-		RTS
+		JMP	gameSlotChanged
+;		RTS
 
 clientDetailStart3Chng:
 ;-------------------------------------------------------------------------------
+		LDA	#$03
+		STA	gameSlotPressed
+
+		JMP	gameSlotChanged
+;		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameSlotChanged - shared tail for the four corner START handlers,
+;	which have already parked their own corner number in
+;	gameSlotPressed.
+;
+;	A control's "changed" hook fires on the way UP as well as the way
+;	down, so acting unconditionally would run the press twice. Gate on
+;	STATE_DOWN exactly as the framework's own clientPlayJoinChng does
+;	(fw_ctrls_net.s), including reading the state BEFORE
+;	ctrlsControlDefChanged - it updates the element, so a read after it
+;	is a read of the wrong thing.
+;-------------------------------------------------------------------------------
+gameSlotChanged:
+;-------------------------------------------------------------------------------
+		LDY	#ELEMENT::state
+		LDA	(elemptr0), Y
+		STA	tempdat0
+
 		JSR	ctrlsControlDefChanged
 
-;	TODO: claim corner 3 - see clientDetailStart0Chng.
+		LDA	tempdat0
+		AND	#STATE_DOWN
+		BEQ	@exit
 
+		LDA	gameSlotPressed
+		JMP	gameSlotPress
+;		RTS
+
+@exit:
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameSlotPress - a corner's START control was pressed. Pressing the
+;	corner you already hold RELEASES it; pressing any other one tries
+;	to CLAIM it. One control per corner doing both directions, rather
+;	than a separate leave button, since a corner can only ever be in
+;	one of those two states from this client's point of view.
+;
+;	Nothing is assumed about the outcome - gameMySlot only ever moves
+;	when the server's own SlotStatus says so (see
+;	gameProcSlotStatusMsg). A refused claim just produces a server
+;	error in the log and leaves everything as it was.
+;	IN	.A		corner 0..3
+;-------------------------------------------------------------------------------
+gameSlotPress:
+;-------------------------------------------------------------------------------
+		CMP	gameMySlot
+		BEQ	@release
+
+;	Don't stack claims. Without this, holding the accelerator down (or
+;	an impatient double-press while the first is still in flight) sends
+;	several claims for the same corner; the server refuses the extras
+;	harmlessly, but each one comes back as an error in the player's log
+;	for something they did once.
+		LDX	gameSlotWanted
+		CPX	#SLOT_CLAIM_NONE
+		BNE	@busy
+
+		STA	gameSlotWanted
+
+		JMP	gameSendSlotClaim
+;		RTS
+
+@release:
+;	Deliberately does NOT clear gameMySlot here. The server's own
+;	SlotStatus broadcast clears it (isyou goes to 0), and doing it
+;	locally as well would mean a release whose SEND failed left this
+;	client believing it had left a corner it still holds.
+		JMP	gameSendSlotRelease
+;		RTS
+
+@busy:
 		RTS
 
 

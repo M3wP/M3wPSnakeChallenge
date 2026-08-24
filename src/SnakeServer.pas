@@ -46,6 +46,11 @@ const
 	DEMO_LAVA_SEEDS = 2;
 	DEMO_LAVA_CELLS_CAP = 32;
 
+	// Bees in the attract wave, one per corner. Up here too -
+	// TSnakeGame.DemoBees needs it. Reasoning with the other bee
+	// constants further down.
+	DEMO_BEE_COUNT = 4;
+
 type
 
 	{ TServerDispatcher }
@@ -282,7 +287,7 @@ type
 	// Which mechanic the attract reel is currently showing off. See
 	// DEMO_WAVE_FIRST/LAST - the reel runs the implemented span of this
 	// in order and then wraps.
-	TDemoWave = (dwLava, dwBees, dwFood);
+	TDemoWave = (dwLava, dwBees, dwFood, dwBoss);
 
 	// A lava pool's life: creep outward, sit at full extent, drain back.
 	// dlpIdle is the beat between waves.
@@ -299,6 +304,18 @@ type
 	TDemoLava = record
 		Cells: array[0..DEMO_LAVA_CELLS_CAP - 1] of TDemoCell;
 		Count: Integer;
+	end;
+
+	// One bee. Target is a SNAKE INDEX picked at spawn and then KEPT -
+	// dengland's call, and it is what stops the bees clumping: if each
+	// re-picked the nearest head every step, bees that drifted near one
+	// another would converge on the same snake and merge into a single
+	// wall instead of staying four separate threats.
+	TDemoBee = record
+		Row, Col: Byte;
+		Target: Integer;
+		MoveTick: Integer;
+		Active: Boolean;
 	end;
 
 	// The original's tGAMEDIFFICULTY (server.lua), ordinals and all:
@@ -394,7 +411,42 @@ type
 		DemoLava: array[0..DEMO_LAVA_SEEDS - 1] of TDemoLava;
 		DemoLavaPhase: TDemoLavaPhase;
 		DemoLavaStep: Integer;
+
+		// Ticks left in the lava's HOLD phase. Its own counter, not
+		// DemoWaveWait: that one means "a wave gap is running" to
+		// TickDemoWave, which decrements it and skips the wave entirely
+		// while it is non-zero. Borrowing it for the hold meant the
+		// hold was actually being driven by the gap logic with DemoWave
+		// still dwLava, so the shake cue fired a SECOND time as the
+		// pool began to drain (dengland, 2026-08-25: "its shaking when
+		// the lava goes away too which isn't right").
+		DemoLavaHold: Integer;
+
 		DemoWaveWait: Integer;
+
+		DemoBees: array[0..DEMO_BEE_COUNT - 1] of TDemoBee;
+		DemoBeeLeft: Integer;
+
+		DemoFoodLeft: Integer;
+
+		// The boss needs no body array: it runs a fixed loop, and
+		// RectWalk is stateless, so its whole state is how far round it
+		// has got. Every segment's position AND shape derive from
+		// (DemoBossDist - segment index). See TickDemoBoss.
+		DemoBossDist: Integer;
+		DemoBossStep: Integer;
+		DemoBossLeft: Integer;
+
+		// Whether the boss's body is CURRENTLY painted flashing - the
+		// same painted-vs-wanted trick the demo snakes use, so the body
+		// is only re-emitted when the phase actually flips.
+		DemoBossFlashOn: Boolean;
+
+		// Frames of screen shake owed to every watcher, set by the wave
+		// code and drained by Tick. A flag rather than a direct send so
+		// the wave procedures stay pure board logic and all the
+		// per-watcher error handling lives in one place (see Tick).
+		DemoShakePending: Integer;
 
 		constructor Create; override;
 		destructor  Destroy; override;
@@ -418,6 +470,32 @@ type
 		// sync (see Watchers' own comment).
 		procedure SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TTileDelta);
 
+		// Tell a watcher to shake its screen for AFrames frames - see
+		// the implementation for why duration, not per-frame offsets.
+		procedure SendShake(APlayer: TPlayer; AFrames: Integer);
+
+		// SLOT CLAIM/RELEASE - a spectator taking or giving up one of the
+		// four corners. Both return the slot affected, or -1 if nothing
+		// happened; both broadcast SlotStatus themselves. Callers must
+		// NOT hold Lock - these acquire it.
+		function  ClaimSlot(APlayer: TPlayer; ASlot: Integer): Integer;
+		function  ReleaseSlot(APlayer: TPlayer): Integer;
+
+		// Broadcast one slot's state to everyone in the zone. Caller
+		// must hold Lock.
+		procedure SlotStatusToAll(ASlot: Integer);
+
+		// LEVEL GEOMETRY - see the implementations and the LEVEL_*
+		// constants. BuildLevelBase lays down bare floor inside a solid
+		// border ring; DrawWallLine is the original's levelDrawLine;
+		// DrawWallQuad reflects one line into all four quadrants so
+		// every corner gets the same geometry; BuildLevel assembles one
+		// of the LEVEL_VARIANTS at a given difficulty progress.
+		procedure BuildLevelBase;
+		procedure DrawWallLine(AR1, AC1, AR2, AC2: Integer);
+		procedure DrawWallQuad(AR1, AC1, AR2, AC2: Integer);
+		procedure BuildLevel(AVariant, AProgress: Integer);
+
 		// Demo/attract mode - see DemoSnakes. InitDemoSnakes lays both
 		// snakes out on the board (and writes them into Board);
 		// TickDemoSnakes advances them one tick, appending whatever
@@ -437,6 +515,12 @@ type
 		procedure TickDemoWave(var ADeltas: array of TTileDelta;
 				var ADeltaCount: Integer);
 		procedure TickDemoLava(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure TickDemoBees(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure TickDemoFood(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure TickDemoBoss(var ADeltas: array of TTileDelta;
 				var ADeltaCount: Integer);
 
 		procedure AddWatcher(APlayer: TPlayer);
@@ -632,6 +716,9 @@ const
 	LIT_ERR_PLAYPINV: AnsiString = 'Invalid play part';
 	LIT_ERR_PLAYLINV: AnsiString = 'Invalid play list';
 	LIT_ERR_PLAYGMST: AnsiString = 'Play in progress or full';
+	LIT_ERR_PLAYCINV: AnsiString = 'Invalid corner claim';
+	LIT_ERR_PLAYCTKN: AnsiString = 'Corner already taken';
+	LIT_ERR_PLAYCHAV: AnsiString = 'Already holding a corner';
 
 	// Static list of boards, per the confirmed design ("at least for the
 	// development passes") - unlike chess's freeform type-a-name-to-join-
@@ -646,6 +733,13 @@ const
 	// being built.
 	TILE_FLOOR = 0;
 	TILE_WALL = 1;
+
+	// SlotClaim (mcPlay/$05) payload - a specific corner 0..3, or this
+	// for "any free one". The four-corner controls send a specific
+	// corner (that is the design: a spectator presses the START on the
+	// corner they want); ANY exists for a plain "just put me in"
+	// affordance and costs nothing to support.
+	SLOT_CLAIM_ANY = $FF;
 
 	// Was the attract-mode bounce's lit cell, which the demo snakes below
 	// have now replaced (2026-08-24). The value is deliberately left in
@@ -693,13 +787,27 @@ const
 	// Tile value = TILE_SNAKE_BASE
 	//              + ((player * SNAKE_ROLE_COUNT) + role) * SHAPE_COUNT
 	//              + shape
-	// 4 players x 2 roles x 6 shapes = 48 values, 3..50 - comfortably
-	// inside the one byte a delta carries. All 48 are reachable: heads
-	// take corner shapes too, one step before they turn. See SnakeTile.
+	// 5 render slots (4 players + the boss) x 2 roles x 6 shapes = 60
+	// values, 3..62 - comfortably inside the one byte a delta carries.
+	// All are reachable: heads take corner shapes too, one step before
+	// they turn. See SnakeTile.
 	TILE_SNAKE_BASE = 3;
 
-	// One MORE block of 6 shapes straight after those 48 (51..56): the
-	// invulnerability flash body, white, shared by all four players.
+	// A fifth RENDER slot after the four players, for the boss - cyan
+	// body, purple head (dengland, 2026-08-25). It is a snake, so it
+	// gets a slot in the same encoding rather than a tile range and a
+	// lookup of its own: SnakeTile(SNAKE_SLOT_BOSS, role, shape) just
+	// works, and every shaping helper (SegShape, the turn telegraph,
+	// the flash) applies to it unchanged.
+	//
+	// Deliberately NOT folded into SNAKE_PLAYER_COUNT - that is the
+	// number of CORNERS a human can claim, and it sizes Slots and
+	// DemoSnakes. The boss is not a player.
+	SNAKE_SLOT_BOSS = SNAKE_PLAYER_COUNT;
+	SNAKE_RENDER_SLOTS = SNAKE_PLAYER_COUNT + 1;
+
+	// One MORE block of 6 shapes straight after those (63..68): the
+	// invulnerability flash body, white, shared by every snake.
 	//
 	// The original does the same thing - realiseSnake swaps the body to
 	// a different texture index (5) while invun, rather than recolouring
@@ -712,7 +820,7 @@ const
 	// One shared block, not one per player: white is white, and the
 	// point of the flash is that it OVERRIDES the player colour.
 	TILE_SNAKE_FLASH_BASE = TILE_SNAKE_BASE
-			+ (SNAKE_PLAYER_COUNT * SNAKE_ROLE_COUNT * SHAPE_COUNT);
+			+ (SNAKE_RENDER_SLOTS * SNAKE_ROLE_COUNT * SHAPE_COUNT);
 
 	// Spreading lava (57..59), by AGE tier: the cells laid down first are
 	// the hot core, the newest are the cooling crust at the edge. Tier is
@@ -730,7 +838,28 @@ const
 	// gameTileColrs by raw tile value with NO bounds check (snake_game.s
 	// says so explicitly), so these tables must have exactly this many
 	// entries - if this number changes, they change with it.
-	TILE_COUNT = TILE_LAVA_BASE + LAVA_TIER_COUNT;
+	// Bee (60). One tile - bees have no shapes and no age, they just
+	// move. Character $DA in colour $04, both dengland's.
+	TILE_BEE = TILE_LAVA_BASE + LAVA_TIER_COUNT;
+
+	// Food (61..64), in the original's own type order - see
+	// snakeCheckEat. Note 0 and 1 are OPPOSITES in both growth and
+	// speed, and each cancels the other's pending effect; they are not
+	// "grow big / grow small".
+	//
+	//   0  clubs $58         growNone 18, moveFast  +9   600 pts
+	//   1  solid circle $51  growEx   12, moveFast  -6   200 pts
+	//   2  open circle $57                moveFast +24   400 pts
+	//   3  heart $53         invun +24,   moveFast +12   500 pts
+	//
+	// Characters are dengland's (2026-08-25), bit 7 clear - the plain
+	// forms, not the reversed ones. Solid circle reads as heavy for the
+	// grow-and-slow food, open circle as light for the fast one, which
+	// was his reasoning.
+	TILE_FOOD_BASE = TILE_BEE + 1;
+	FOOD_TYPE_COUNT = 4;
+
+	TILE_COUNT = TILE_FOOD_BASE + FOOD_TYPE_COUNT;
 
 
 	// 12 ticks/sec (1000 div 12 = 83ms) as of 2026-08-24 - raised from
@@ -760,7 +889,12 @@ const
 	// TICK_MS=83 that's ~6 steps/sec for the demo, ~4 for normal play
 	// and ~12 flat out.
 	//
-	// The gear names, in ticks-per-step (SMALLER is faster).
+	// The gear names, in ticks-per-step (SMALLER is faster). These are
+	// the original's tGAMESPEED values exactly:
+	//   {slow = 4, normal = 3, fast = 2, turbo1 = 1, turbo2 = 0}
+	// turbo2 is deliberately absent - server.lua:46 says "DO NOT USE
+	// turbo settings, especially turbo2!", so TOP is the floor here.
+	SNAKE_SPEED_SLOW   = 4;
 	SNAKE_SPEED_NORMAL = 3;
 	SNAKE_SPEED_FAST   = 2;
 	SNAKE_SPEED_TOP    = 1;
@@ -953,6 +1087,104 @@ const
 	// lava is let out into real play, rather than being remembered then.
 	DEMO_LAVA_HEAD_CLEAR = 2;
 
+	// --- Bees ---
+	//
+	// DEMO_BEE_COUNT (4, one per corner) is declared ahead of the type
+	// block - see the top of the unit. In real play the count should
+	// scale with progress the way the original does it
+	// (`iLevelBeesMax = 5 + iLevelProgress * 3`); four is a showcase
+	// number, matching dengland's "4 bees in the corners".
+
+	// Cells of clearance a bee needs from every head when it SPAWNS
+	// (Chebyshev - max of the two axis distances). dengland's rule,
+	// 2026-08-24, superseding the original's checkPlaceBee: that one
+	// ANDs its axis tests, so it actually blocks the whole 5-wide row
+	// band and column band through the head rather than a box. A plain
+	// distance is both clearer and less punishing.
+	DEMO_BEE_SPAWN_CLEAR = 5;
+
+	// A bee's move is chosen from three options, weighted. Toward-weight
+	// rises and stall-weight falls with progress, so difficulty changes
+	// how OFTEN a bee acts, never how fast it moves when it does -
+	// dengland's call, and the important one:
+	//
+	//   a slow bee is a PREDICTABLE bee. Scaling the rate down for easy
+	//   play would make easy bees both slow and deterministic, which is
+	//   exactly the solvable-by-geometry problem the stall option
+	//   exists to prevent. Do not "simplify" this back into a rate.
+	//
+	//   progress   toward:random:stall      toward / random / stall
+	//   training      2:1:3                    33% / 17% / 50%
+	//   easy          2:1:2                    40% / 20% / 40%
+	//   normal        2:1:1                    50% / 25% / 25%  <- his figure
+	//   hard          3:1:1                    60% / 20% / 20%
+	//   expert        4:1:1                    67% / 17% / 17%
+	//
+	// Stall never reaches zero, so arrival stays uncertain even at
+	// expert.
+	DEMO_BEE_WEIGHT_RANDOM = 1;
+
+	// How long the bee wave holds the stage.
+	DEMO_BEE_WAVE_TICKS = 9000 div TICK_MS;
+
+	// --- Food ---
+	//
+	// The attract food wave is a straight DISPLAY of all four types, not
+	// a simulation: one row above the middle wall and one below, every
+	// other cell, cycling through the types (dengland, 2026-08-25 -
+	// "two rows of it above and below the wall alternating each type
+	// with spaces between them"). Demo snakes never eat, so there is
+	// nothing to simulate yet; this exists to show what the four foods
+	// LOOK like.
+	//
+	// Real play spawns them one at a time at random free cells with a
+	// TTL of 16..28 and a cap of 5 outstanding (levelTick) - nothing
+	// like this layout.
+	// --- Boss ---
+	//
+	// The attract boss circles the middle wall (dengland, 2026-08-25:
+	// "we can have the boss circling the wall after the food is shown").
+	// A fixed loop, NOT an AI - it is the demo snakes' circuit trick on
+	// a smaller rectangle, so it costs nothing and can't misbehave. The
+	// real boss AI is a separate and much larger job; see the design
+	// notes on why a snake AI is harder than the bees' (a bee is a
+	// point and can bump harmlessly, a snake that walks into itself is
+	// dead).
+	//
+	// Margin 2 rather than 1: hugging the wall gives a loop only 3 rows
+	// tall, where the boss spends most of its time cornering and reads
+	// as frantic rather than deliberate.
+	DEMO_BOSS_MARGIN = 2;
+	DEMO_BOSS_TOP    = DEMO_WALL_ROW - DEMO_BOSS_MARGIN;
+	DEMO_BOSS_BOTTOM = DEMO_WALL_ROW + DEMO_BOSS_MARGIN;
+	DEMO_BOSS_LEFT   = DEMO_WALL_LEFT - DEMO_BOSS_MARGIN;
+	DEMO_BOSS_RIGHT  = DEMO_WALL_RIGHT + DEMO_BOSS_MARGIN;
+
+	DEMO_BOSS_LAP = 2 * (DEMO_BOSS_RIGHT - DEMO_BOSS_LEFT)
+			+ 2 * (DEMO_BOSS_BOTTOM - DEMO_BOSS_TOP);
+
+	// Longer than a demo snake - it should read as something bigger
+	// than the players, and length is the only cue for that (a head
+	// running straight is the same character as its body).
+	DEMO_BOSS_LEN = 8;
+
+	// Slower than the demo snakes' FAST, so it reads as heavy.
+	DEMO_BOSS_STEP_TICKS = SNAKE_SPEED_NORMAL;
+
+	// Longer than the other waves (dengland, 2026-08-25). It moves at
+	// NORMAL speed round a 28-cell loop, so 9s was barely a lap and a
+	// half - not enough to read as circling. 14s is about two and a
+	// half laps.
+	DEMO_BOSS_WAVE_TICKS = 14000 div TICK_MS;
+
+	DEMO_FOOD_STRIDE = 2;
+
+	// Rows between the food and the wall - 2 leaves ONE clear tile
+	// between them (dengland, 2026-08-25). Sitting directly against the
+	// wall made the two read as one thick band.
+	DEMO_FOOD_WALL_GAP = 2;
+	DEMO_FOOD_WAVE_TICKS = 7000 div TICK_MS;
+
 	// How long the pool sits at full extent before draining.
 	DEMO_LAVA_HOLD_TICKS = 3000 div TICK_MS;
 
@@ -961,6 +1193,98 @@ const
 	// noise, a beat of nothing makes each one an event.
 	DEMO_WAVE_GAP_TICKS = 2000 div TICK_MS;
 
+	// --- Screen shake, cued for the lava eruption ---
+	//
+	// dengland, 2026-08-25: shake "just before and then during the first
+	// parts of the lava eruption". So it is cued DEMO_SHAKE_LEAD_MS
+	// before the wave's gap runs out, and runs on past the seeding into
+	// the first growth steps - the ground moves, then the lava arrives.
+	//
+	// Duration goes over in FRAMES, not ticks: the client jitters the
+	// scroll registers per frame, and a tick is 83ms - far too coarse
+	// to pace a shake by. PAL 50Hz assumed for the conversion.
+	FRAME_MS = 20;
+
+	DEMO_SHAKE_LEAD_MS = 800;
+	DEMO_SHAKE_MS = 2200;
+
+	DEMO_SHAKE_LEAD_TICKS = DEMO_SHAKE_LEAD_MS div TICK_MS;
+	DEMO_SHAKE_FRAMES = DEMO_SHAKE_MS div FRAME_MS;
+
+
+	// --- REAL LEVEL GEOMETRY -------------------------------------------
+	//
+	// Ported from the original's levelGenA..D (LUA/server.lua:1370-1465)
+	// and its Bresenham levelDrawLine (:1338). This is the interior wall
+	// layout a REAL game plays on, as opposed to the demo's single
+	// hand-placed bar (DEMO_WALL_ROW and friends above), which exists
+	// only to give the attract reel's hazards something to flow around.
+	//
+	// Two differences from the original are deliberate:
+	//
+	// 1. THE ORIGINAL HAS NO BORDER. Its bounds test is commented out
+	//    (snakeCheckMove, :1026-1031) and nothing ever draws a frame, so
+	//    a snake leaving the field indexes tUpdTiles out of range.
+	//    QUADRO has always drawn a solid ring (now BuildLevelBase), and
+	//    that stays - it is the same rule the walls already give us
+	//    rather than a special case, and it is what the client already
+	//    renders.
+	//
+	// 2. FOUR-FOLD SYMMETRY INSTEAD OF THE ORIGINAL'S HAND-PLACED PAIRS.
+	//    The original is a 2-player game and its four lines are two
+	//    roughly-mirrored pairs, eyeballed rather than generated - e.g.
+	//    levelGenA's {3,7} pairs with {24,8}, which is not an exact
+	//    reflection of anything. With four corners that stops being good
+	//    enough: whatever geometry sits near one corner has to sit near
+	//    all four, or the corners are not the same game. So a variant
+	//    declares ONE line in the top-left quadrant and DrawWallQuad
+	//    reflects it into the other three.
+	//
+	// Line COUNT is unchanged at four per level - the original drew four
+	// by hand, this draws one shape four times.
+	LEVEL_VARIANTS = 4;
+
+	// Generated walls stay one cell clear of the demo circuit's track
+	// (DEMO_INSET), and that clearance is not cosmetic. The demo snakes
+	// restore TILE_FLOOR behind themselves rather than whatever was
+	// there before, so a generated wall underneath the track would be
+	// silently EATEN by the first snake to pass over it.
+	LEVEL_INSET = DEMO_INSET + 1;
+
+	// The top-left quadrant a variant's base line is declared in. Walls
+	// are mirrored out of here, so a line is capped to the QUADRANT
+	// rather than to the board - the original's caps of 8 and 5 assume
+	// its own 30x18 field with no border and no inset, and a vertical
+	// run of 8 does not fit in the seven rows this leaves.
+	LEVEL_QUAD_TOP    = LEVEL_INSET;
+	LEVEL_QUAD_LEFT   = LEVEL_INSET;
+	LEVEL_QUAD_BOTTOM = (BOARD_ROWS div 2) - 1;
+	LEVEL_QUAD_RIGHT  = (BOARD_COLS div 2) - 1;
+
+	LEVEL_QUAD_ROWS = LEVEL_QUAD_BOTTOM - LEVEL_QUAD_TOP + 1;
+	LEVEL_QUAD_COLS = LEVEL_QUAD_RIGHT - LEVEL_QUAD_LEFT + 1;
+
+	// The original's own length scaling, kept exactly: a "long" run is
+	// min((progress+1)*2, 8) and a "short" one min(progress+1, 5), each
+	// then less one because they count cells TRAVELLED, not cells drawn.
+	// Walls therefore GROW with difficulty, which is the original's
+	// level-difficulty model and the reason boards can eventually BE the
+	// difficulty tiers.
+	LEVEL_LONG_CAP  = 8;
+	LEVEL_SHORT_CAP = 5;
+
+	// The boss needs a fifth spawn point when all four corners are taken,
+	// and dengland put it in the middle (2026-08-25) - "the area in the
+	// middle might be free but we can make it so anyway". It IS free:
+	// measured across every variant at progress 0..20, the smallest
+	// clear box at dead centre is 8x8. This carve is therefore a no-op
+	// today and exists as a GUARANTEE - a future variant reaching the
+	// middle would otherwise break the boss spawn silently, and this is
+	// far cheaper than remembering to re-measure.
+	//
+	// Half-width, so the box is 2x this on each axis - the centre of an
+	// even-sided board falls between cells and has no single middle.
+	LEVEL_CENTRE_CLEAR = 2;
 
 
 procedure DoDestroyListMessages;
@@ -2316,9 +2640,322 @@ procedure TSnakeGame.Add(APlayer: TPlayer);
 		end;
 	end;
 
-constructor TSnakeGame.Create;
+// SlotStatusToAll - tell everyone in the zone about one corner. Caller
+// holds Lock.
+//
+// Everyone, not just the other corner-holders as chess did: QUADRO is
+// spectator-first, and a spectator watching the board wants to see a
+// corner change hands as much as the players do. Mirrors the same
+// broadcast already inside Remove.
+procedure TSnakeGame.SlotStatusToAll(ASlot: Integer);
+	var
+	j: Integer;
+
+	begin
+	with FPlayers.LockList do
+		try
+		for j:= 0 to Count - 1 do
+			SendSlotStatus(Items[j], ASlot);
+
+		finally
+		FPlayers.UnlockList;
+		end;
+	end;
+
+// ClaimSlot - a spectator takes one of the four corners. ASlot is
+// 0..3, or SLOT_CLAIM_ANY for the lowest free one. Returns the slot
+// claimed, or -1 if the claim was refused.
+//
+// Refusals are distinguished by the caller (see ProcessPlayerMessage)
+// rather than folded into one error, because they mean genuinely
+// different things to a player: the corner you pressed is taken, versus
+// you already have one.
+//
+// Claiming does NOT spawn a snake yet - there is no movement model to
+// spawn into. This is the corner-ownership half only; the spawn (with
+// its shield and cleared start area, per the join-in-progress design)
+// lands with the tick simulation.
+function TSnakeGame.ClaimSlot(APlayer: TPlayer; ASlot: Integer): Integer;
+	var
+	i: Integer;
+
+	begin
+	Result:= -1;
+
+	Lock.Acquire;
+		try
+		// One corner per player. Without this a client that double-fires
+		// its control would silently occupy two corners and only ever
+		// be released from one (Remove stops at the first match).
+		for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+			if  Slots[i].Player = APlayer then
+				Exit;
+
+		if  ASlot = SLOT_CLAIM_ANY then
+			begin
+			for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+				if  not Assigned(Slots[i].Player) then
+					begin
+					ASlot:= i;
+					Break;
+					end;
+
+			if  ASlot = SLOT_CLAIM_ANY then
+				Exit;			// all four taken
+			end
+		else
+			begin
+			if  (ASlot < 0) or (ASlot > SNAKE_PLAYER_COUNT - 1) then
+				Exit;
+
+			if  Assigned(Slots[ASlot].Player) then
+				Exit;
+			end;
+
+		Slots[ASlot].Player:= APlayer;
+		Slots[ASlot].Name:= APlayer.Name;
+		Slots[ASlot].State:= psPlaying;
+
+		Result:= ASlot;
+
+		SlotStatusToAll(ASlot);
+
+		finally
+		Lock.Release;
+		end;
+	end;
+
+// ReleaseSlot - give up whatever corner this player holds, back to
+// spectator. Returns the slot released, or -1 if they held none.
+//
+// Deliberately the same three assignments Remove makes, for the same
+// reason: there is no forfeit or winner logic to run, the board just
+// carries on with one fewer corner claimed - down to zero, which is
+// attract mode.
+function TSnakeGame.ReleaseSlot(APlayer: TPlayer): Integer;
+	var
+	i: Integer;
+
+	begin
+	Result:= -1;
+
+	Lock.Acquire;
+		try
+		for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+			if  Slots[i].Player = APlayer then
+				begin
+				Slots[i].Player:= nil;
+				Slots[i].Name:= '';
+				Slots[i].State:= psNone;
+
+				Result:= i;
+
+				SlotStatusToAll(i);
+
+				Break;
+				end;
+
+		finally
+		Lock.Release;
+		end;
+	end;
+
+// BuildLevelBase - a bare room: solid wall around the outside, floor
+// everywhere inside. Every board starts here, demo or real, so there is
+// exactly one place that knows what the border looks like.
+//
+// The border is QUADRO's own addition; see the LEVEL_* constants for why
+// the original manages without one (it doesn't, quite).
+procedure TSnakeGame.BuildLevelBase;
 	var
 	r, c: Integer;
+
+	begin
+	for r:= 0 to BOARD_ROWS - 1 do
+		for c:= 0 to BOARD_COLS - 1 do
+			if  (r = 0) or (r = BOARD_ROWS - 1)
+			or  (c = 0) or (c = BOARD_COLS - 1) then
+				Board[r][c]:= TILE_WALL
+			else
+				Board[r][c]:= TILE_FLOOR;
+	end;
+
+// DrawWallLine - the original's levelDrawLine (LUA/server.lua:1338),
+// which is Bresenham from rosettacode. Kept rather than replaced because
+// variants C and D draw shallow DIAGONALS, and a diagonal's exact step
+// pattern is the shape - reimplementing it with a different rounding
+// rule would quietly redraw those levels.
+//
+// Two changes from the original. It takes plain row/col integers instead
+// of mutating {x,y} tables in place (the original's caller can never
+// reuse a tPos, since levelDrawLine walks tPos1 to its destination); and
+// every write is range-checked. The check is defence, not policy - the
+// callers below stay inside the quadrant by construction - but Board is
+// a fixed array and a bad progress value writing outside it would be the
+// same class of wild write as the board-row bug fixed in the client.
+procedure TSnakeGame.DrawWallLine(AR1, AC1, AR2, AC2: Integer);
+	var
+	dr, dc, sr, sc, err: Integer;
+
+	begin
+	if  AC1 < AC2 then
+		sc:= 1
+	else
+		sc:= -1;
+
+	if  AR1 < AR2 then
+		sr:= 1
+	else
+		sr:= -1;
+
+	dc:= Abs(AC2 - AC1);
+	dr:= Abs(AR2 - AR1);
+
+	if  dc > dr then
+		err:= dc div 2
+	else
+		err:= -dr div 2;
+
+	while True do
+		begin
+		if  (AR1 >= 0) and (AR1 <= BOARD_ROWS - 1)
+		and (AC1 >= 0) and (AC1 <= BOARD_COLS - 1) then
+			Board[AR1][AC1]:= TILE_WALL;
+
+		if  (AC1 = AC2) and (AR1 = AR2) then
+			Break;
+
+		if  err > -dc then
+			begin
+			err:= err - dr;
+			AC1:= AC1 + sc;
+
+			if  (AC1 = AC2) and (AR1 = AR2) then
+				begin
+				if  (AR1 >= 0) and (AR1 <= BOARD_ROWS - 1)
+				and (AC1 >= 0) and (AC1 <= BOARD_COLS - 1) then
+					Board[AR1][AC1]:= TILE_WALL;
+
+				Break;
+				end;
+			end;
+
+		if  err < dr then
+			begin
+			err:= err + dc;
+			AR1:= AR1 + sr;
+			end;
+		end;
+	end;
+
+// DrawWallQuad - draw a line and its three reflections, so all four
+// corners see identical geometry. This is the whole of QUADRO's
+// departure from the original's level layout; see the LEVEL_* constants
+// for why four players make hand-placed pairs untenable.
+//
+// Reflections are about the board's centre lines, which for even
+// dimensions fall BETWEEN cells - so col c maps to BOARD_COLS-1-c with
+// no fixed column, and every line has three distinct images. On an odd
+// dimension a line sitting exactly on the centre would map to itself and
+// get drawn twice; harmless (it writes the same TILE_WALL) but worth
+// knowing before anyone revisits the 29x20 board idea.
+procedure TSnakeGame.DrawWallQuad(AR1, AC1, AR2, AC2: Integer);
+	var
+	mr, mc: Integer;
+
+	begin
+	mr:= BOARD_ROWS - 1;
+	mc:= BOARD_COLS - 1;
+
+	DrawWallLine(AR1, AC1, AR2, AC2);
+	DrawWallLine(AR1, mc - AC1, AR2, mc - AC2);
+	DrawWallLine(mr - AR1, AC1, mr - AR2, AC2);
+	DrawWallLine(mr - AR1, mc - AC1, mr - AR2, mc - AC2);
+	end;
+
+// BuildLevel - lay out one of the four level variants at a given
+// difficulty progress. Ported from levelGenA..D; see the LEVEL_*
+// constants for what was kept and what changed.
+//
+// Each variant declares ONE line inside the top-left quadrant and hands
+// it to DrawWallQuad. A and B are the axis-aligned pair (A long
+// horizontal, B long vertical - the original alternates the same way),
+// C and D the shallow diagonals, mirrored so C rises to the right and D
+// falls.
+//
+// NOT YET CALLED FROM ANYWHERE. Real games do not start yet, and the
+// attract reel deliberately does not use this: the demo's boss circles
+// rows 7..11 / cols 9..19 painting TILE_FLOOR behind itself, which would
+// erase any generated wall it crossed - variant A's line at row 8 runs
+// straight through it. The demo's own bar stays demo scaffolding.
+procedure TSnakeGame.BuildLevel(AVariant, AProgress: Integer);
+	var
+	long, short, drop, r, c: Integer;
+
+	begin
+	BuildLevelBase;
+
+	// The original's scaling, then clamped to the quadrant so a run
+	// cannot cross the centre line and collide with its own reflection.
+	long:= (AProgress + 1) * 2;
+	if  long > LEVEL_LONG_CAP then
+		long:= LEVEL_LONG_CAP;
+
+	short:= AProgress + 1;
+	if  short > LEVEL_SHORT_CAP then
+		short:= LEVEL_SHORT_CAP;
+
+	Dec(long);
+	Dec(short);
+
+	if  long > LEVEL_QUAD_COLS - 1 then
+		long:= LEVEL_QUAD_COLS - 1;
+	if  short > LEVEL_QUAD_ROWS - 1 then
+		short:= LEVEL_QUAD_ROWS - 1;
+
+	case AVariant mod LEVEL_VARIANTS of
+		// A - long horizontal, sitting one row above the centre line and
+		// reaching inward from the left edge of the quadrant.
+		0:	DrawWallQuad(LEVEL_QUAD_BOTTOM - 1, LEVEL_QUAD_LEFT,
+					LEVEL_QUAD_BOTTOM - 1, LEVEL_QUAD_LEFT + long);
+
+		// B - long vertical. The vertical cap bites here: the quadrant
+		// is only LEVEL_QUAD_ROWS tall, so B's run is shorter than A's
+		// at the same progress. That asymmetry is the board's shape
+		// (30x20), not a mistake, and it is why B pushes its line
+		// further in from the side to compensate.
+		1:	DrawWallQuad(LEVEL_QUAD_TOP, LEVEL_QUAD_LEFT + 2,
+					LEVEL_QUAD_TOP + short, LEVEL_QUAD_LEFT + 2);
+
+		// C/D - the diagonals. The original derives the rise from the
+		// run (iLenY2 = ceil(iLenX / 3)), giving a shallow slope that
+		// stays readable as a wall rather than a staircase; kept, with
+		// the ceiling done by hand since Pascal's Ceil wants floats.
+		2:	begin
+			drop:= (long + 2) div 3;
+			DrawWallQuad(LEVEL_QUAD_BOTTOM, LEVEL_QUAD_LEFT,
+					LEVEL_QUAD_BOTTOM - drop, LEVEL_QUAD_LEFT + long);
+			end;
+
+		3:	begin
+			drop:= (long + 2) div 3;
+			DrawWallQuad(LEVEL_QUAD_TOP, LEVEL_QUAD_LEFT,
+					LEVEL_QUAD_TOP + drop, LEVEL_QUAD_LEFT + long);
+			end;
+		end;
+
+	// Guarantee the boss's centre spawn - see LEVEL_CENTRE_CLEAR. Runs
+	// after the variant, so it wins over anything a variant draws.
+	for r:= (BOARD_ROWS div 2) - LEVEL_CENTRE_CLEAR
+			to (BOARD_ROWS div 2) - 1 + LEVEL_CENTRE_CLEAR do
+		for c:= (BOARD_COLS div 2) - LEVEL_CENTRE_CLEAR
+				to (BOARD_COLS div 2) - 1 + LEVEL_CENTRE_CLEAR do
+			Board[r][c]:= TILE_FLOOR;
+	end;
+
+constructor TSnakeGame.Create;
+	var
+	c: Integer;
 
 	begin
 	inherited;
@@ -2332,18 +2969,12 @@ constructor TSnakeGame.Create;
 	Difficulty:= gdNormal;
 	LevelProgress:= Ord(Difficulty);
 
-	// Placeholder board - a plain bordered room (wall around the edge,
-	// empty floor inside). No real level/tile simulation exists yet
-	// (see the TODO below) - this just gives the row-fetch protocol
-	// something real and stable to sync against. The eventual tick
-	// simulation replaces this wholesale, it doesn't build on it.
-	for r:= 0 to BOARD_ROWS - 1 do
-		for c:= 0 to BOARD_COLS - 1 do
-			if  (r = 0) or (r = BOARD_ROWS - 1)
-			or  (c = 0) or (c = BOARD_COLS - 1) then
-				Board[r][c]:= TILE_WALL
-			else
-				Board[r][c]:= TILE_FLOOR;
+	// A plain bordered room - wall around the edge, empty floor inside.
+	// This is the ATTRACT board; a real game will call BuildLevel
+	// instead, which starts from the same base and then adds the level's
+	// own interior geometry. The demo scaffolding below is deliberately
+	// not part of that - see BuildLevel's own comment.
+	BuildLevelBase;
 
 	// A short wall across the middle, on the lava seed row and between
 	// the two pools. Demo scaffolding, not a real level: lava has always
@@ -2353,8 +2984,12 @@ constructor TSnakeGame.Create;
 	// pattern against (2026-08-24) - a tendril creeping inward along
 	// this row now visibly stops dead and flows around it instead.
 	//
-	// Real level geometry comes from the original's levelGenA..D, which
-	// still need reworking for 4 corners.
+	// Real level geometry now exists - see BuildLevel, ported from the
+	// original's levelGenA..D and reworked for 4 corners. It is not used
+	// here: the boss circuit and the food rows are both positioned off
+	// this bar, and the demo paints TILE_FLOOR behind everything it
+	// moves, so generated walls and the attract reel cannot share a
+	// board without the reel slowly eating the level.
 	for c:= DEMO_WALL_LEFT to DEMO_WALL_RIGHT do
 		Board[DEMO_WALL_ROW][c]:= TILE_WALL;
 
@@ -2431,6 +3066,33 @@ procedure TSnakeGame.SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TT
 	APlayer.AddSendMessage(m);
 	end;
 
+// Shake (mcPlay/$0C) - payload is [frames]. "We can just send a message
+// 'shake now' and have it last that long on the client" (dengland,
+// 2026-08-25).
+//
+// One message, one duration, and the client owns the whole effect after
+// that: it jitters the scroll registers itself, per FRAME, and stops on
+// its own. Sending per-frame offsets from here instead would put a
+// 50Hz visual on a 12Hz tick and burn the delta budget on something the
+// client can generate for free.
+procedure TSnakeGame.SendShake(APlayer: TPlayer; AFrames: Integer);
+	var
+	m: TBaseMessage;
+
+	begin
+	if  AFrames > 255 then
+		AFrames:= 255;
+
+	m:= TBaseMessage.Create;
+	m.Category:= mcPlay;
+	m.Method:= $0C;
+
+	SetLength(m.Data, 1);
+	m.Data[0]:= AFrames;
+
+	APlayer.AddSendMessage(m);
+	end;
+
 const
 	// Lap length in cells, walking the rectangle's perimeter.
 	DEMO_RUN_H  = DEMO_RIGHT - DEMO_LEFT;
@@ -2462,6 +3124,15 @@ const
 // with no other symptom - TICK_MS could grow enough to do that.
 {$IF DEMO_INVUN_TICKS < 1}
 	{$ERROR DEMO_INVUN_TICKS rounded to zero - check TICK_MS}
+{$ENDIF}
+
+// The boss must be shorter than its own loop, or its tail would still
+// occupy the cell its head is arriving at and it would paint over
+// itself. Same reasoning as DEMO_SNAKE_MAX_LEN vs DEMO_SPACING, and it
+// matters here because the loop is derived from the WALL's size - move
+// the wall and this can break silently.
+{$IF DEMO_BOSS_LEN >= DEMO_BOSS_LAP}
+	{$ERROR DEMO_BOSS_LEN must be less than DEMO_BOSS_LAP}
 {$ENDIF}
 
 // Tile value for one snake segment - see the SHAPE_*/SNAKE_ROLE_*
@@ -2557,37 +3228,57 @@ function DemoLookFrom(ARow, ACol: Byte; ADir: TSnakeDir): TSnakeDir;
 // circuit parametric is what lets any number of snakes be spaced evenly
 // around it without hand-placing each one - including snakes whose
 // bodies straddle a corner at spawn, which hand-placement got wrong.
-procedure CircuitAt(ADist: Integer; out ARow, ACol: Byte; out ADir: TSnakeDir);
+// Walk ADist cells anticlockwise round the perimeter of an arbitrary
+// rectangle. Generalised out of CircuitAt so the boss can run its own
+// smaller loop around the middle wall on exactly the same code - see
+// BossAt.
+//
+// Note this is STATELESS: a cell's position and the direction leaving
+// it depend only on the distance. That is what lets a snake on a fixed
+// loop be stored as nothing but a distance counter, with no body array
+// and no per-segment bookkeeping at all.
+procedure RectWalk(ADist, ATop, ALeft, ABottom, ARight: Integer;
+		out ARow, ACol: Byte; out ADir: TSnakeDir);
 	var
-	d: Integer;
+	d, runh, runv, lap: Integer;
 
 	begin
-	d:= ((ADist mod DEMO_LAP) + DEMO_LAP) mod DEMO_LAP;
+	runh:= ARight - ALeft;
+	runv:= ABottom - ATop;
+	lap:= 2 * runh + 2 * runv;
 
-	if  d < DEMO_RUN_H then
+	d:= ((ADist mod lap) + lap) mod lap;
+
+	if  d < runh then
 		begin					// along the bottom, heading right
-		ARow:= DEMO_BOTTOM;
-		ACol:= DEMO_LEFT + d;
+		ARow:= ABottom;
+		ACol:= ALeft + d;
 		ADir:= sdRight;
 		end
-	else if d < (DEMO_RUN_H + DEMO_RUN_V) then
+	else if d < (runh + runv) then
 		begin					// up the right side
-		ARow:= DEMO_BOTTOM - (d - DEMO_RUN_H);
-		ACol:= DEMO_RIGHT;
+		ARow:= ABottom - (d - runh);
+		ACol:= ARight;
 		ADir:= sdUp;
 		end
-	else if d < (2 * DEMO_RUN_H + DEMO_RUN_V) then
+	else if d < (2 * runh + runv) then
 		begin					// along the top, heading left
-		ARow:= DEMO_TOP;
-		ACol:= DEMO_RIGHT - (d - DEMO_RUN_H - DEMO_RUN_V);
+		ARow:= ATop;
+		ACol:= ARight - (d - runh - runv);
 		ADir:= sdLeft;
 		end
 	else
 		begin					// down the left side
-		ARow:= DEMO_TOP + (d - 2 * DEMO_RUN_H - DEMO_RUN_V);
-		ACol:= DEMO_LEFT;
+		ARow:= ATop + (d - 2 * runh - runv);
+		ACol:= ALeft;
 		ADir:= sdDown;
 		end;
+	end;
+
+procedure CircuitAt(ADist: Integer; out ARow, ACol: Byte; out ADir: TSnakeDir);
+	begin
+	RectWalk(ADist, DEMO_TOP, DEMO_LEFT, DEMO_BOTTOM, DEMO_RIGHT,
+			ARow, ACol, ADir);
 	end;
 
 procedure TSnakeGame.InitDemoSnakes;
@@ -2615,10 +3306,19 @@ procedure TSnakeGame.InitDemoSnakes;
 	DemoWave:= dwLava;
 	DemoLavaPhase:= dlpIdle;
 	DemoLavaStep:= 0;
+	DemoLavaHold:= 0;
 	DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
 
 	for b:= 0 to High(DemoLava) do
 		DemoLava[b].Count:= 0;
+
+	DemoBeeLeft:= 0;
+	DemoFoodLeft:= 0;
+	DemoBossLeft:= 0;
+	DemoShakePending:= 0;
+
+	for b:= 0 to High(DemoBees) do
+		DemoBees[b].Active:= False;
 
 	for s:= 0 to High(DemoSnakes) do
 		begin
@@ -3054,15 +3754,15 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 		if  full then
 			begin
 			DemoLavaPhase:= dlpHold;
-			DemoWaveWait:= DEMO_LAVA_HOLD_TICKS;
+			DemoLavaHold:= DEMO_LAVA_HOLD_TICKS;
 			end;
 		end;
 
 	dlpHold:
 		begin
-		Dec(DemoWaveWait, DEMO_LAVA_STEP_TICKS);
+		Dec(DemoLavaHold, DEMO_LAVA_STEP_TICKS);
 
-		if  DemoWaveWait <= 0 then
+		if  DemoLavaHold <= 0 then
 			DemoLavaPhase:= dlpRecede;
 		end;
 
@@ -3103,6 +3803,456 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 		end;
 	end;
 
+// Ticks between steps for anything moving at this board's own pace -
+// snakes in real play, and bees, which get their move OPPORTUNITY on
+// the same rhythm (see TickDemoBees).
+//
+// Derived from difficulty rather than being a separate setting: the
+// original keeps iGameSpeed independent of iGameDifficulty, but QUADRO
+// makes the boards themselves the difficulty tiers, so a harder board
+// is a faster one. Anchored so normal progress gives SNAKE_SPEED_NORMAL.
+//
+// The clamp is NOT optional. A plain (4 - progress) lands expert on 0,
+// which is the original's turbo2 - "DO NOT USE turbo settings,
+// especially turbo2!" (server.lua:46) - and progress keeps climbing
+// past expert as levels are cleared, so it would go negative after.
+function SnakeStepTicks(AProgress: Integer): Integer;
+	begin
+	Result:= SNAKE_SPEED_NORMAL + 2 - AProgress;
+
+	if  Result > SNAKE_SPEED_SLOW then
+		Result:= SNAKE_SPEED_SLOW;
+
+	if  Result < SNAKE_SPEED_TOP then
+		Result:= SNAKE_SPEED_TOP;
+	end;
+
+procedure TSnakeGame.TickDemoBees(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	b, k, best, dist, bestdist: Integer;
+	toward, stall, pick: Integer;
+	dr, dc, nr, nc: Integer;
+	r, c: Integer;
+
+	// Chebyshev distance - the "at least 5 away" rule is a box, so the
+	// larger of the two axis distances is the one that matters.
+	function HeadDist(ARow, ACol, ASnake: Integer): Integer;
+		var
+		a, d: Integer;
+
+		begin
+		a:= Abs(ARow - DemoSnakes[ASnake].Body[0].Row);
+		d:= Abs(ACol - DemoSnakes[ASnake].Body[0].Col);
+
+		if  a > d then
+			Result:= a
+		else
+			Result:= d;
+		end;
+
+	begin
+	// --- spawn, on entering the wave ---
+	if  DemoBeeLeft <= 0 then
+		begin
+		DemoBeeLeft:= DEMO_BEE_WAVE_TICKS;
+
+		for b:= 0 to High(DemoBees) do
+			begin
+			DemoBees[b].Active:= False;
+
+			// Clustered around the middle WALL - one off each end, above
+			// and below (dengland, 2026-08-25: "closer to the wall so
+			// as to not be blocked by the snakes").
+			//
+			// They used to spawn in the circuit's interior corners,
+			// which put them right against the track: the snakes were
+			// constantly in the way, and worse, the spawn clearance
+			// test below would reject a corner outright whenever a head
+			// happened to be near it, so bees went missing rather than
+			// appearing somewhere else. Starting in the open middle
+			// gives them room to actually be seen chasing.
+			//
+			// Bees are still PENNED inside the circuit for the same
+			// reason lava is: the demo has no collision, so a bee on
+			// the track would just be painted over by the next snake
+			// through. Real play lets them anywhere, which is where the
+			// clearance rule starts earning its keep.
+			if  (b and 1) = 0 then
+				c:= DEMO_WALL_LEFT - 1
+			else
+				c:= DEMO_WALL_RIGHT + 1;
+
+			if  (b and 2) = 0 then
+				r:= DEMO_WALL_ROW - 1
+			else
+				r:= DEMO_WALL_ROW + 1;
+
+			if  Board[r][c] <> TILE_FLOOR then
+				Continue;
+
+			// Never spawn on top of a player - see
+			// DEMO_BEE_SPAWN_CLEAR.
+			bestdist:= BOARD_COLS + BOARD_ROWS;
+			best:= 0;
+
+			for k:= 0 to High(DemoSnakes) do
+				begin
+				dist:= HeadDist(r, c, k);
+
+				if  dist < bestdist then
+					begin
+					bestdist:= dist;
+					best:= k;			// nearest head, kept for life
+					end;
+				end;
+
+			if  bestdist < DEMO_BEE_SPAWN_CLEAR then
+				Continue;
+
+			DemoBees[b].Row:= r;
+			DemoBees[b].Col:= c;
+			DemoBees[b].Target:= best;
+			DemoBees[b].MoveTick:= 0;
+			DemoBees[b].Active:= True;
+
+			EmitCell(r, c, TILE_BEE, ADeltas, ADeltaCount);
+			end;
+		end;
+
+	Dec(DemoBeeLeft);
+
+	// --- move ---
+	toward:= 2;
+
+	if  LevelProgress > 2 then
+		toward:= 2 + (LevelProgress - 2);
+
+	stall:= 3 - LevelProgress;
+
+	if  stall < 1 then
+		stall:= 1;
+
+	for b:= 0 to High(DemoBees) do
+		begin
+		if  not DemoBees[b].Active then
+			Continue;
+
+		// The move OPPORTUNITY comes at the board's own step rate, not
+		// every tick. That is what makes the weighting above work at
+		// every difficulty: a bee's actual speed is (chance of acting x
+		// board rate), so it is always a little slower than a snake
+		// simply running away, but the margin narrows from about 2x at
+		// training to 1.2x at expert.
+		if  DemoBees[b].MoveTick > 0 then
+			begin
+			Dec(DemoBees[b].MoveTick);
+			Continue;
+			end;
+
+		DemoBees[b].MoveTick:= SnakeStepTicks(LevelProgress) - 1;
+
+		pick:= Random(toward + DEMO_BEE_WEIGHT_RANDOM + stall);
+		dr:= 0;
+		dc:= 0;
+
+		if  pick < toward then
+			begin
+			// Toward the target head, on whichever axis it is further
+			// away - no pathfinding, dengland's call. A blocked move is
+			// simply a lost one (below), which is what makes walls real
+			// shelter rather than something bees route around.
+			r:= DemoSnakes[DemoBees[b].Target].Body[0].Row;
+			c:= DemoSnakes[DemoBees[b].Target].Body[0].Col;
+
+			if  Abs(r - DemoBees[b].Row) > Abs(c - DemoBees[b].Col) then
+				begin
+				if  r < DemoBees[b].Row then
+					dr:= -1
+				else if r > DemoBees[b].Row then
+					dr:= 1;
+				end
+			else
+				begin
+				if  c < DemoBees[b].Col then
+					dc:= -1
+				else if c > DemoBees[b].Col then
+					dc:= 1;
+				end;
+			end
+		else if pick < (toward + DEMO_BEE_WEIGHT_RANDOM) then
+			begin
+			case Random(4) of
+				0: dr:= -1;
+				1: dr:= 1;
+				2: dc:= -1;
+			else
+				dc:= 1;
+				end;
+			end;
+
+		if  (dr = 0) and (dc = 0) then
+			Continue;					// stalled, or already level
+
+		nr:= DemoBees[b].Row + dr;
+		nc:= DemoBees[b].Col + dc;
+
+		// Penned inside the circuit for the demo - see the spawn
+		// comment above.
+		if  (nr <= DEMO_TOP) or (nr >= DEMO_BOTTOM)
+		or (nc <= DEMO_LEFT) or (nc >= DEMO_RIGHT) then
+			Continue;
+
+		// Floor only. The same single test lava uses, and it gives
+		// "cannot pass through walls, snakes, tails, lava or food" with
+		// no per-hazard cases.
+		if  Board[nr][nc] <> TILE_FLOOR then
+			Continue;
+
+		EmitCell(DemoBees[b].Row, DemoBees[b].Col, TILE_FLOOR,
+				ADeltas, ADeltaCount);
+
+		DemoBees[b].Row:= nr;
+		DemoBees[b].Col:= nc;
+
+		EmitCell(nr, nc, TILE_BEE, ADeltas, ADeltaCount);
+		end;
+
+	// --- wave over: clear up and hand on ---
+	if  DemoBeeLeft <= 0 then
+		begin
+		for b:= 0 to High(DemoBees) do
+			if  DemoBees[b].Active then
+				begin
+				DemoBees[b].Active:= False;
+
+				// Only blank a cell still holding OUR bee, for the same
+				// reason lava checks before draining - once bees are
+				// let out onto the track in real play, something else
+				// may own that cell by now.
+				with DemoBees[b] do
+					if  Board[Row][Col] = TILE_BEE then
+						EmitCell(Row, Col, TILE_FLOOR, ADeltas, ADeltaCount);
+				end;
+
+		DemoWave:= dwFood;				// next in the reel
+		DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
+		end;
+	end;
+
+procedure TSnakeGame.TickDemoFood(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	pass, row, c, idx: Integer;
+
+	begin
+	// Lay the whole display out in one go, then just hold it. Both rows
+	// together are ~24 cells, which would blow the delta budget as a
+	// single burst - so this walks one PASS (one row) per tick, two
+	// ticks to appear and two to clear. It also looks better: the rows
+	// arrive one after the other rather than snapping into place.
+	if  DemoFoodLeft <= 0 then
+		DemoFoodLeft:= DEMO_FOOD_WAVE_TICKS + 2;
+
+	Dec(DemoFoodLeft);
+
+	pass:= DEMO_FOOD_WAVE_TICKS + 1 - DemoFoodLeft;
+
+	// Laying out (passes 0 and 1), or clearing (the last two ticks).
+	if  (pass < 2) or (DemoFoodLeft < 2) then
+		begin
+		if  pass < 2 then
+			row:= DEMO_WALL_ROW - DEMO_FOOD_WALL_GAP
+					+ (pass * DEMO_FOOD_WALL_GAP * 2)	// above, then below
+		else
+			row:= DEMO_WALL_ROW - DEMO_FOOD_WALL_GAP
+					+ ((1 - DemoFoodLeft) * DEMO_FOOD_WALL_GAP * 2);
+
+		// Type cycles along the row AND continues across both rows, so
+		// the two rows are offset from each other rather than repeating
+		// the same sequence twice.
+		idx:= 0;
+
+		if  row > DEMO_WALL_ROW then
+			idx:= 1;
+
+		c:= DEMO_LEFT + 1;
+
+		while c <= DEMO_RIGHT - 1 do
+			begin
+			if  pass < 2 then
+				begin
+				if  Board[row][c] = TILE_FLOOR then
+					EmitCell(row, c,
+							TILE_FOOD_BASE + (idx mod FOOD_TYPE_COUNT),
+							ADeltas, ADeltaCount);
+				end
+			else
+				// Only clear what is still food - a snake or lava may
+				// own the cell by the time the wave ends.
+				if  (Board[row][c] >= TILE_FOOD_BASE)
+				and (Board[row][c] < TILE_FOOD_BASE + FOOD_TYPE_COUNT) then
+					EmitCell(row, c, TILE_FLOOR, ADeltas, ADeltaCount);
+
+			Inc(idx);
+			Inc(c, DEMO_FOOD_STRIDE);
+			end;
+		end;
+
+	if  DemoFoodLeft <= 0 then
+		begin
+		DemoWave:= dwBoss;				// the boss closes the reel
+		DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
+		end;
+	end;
+
+procedure TSnakeGame.TickDemoBoss(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	i: Integer;
+	r, c: Byte;
+	dir: TSnakeDir;
+	flash, repaint: Boolean;
+
+	// Where the cell ADist round the boss loop is.
+	procedure BossAt(ADist: Integer; out ARow, ACol: Byte;
+			out ADir: TSnakeDir);
+		begin
+		RectWalk(ADist, DEMO_BOSS_TOP, DEMO_BOSS_LEFT,
+				DEMO_BOSS_BOTTOM, DEMO_BOSS_RIGHT, ARow, ACol, ADir);
+		end;
+
+	// The shape of the cell ADist round the loop: entered travelling
+	// the direction that LEFT ADist-1, left travelling the direction
+	// that leaves ADist. Purely positional - no history needed, which
+	// is the whole reason the boss needs no body array.
+	//
+	// This also gives the turn telegraph for free: the head sits on a
+	// corner cell showing the corner piece the step before it turns,
+	// exactly as a demo snake's head does.
+	function BossShape(ADist: Integer): Integer;
+		var
+		rr, cc: Byte;
+		din, dout: TSnakeDir;
+
+		begin
+		BossAt(ADist - 1, rr, cc, din);
+		BossAt(ADist, rr, cc, dout);
+
+		Result:= SegShape(din, dout);
+		end;
+
+	// Paint or clear the whole boss where it currently stands.
+	procedure PaintBoss(AShow: Boolean);
+		var
+		j: Integer;
+		rr, cc: Byte;
+		dd: TSnakeDir;
+
+		begin
+		for j:= 0 to DEMO_BOSS_LEN - 1 do
+			begin
+			BossAt(DemoBossDist - j, rr, cc, dd);
+
+			if  AShow then
+				begin
+				if  j = 0 then
+					EmitCell(rr, cc, SnakeTile(SNAKE_SLOT_BOSS,
+							SNAKE_ROLE_HEAD, BossShape(DemoBossDist - j)),
+							ADeltas, ADeltaCount)
+				else
+					// Body honours the flash; the head never does, same
+					// as any other snake (see SnakeBodyTile).
+					EmitCell(rr, cc, SnakeBodyTile(SNAKE_SLOT_BOSS,
+							BossShape(DemoBossDist - j), DemoBossFlashOn),
+							ADeltas, ADeltaCount);
+				end
+			else
+				// Only clear what is still ours - see the lava and bee
+				// waves for why.
+				if  (Board[rr][cc] >= TILE_SNAKE_BASE)
+				and (Board[rr][cc] < TILE_SNAKE_FLASH_BASE) then
+					EmitCell(rr, cc, TILE_FLOOR, ADeltas, ADeltaCount);
+			end;
+		end;
+
+	begin
+	// --- arrive ---
+	if  DemoBossLeft <= 0 then
+		begin
+		DemoBossLeft:= DEMO_BOSS_WAVE_TICKS;
+		DemoBossDist:= 0;
+		DemoBossStep:= 0;
+		DemoBossFlashOn:= False;
+
+		PaintBoss(True);
+		end;
+
+	Dec(DemoBossLeft);
+
+	// --- leave ---
+	if  DemoBossLeft <= 0 then
+		begin
+		PaintBoss(False);
+
+		DemoWave:= dwLava;			// round the reel again
+		DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
+
+		Exit;
+		end;
+
+	// --- invulnerability, from halfway on ---
+	//
+	// It turns invulnerable partway through its own wave rather than
+	// arriving that way (dengland, 2026-08-25), so the attract screen
+	// shows the boss BECOMING dangerous - a state change reads as an
+	// event, where a boss that flashed from the start would just look
+	// like a differently-coloured snake.
+	//
+	// Runs on the TICK, not the step, so it flashes at the same rate a
+	// player's does regardless of how slowly the boss is crawling.
+	flash:= (DemoBossLeft <= (DEMO_BOSS_WAVE_TICKS div 2))
+			and (((DemoBossLeft div DEMO_INVUN_FLASH_TICKS) and 1) = 0);
+
+	repaint:= flash <> DemoBossFlashOn;
+	DemoBossFlashOn:= flash;
+
+	// --- crawl ---
+	if  DemoBossStep > 0 then
+		begin
+		Dec(DemoBossStep);
+
+		if  repaint then
+			PaintBoss(True);
+
+		Exit;
+		end;
+
+	DemoBossStep:= DEMO_BOSS_STEP_TICKS - 1;
+
+	// Only three cells change per step, the same as a demo snake: the
+	// tail vacates, the old head demotes to body, and the new head
+	// arrives. Tail first, so a boss as long as its own loop still
+	// can't collide with the cell it is leaving.
+	BossAt(DemoBossDist - DEMO_BOSS_LEN + 1, r, c, dir);
+	EmitCell(r, c, TILE_FLOOR, ADeltas, ADeltaCount);
+
+	i:= DemoBossDist;
+	BossAt(i, r, c, dir);
+	EmitCell(r, c, SnakeBodyTile(SNAKE_SLOT_BOSS, BossShape(i),
+			DemoBossFlashOn), ADeltas, ADeltaCount);
+
+	Inc(DemoBossDist);
+
+	BossAt(DemoBossDist, r, c, dir);
+	EmitCell(r, c, SnakeTile(SNAKE_SLOT_BOSS, SNAKE_ROLE_HEAD,
+			BossShape(DemoBossDist)), ADeltas, ADeltaCount);
+
+	// After the move, so it paints where the segments now are.
+	if  repaint then
+		PaintBoss(True);
+	end;
+
 procedure TSnakeGame.TickDemoWave(var ADeltas: array of TTileDelta;
 		var ADeltaCount: Integer);
 	begin
@@ -3110,6 +4260,13 @@ procedure TSnakeGame.TickDemoWave(var ADeltas: array of TTileDelta;
 	if  DemoWaveWait > 0 then
 		begin
 		Dec(DemoWaveWait);
+
+		// Cue the shake while the beat is still running, so the ground
+		// is already moving before the first lava cell appears.
+		if  (DemoWave = dwLava)
+		and (DemoWaveWait = DEMO_SHAKE_LEAD_TICKS) then
+			DemoShakePending:= DEMO_SHAKE_FRAMES;
+
 		Exit;
 		end;
 
@@ -3117,13 +4274,14 @@ procedure TSnakeGame.TickDemoWave(var ADeltas: array of TTileDelta;
 	dwLava:
 		TickDemoLava(ADeltas, ADeltaCount);
 
-	// Not built yet. Rather than leave dead air on the attract screen,
-	// an unimplemented wave hands straight back to the start of the
-	// reel - so bringing one into rotation means implementing it here
-	// and nothing else.
-	dwBees,
+	dwBees:
+		TickDemoBees(ADeltas, ADeltaCount);
+
 	dwFood:
-		DemoWave:= dwLava;
+		TickDemoFood(ADeltas, ADeltaCount);
+
+	dwBoss:
+		TickDemoBoss(ADeltas, ADeltaCount);
 		end;
 	end;
 
@@ -3168,6 +4326,25 @@ procedure TSnakeGame.Tick;
 			TickDemoSnakes(deltas, deltaCount);
 			TickDemoWave(deltas, deltaCount);
 
+			// Drain a cued shake BEFORE the empty-broadcast check
+			// below: the shake is cued during a wave's quiet beat, so
+			// the very tick it lands on is quite likely to be one where
+			// nothing moved at all, and the early Exit would swallow it.
+			if  DemoShakePending > 0 then
+				begin
+				for i:= 0 to Watchers.Count - 1 do
+					try
+					SendShake(Watchers[i], DemoShakePending);
+
+					except
+					on E: Exception do
+						AddLogMessage(slkError, 'Tick: SendShake failed for watcher - ' +
+								E.Message);
+					end;
+
+				DemoShakePending:= 0;
+				end;
+
 			// Nothing changed this tick (snakes still counting down to
 			// their next step, and no hazard cell moved) - don't send
 			// an empty broadcast.
@@ -3207,7 +4384,9 @@ class function TSnakeGame.Name: AnsiString;
 procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
         AMessage: TBaseMessage; var AHandled: Boolean);
 	var
-	i: Integer;
+	i, s: Integer;
+	h: Boolean;
+	m: TBaseMessage;
 
 	procedure PeerMessageFromPlayer(APeer: TPlayer; AMessage: TBaseMessage);
 		var
@@ -3227,40 +4406,57 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 	begin
 	if  AMessage.Category = mcPlay then
 		begin
-		// FIXME: this still expects chess's old RoomPeer-shaped payload
-		// ([room, sender, message], method 4) and matches it against
-		// Desc, but the client (clientSendGameChat, fw_ctrls_net.s) was
-		// since corrected to send plain text only on method $0E with no
-		// room-name field, since ProcessPlayerMessage is only ever
-		// reached for players already in this game - see the comment on
-		// clientSendGameChat. The two ends currently don't agree, so
-		// chat doesn't actually work end-to-end yet - flagged for a
-		// follow-up pass, deliberately not fixed as a drive-by here
-		// since it's a separate concern from the board-row protocol.
 		if  AMessage.Method = 4 then
 			begin
 			// Game chat - broadcast to everyone in the zone (spectators
-			// included), not just the 4 claimed corners. Carried over
-			// near-verbatim from chess's TChessGame.ProcessPlayerMessage,
-			// which already worked this way (FPlayers is the zone's full
-			// membership, not just Slots).
+			// included), not just the 4 claimed corners. FPlayers is the
+			// zone's full membership, not just Slots.
+			//
+			// FIXED 2026-08-25. This used to expect chess's RoomPeer
+			// payload ([room, sender, message]) and match the room name
+			// against Desc, while the client had moved to sending plain
+			// text on $0E - so the two ends agreed on neither the method
+			// number nor the shape, and chat never worked end-to-end.
+			// Both are now $04 (dengland wanted the standard methods low,
+			// and it matches mcLobby/$04 room chat).
+			//
+			// Inbound is [message] and nothing else: ProcessPlayerMessage
+			// is only reached for a player already in this game, so there
+			// is no room to name, and the sender is stamped HERE from
+			// APlayer rather than trusted from the wire - a client could
+			// otherwise post as anyone.
 			AHandled:= True;
 
 			AMessage.ExtractParams;
-			if  (AMessage.Params.Count > 2)
-			and (CompareText(string(Desc), string(AMessage.Params[0])) = 0) then
+
+			if  AMessage.Params.Count >= 1 then
 				begin
-				AMessage.Params[1]:= Copy(APlayer.Name, Low(AnsiString), 8);
-
-				AMessage.DataFromParams;
-
-				with FPlayers.LockList do
+				m:= TBaseMessage.Create;
 					try
-					for i:= 0 to Count - 1 do
-						PeerMessageFromPlayer(Items[i], AMessage);
+					m.Category:= mcPlay;
+					m.Method:= $04;
+
+					// Outbound is [sender, message] - what the client's
+					// clientProcPlayGameChatMsg reads (readparm0 is the
+					// sender there, not readparm1: unlike RoomPeer there
+					// is no leading room-name field to skip).
+					m.Params.Add(Copy(APlayer.Name, Low(AnsiString), 8));
+					m.Params.Add(AMessage.Params[0]);
+					m.DataFromParams;
+
+					with FPlayers.LockList do
+						try
+						for i:= 0 to Count - 1 do
+							PeerMessageFromPlayer(Items[i], m);
+
+						finally
+						FPlayers.UnlockList;
+						end;
 
 					finally
-					FPlayers.UnlockList;
+					// PeerMessageFromPlayer Assigns a fresh copy per
+					// recipient, so this template is ours to free.
+					m.Free;
 					end;
 				end;
 			end
@@ -3289,6 +4485,88 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 					end;
 				end;
 			end
+		else if  AMessage.Method = $05 then
+			begin
+			// SlotClaim - a spectator presses START on one of the four
+			// corners. Payload is [slot], 0..3 or SLOT_CLAIM_ANY.
+			//
+			// $05, not $04: method 4 is still bound to the dead chess-era
+			// RoomPeer chat handler above. That handler is known-broken
+			// (the client moved to $0E and the server never followed) but
+			// it is live code and matches FIRST, so a claim on $04 would
+			// simply never be reached.
+			//
+			// Unlike BoardRowsReq above this DOES error back on refusal:
+			// a claim is a deliberate user action, not internal protocol
+			// traffic, so a player who pressed a corner and got nothing
+			// needs telling why.
+			AHandled:= True;
+
+			if  Length(AMessage.Data) < 1 then
+				APlayer.SendServerError(LIT_ERR_PLAYCINV)
+			else
+				begin
+				s:= ClaimSlot(APlayer, AMessage.Data[0]);
+
+				if  s < 0 then
+					begin
+					// Distinguish the two refusals - see ClaimSlot. The
+					// held-a-corner test is repeated here rather than
+					// returned as a code, since ClaimSlot's contract is
+					// "the slot, or nothing" and a second return value
+					// would complicate every caller for one message.
+					h:= False;
+
+					Lock.Acquire;
+						try
+						for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+							if  Slots[i].Player = APlayer then
+								h:= True;
+
+						finally
+						Lock.Release;
+						end;
+
+					if  h then
+						APlayer.SendServerError(LIT_ERR_PLAYCHAV)
+					else if (AMessage.Data[0] = SLOT_CLAIM_ANY)
+					or  (AMessage.Data[0] <= SNAKE_PLAYER_COUNT - 1) then
+						APlayer.SendServerError(LIT_ERR_PLAYCTKN)
+					else
+						APlayer.SendServerError(LIT_ERR_PLAYCINV);
+
+					// A refusal must also report the corner's ACTUAL
+					// state, not just an error string. The client marks
+					// a claim outstanding when it sends one and clears
+					// it when SlotStatus arrives for that corner - so a
+					// refusal that carried no SlotStatus would leave
+					// that marker set forever and block every later
+					// claim. Only for a real corner number; a refused
+					// SLOT_CLAIM_ANY names no particular slot, and the
+					// client never leaves a marker outstanding for it.
+					if  (AMessage.Data[0] <= SNAKE_PLAYER_COUNT - 1) then
+						begin
+						Lock.Acquire;
+							try
+							SendSlotStatus(APlayer, AMessage.Data[0]);
+
+							finally
+							Lock.Release;
+							end;
+						end;
+					end;
+				end;
+			end
+		else if  AMessage.Method = $08 then
+			begin
+			// SlotRelease - give up a corner, back to spectating.
+			// Payload-less. Silent if they held none: the client can
+			// reasonably fire this on leaving the board page without
+			// knowing whether it ever claimed anything.
+			AHandled:= True;
+
+			ReleaseSlot(APlayer);
+			end
 		else if  AMessage.Method = $0C then
 			begin
 			// WatchStart - client is telling us its UI just switched to
@@ -3311,9 +4589,10 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 			end;
 		end;
 
-	// TODO: slot-claim (press-start-on-one-of-4-corners), direction input,
-	// and the dirty-cell board-delta broadcast all go here once the
-	// tile/movement model is designed - see SnakeClasses.pas' TODO and
+	// Slot-claim (press-start-on-one-of-4-corners) is done - $05/$08
+	// above. TODO: direction input, and the spawn itself (shield +
+	// cleared start area), once the tile/movement model is designed -
+	// see SnakeClasses.pas' TODO and
 	// the project's own design-decision notes (spectator/slot model,
 	// 6 ticks/sec, delta broadcast, 30x18 board for now).
 	end;
@@ -3412,9 +4691,25 @@ procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
 	m.Category:= mcPlay;
 	m.Method:= $07;
 
-	SetLength(m.Data, 2);
+	// [slot, state, isyou]. The third byte is new (2026-08-25) and is
+	// what lets a client tell ITS corner from anyone else's - without it
+	// slotStates records that corner 2 is occupied but not by whom, so
+	// the client cannot decide whether pressing START on it means claim
+	// or release.
+	//
+	// Free to add: this is already called once per recipient (see the
+	// broadcast loops in Remove/SlotStatusToAll), so each player can be
+	// told something different, and the payload had 252 spare bytes.
+	// Appending also keeps it backward-compatible - the client reads
+	// fixed offsets and ignores trailing data.
+	SetLength(m.Data, 3);
 	m.Data[0]:= ASlot;
 	m.Data[1]:= Ord(Slots[ASlot].State);
+
+	if  Slots[ASlot].Player = APlayer then
+		m.Data[2]:= 1
+	else
+		m.Data[2]:= 0;
 
     APlayer.AddSendMessage(m);
 	end;
