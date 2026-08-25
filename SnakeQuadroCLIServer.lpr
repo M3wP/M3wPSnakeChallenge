@@ -55,7 +55,7 @@ procedure TSnakeServer.DoRun;
 
 	begin
 	// quick check parameters
-	ErrorMsg:= CheckOptions('hm:sd', 'help');
+	ErrorMsg:= CheckOptions('hm:sdl:', 'help');
 	if  ErrorMsg <> '' then
 		begin
 		ShowException(Exception.Create(ErrorMsg));
@@ -73,6 +73,23 @@ procedure TSnakeServer.DoRun;
 
 	if  HasOption('d', '') then
 		Include(FilterLogKinds, slkDebug);
+
+	// -l <n> - DEBUG: start every board on level n instead of 1, so a
+	// lava or boss stage can be looked at without playing eight
+	// two-minute levels to reach it. See StartPlay.
+	if  HasOption('l', '') then
+		begin
+		s:= GetOptionValue('l', '');
+
+		if  TryStrToInt(s, i) and (i >= 1) then
+			DebugStartLevel:= i
+		else
+			begin
+			ShowException(Exception.Create('Invalid start level!'));
+			Terminate;
+			Exit;
+			end;
+		end;
 
     TCPServer.TCPServer:= TTCPServer.Create;
 	TCPServer.TCPServer.OnConnect:= DoConnect;
@@ -319,7 +336,13 @@ destructor TSnakeServer.Destroy;
 
 procedure TSnakeServer.WriteHelp;
 	begin
-	writeln('Usage: ', ExeName, ' [-h|--help]|[[-s] [-m <connections>]]');
+	writeln('Usage: ', ExeName,
+			' [-h|--help]|[[-s] [-d] [-m <connections>] [-l <level>]]');
+	writeln('  -s              silent');
+	writeln('  -d              debug logging');
+	writeln('  -m <n>          max connections');
+	writeln('  -l <n>          DEBUG: start boards on level n (see the');
+	writeln('                  stage cycle - 4 and 7 are lava, 8 is boss)');
 	end;
 
 var

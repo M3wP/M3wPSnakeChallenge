@@ -526,11 +526,32 @@ function TTCPWorker.ProcessConnection(AConnection: TTCPConnection): Boolean;
 	// under the same name collide with its own stale prior session.
 	if  (i = 0) and AConnection.Socket.CanRead(0) then
 		begin
-		Result:= False;
-		AddLogMessage(slkInfo, '"' + AConnection.Ticket +
-				'" closed connection gracefully.');
+		// RE-READ THE COUNT BEFORE BELIEVING IT. "Readable" means data
+		// OR a FIN, and the count above was sampled BEFORE CanRead - so
+		// a packet arriving between those two calls left i at a stale 0
+		// while CanRead correctly reported readable, and this concluded
+		// the peer had gone when it had in fact just spoken.
+		//
+		// The server then closed and sent its own FIN, so BOTH ENDS
+		// blamed the other: this logged "closed connection gracefully"
+		// while the client recorded EV_PEER_FIN for the same event. That
+		// symmetry is what gave it away - dengland's MEGA65 client
+		// dropped mid-level 2026-08-26, and discEventFlags read back $02
+		// over the serial monitor.
+		//
+		// Made likelier by anything that raises the client's send rate,
+		// which is why it surfaced at the level ramp: the snake speeds
+		// up, so the player turns more often.
+		i:= AConnection.Socket.WaitingData;
 
-		Exit;
+		if  i = 0 then
+			begin
+			Result:= False;
+			AddLogMessage(slkInfo, '"' + AConnection.Ticket +
+					'" closed connection gracefully.');
+
+			Exit;
+			end;
 		end;
 
   	if  i > 0 then

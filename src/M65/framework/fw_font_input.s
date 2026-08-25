@@ -132,19 +132,19 @@ pickBlinkState:
 userIRQInstall:
 ;-------------------------------------------------------------------------------
 		LDA	#<userIRQ		;install our handler
-		STA	cpuIRQ
+		STA	VAL_CPU_IRQ
 		LDA	#>userIRQ
-		STA	cpuIRQ + 1
+		STA	VAL_CPU_IRQ + 1
 
 		LDA	#<userNOP		;install our handler
-		STA	cpuRESET
+		STA	VAL_CPU_RESET
 		LDA	#>userNOP
-		STA	cpuRESET + 1
+		STA	VAL_CPU_RESET + 1
 
 		LDA	#<userNOP		;install our handler
-		STA	cpuNMI
+		STA	VAL_CPU_NMI
 		LDA	#>userNOP
-		STA	cpuNMI + 1
+		STA	VAL_CPU_NMI + 1
 
 
 		LDA	#%01111111		;We'll always want rasters
@@ -582,10 +582,13 @@ userIRQHandler:
 		STA	crsr_dly
 
 @crsrfin:
-		JSR	userProcessMouse	;Do mouse first so we can skip
-						;	expensive all lines
-						;	keyboard scan when mouse
-						;	used.
+;	THESE THREE ARE ONE SEQUENCE - see mouse.inc's port-discipline note.
+;	userProcessMouse samples the pots and then points VAL_CIA1_PRA at the
+;	joystick; userProcessPorts reads it. The keyboard scan in between is
+;	not just ordering, it IS the settling delay, and it is free because
+;	the scan has to happen anyway. Do not reorder or collapse these, and
+;	do not put userProcessPorts before the scan.
+		JSR	userProcessMouse
 
 	.if	DEBUG_RASTERTIME
 		LDA	#$05
@@ -593,7 +596,12 @@ userIRQHandler:
 	.endif
 
 		JSR	userKeyScanKey
-		
+
+;	Joystick and buttons, now that VAL_CIA1_PRA has had the whole scan to
+;	settle. Ahead of userHandleMouse below, which consumes Buttons and
+;	ButtonLClick.
+		JSR	userProcessPorts
+
 		LDA	ctrlsLock
 		BNE	@skipUpdate
 
@@ -688,11 +696,26 @@ userReadKey:
 ;-------------------------------------------------------------------------------
 userKeyScanKey:
 ;-------------------------------------------------------------------------------
-		LDA	Buttons			;When button down, just leave 
-		BEQ	@begin			;	already
-
-		RTS
-
+;	NO BUTTON GATE HERE ANY MORE (removed 2026-08-25).
+;
+;	This used to return immediately whenever Buttons was non-zero -
+;	"when button down, just leave already", to skip what was then an
+;	expensive all-lines matrix scan that a held mouse button would
+;	corrupt anyway. Neither half of that is true now: the keyboard is
+;	read from the MEGA65's own scanner below ($D60A/$D610, two register
+;	reads), and the matrix is not involved at all.
+;
+;	What it DID do was make the keyboard unusable for as long as
+;	anything looked like a held button. Paired with the old port code -
+;	which flipped DDRB to input and read PRB on the next instruction,
+;	so on MEGA65 revisions that actually implement the direction
+;	registers the read came back before the lines had settled - Buttons
+;	could be non-zero on every frame, and the keyboard would then never
+;	be scanned at all. That is exactly dengland's report: "you can't use
+;	the keyboard when the mouse is plugged in" on newer revisions.
+;
+;	MEGASPUTM's input.c has no equivalent gate - handle_keyboard()
+;	always reads ASCIIKEY. See mouse.inc's port-discipline note.
 @begin:
 ;	MODKEY ($D60A[0:6]) for the event currently at the head of the
 ;	queue - read before popping ASCIIKEY below, so it can't end up
@@ -1233,24 +1256,24 @@ CMOVEX:
 		STA	tempValue + 1
 	
 		LDA	tempValue
-		STA	VICXPOS0
-		STA	VICXPOS1
-		STA	VICXPOS2
-		STA	VICXPOS3
+		STA	VAL_VIC_XPOS0
+		STA	VAL_VIC_XPOS1
+		STA	VAL_VIC_XPOS2
+		STA	VAL_VIC_XPOS3
 		
 		LDA	tempValue + 1
 		CMP	#$00
 		BEQ	@unset
 	
-		LDA	VICXPOSMSB
+		LDA	VAL_VIC_XPOSMSB
 		ORA	#$0F
-		STA	VICXPOSMSB
+		STA	VAL_VIC_XPOSMSB
 		RTS
 	
 @unset:
-		LDA	VICXPOSMSB
+		LDA	VAL_VIC_XPOSMSB
 		AND	#$F0
-		STA	VICXPOSMSB
+		STA	VAL_VIC_XPOSMSB
 		RTS
 	
 ;-------------------------------------------------------------------------------
@@ -1265,10 +1288,10 @@ CMOVEY:
 		STA	tempValue + 1
 	
 		LDA	tempValue
-		STA	VICYPOS0
-		STA	VICYPOS1
-		STA	VICYPOS2
-		STA	VICYPOS3
+		STA	VAL_VIC_YPOS0
+		STA	VAL_VIC_YPOS1
+		STA	VAL_VIC_YPOS2
+		STA	VAL_VIC_YPOS3
 	
 		RTS
 

@@ -585,6 +585,13 @@ gameDeltaTile:
 gameDeltaCount:
 		.byte	$00
 
+;	Whether the deltas in the message being processed should actually be
+;	DRAWN, as opposed to just recorded in boardTiles. Sampled once per
+;	message rather than tested per cell, since the page cannot change
+;	while a message is being handled.
+gameDeltaDraw:
+		.byte	$00
+
 ;	Absolute screen row (board row + 5) for the delta currently being
 ;	drawn - held here rather than just in Y, since Y gets reused for
 ;	the gameTileChars/gameTileColrs lookup in between the screen and
@@ -706,8 +713,10 @@ boardRowOffsetHi:
 ;	guarantees only real board cells ever reach a lookup). All 48 are
 ;	reachable - heads take corner shapes too, one step before turning.
 ;
-;	57 entries total, and the server has a TILE_COUNT constant that
-;	must agree - if a block is added there, add it here too.
+;	78 entries total (0..77), and the server has a TILE_COUNT constant
+;	that must agree - if a block is added there, add it here too. The
+;	count is asserted below rather than left to this comment, which had
+;	already drifted (it said 57) before the key was added.
 ;
 ;	Colours are dengland's own pick (2026-08-24), light body / dark
 ;	head per player: P1 $0E/$06, P2 $0A/$02, P3 $0D/$05, P4 $07/$08.
@@ -728,7 +737,25 @@ gameTileChars:
 ;	Food (73-76) in the original's type order: no-grow+fast,
 ;	grow+slow, speed burst, invulnerability. dengland's characters,
 ;	bit 7 CLEAR - the plain forms, not the reversed ones.
-		.byte	$58, $51, $57, $53
+;
+;	TYPES 0 AND 1 HAVE SWAPPED LOOKS (dengland, 2026-08-26) - the solid
+;	circle now wears no-grow+fast and the clubs wear grow+slow, taking
+;	their colours with them. Only the APPEARANCE moved: the effects are
+;	still bound to the type numbers server-side, so what changed is
+;	which effect wears which look, not what any of them do.
+		.byte	$51, $58, $57, $53
+;	The KEY (77) - dengland's pick, yellow (2026-08-26). Not part of
+;	the random food roll on the server: it appears to its own schedule,
+;	a couple of times a level and only for a few seconds, and taking it
+;	cuts the level clock to 30 seconds.
+;
+;	$00, NOT $40. This table is written STRAIGHT TO SCREEN RAM, so
+;	every entry is a SCREEN CODE, not PETSCII. '@' is $40 in PETSCII
+;	but screen code $00 - screen codes run $00-$1F for @ABC..._ - so
+;	$40 here drew a different glyph entirely (caught on hardware,
+;	2026-08-26). The other food characters were already screen codes,
+;	which is why this was the only one wrong.
+		.byte	$00
 
 gameTileColrs:
 		.byte	CLR_LOG_C64_BLACK
@@ -801,10 +828,39 @@ gameTileColrs:
 ;	the characters only. Chosen to stay clear of the player colours
 ;	where it matters; the heart shares P2's light red, but a heart
 ;	against a pipe segment is never ambiguous.
-		.byte	CLR_LOG_C64_LIGHTGREY		;$0F - clubs, no-grow + fast
-		.byte	CLR_LOG_C64_GREY		;$0C - solid circle, grow + slow
+;	Green (dengland, 2026-08-26), was light grey. He named this one by
+;	the character $D8, which is this glyph REVERSED ($58 | $80) - the
+;	table uses the plain form, so if the reversed one is what he is
+;	actually looking at on screen, the CHARACTER wants changing too and
+;	not just this colour.
+;
+;	Green is also P3's HEAD, but $58 is not a pipe shape so the two
+;	never read as each other - the same argument the bee's purple and
+;	the key's yellow both rest on.
+;
+;	SWAPPED with the entry below (dengland, 2026-08-26) - see the
+;	character table. Colour travels with the glyph, so green stays on
+;	the clubs and grey stays on the solid circle; it is the EFFECTS
+;	they sit on that changed.
+		.byte	CLR_LOG_C64_GREY		;$0C - solid circle, no-grow + fast
+		.byte	CLR_LOG_C64_GREEN		;$05 - clubs, grow + slow
 		.byte	CLR_LOG_C64_CYAN		;$03 - open circle, speed burst
 		.byte	CLR_LOG_C64_LIGHTRED		;$0A - heart, invulnerability
+
+;	The KEY (77) - yellow, dengland's pick. Shares P4's body colour,
+;	but $40 is not a pipe shape so the two never read as each other -
+;	the same argument the bee's purple rests on.
+		.byte	CLR_LOG_C64_YELLOW		;$07 - key, clock cut
+
+;	Both tables are indexed by RAW TILE VALUE with no bounds check, so a
+;	table one byte short is a wild read of whatever follows it, silently,
+;	for one tile value. Assert the lengths rather than trusting the
+;	comment above - which had already drifted to 57 before anyone
+;	noticed. Must equal the server's TILE_COUNT (SnakeServer.pas).
+TILE_COUNT	= 78
+
+		.assert	(gameTileColrs - gameTileChars) = TILE_COUNT, error, "gameTileChars is not TILE_COUNT bytes - it must have one entry per tile value"
+		.assert	(* - gameTileColrs) = TILE_COUNT, error, "gameTileColrs is not TILE_COUNT bytes - it must have one entry per tile value"
 
 
 ;-------------------------------------------------------------------------------
@@ -1635,9 +1691,26 @@ gameSendDirection:
 ;-------------------------------------------------------------------------------
 gameKeyPress:
 ;-------------------------------------------------------------------------------
-		LDX	gameMySlot
-		CPX	#SLOT_CLAIM_NONE
+;	THE BOARD PAGE OWNS THE CURSOR KEYS OUTRIGHT - held corner or not.
+;	Gated on the PAGE, not on gameMySlot, which is the whole change
+;	(dengland, 2026-08-26: "we need to never allow the cursor keys on
+;	the board page to move the active control. its too awful at all").
+;
+;	It was gated on holding a corner, so the moment a run ended -
+;	mid-keypress, with the key still auto-repeating - the cursor keys
+;	fell straight back through to the widget engine, where UP and DOWN
+;	are TAB and SHIFT-TAB (see ctrlsPageKeyPress). The focus ring then
+;	walked off under the player's hand. Swallowing them for spectators
+;	as well makes that unreachable rather than merely unlikely.
+;
+;	TAB IS UNAFFECTED. Only the four cursor keys are claimed here, and
+;	ctrlsPageKeyPress translates TAB into a navigation key AFTER this
+;	hook has declined it, so tabbing between the corner controls still
+;	works exactly as before.
+		JSR	gameOnBoardPage
 		BEQ	@notours
+
+		LDA	msgsdat0			;.A was clobbered above
 
 		CMP	#KEY_C64_CUP
 		BEQ	@up
@@ -1668,6 +1741,14 @@ gameKeyPress:
 		LDA	#SNAKE_DIR_RIGHT
 
 @send:
+;	SWALLOWED, not sent, when this client holds no corner. A spectator
+;	has no snake to steer, but the key must still not reach the widget
+;	engine - that is the entire point of claiming it here. Consumed and
+;	dropped.
+		LDX	gameMySlot
+		CPX	#SLOT_CLAIM_NONE
+		BEQ	@done
+
 ;	Keys auto-repeat and the server would only re-apply the heading it
 ;	already has, so drop a repeat of whatever was last sent. Shares
 ;	gameLastDir with gamePollJoystick deliberately - the stick and the
@@ -2281,6 +2362,25 @@ gameShakeRestore:
 ;	(there's normally only 1-2 cells per message, not a whole row).
 ;-------------------------------------------------------------------------------
 gameProcTileDeltaMsg:
+;	Record ALWAYS, draw only while the board page is the one on screen.
+;
+;	The two halves of this handler are not the same job. boardTiles is
+;	the client's model of the board and has to stay current no matter
+;	which page is up - a player who tabs away is still ON the board and
+;	their snake is still moving, so letting the model go stale would
+;	mean a full resync every time they came back. The screen writes are
+;	a RENDER of that model, and a render belongs to one page.
+;
+;	Without this the writes land wherever they always did - screen rows
+;	5 and down - straight over whatever page has replaced the board
+;	(dengland, 2026-08-25: "when I change pages I get some of the tile
+;	updates on the other page"). WatchStop does not prevent it: leaving
+;	the page sends one, but it costs a server round trip, and every
+;	delta already in flight arrives after the page has changed. Hence
+;	"some" - it is the tail end of the stream, not the whole of it.
+		JSR	gameOnBoardPage
+		STA	gameDeltaDraw
+
 		LDA	readmsg0 + 2			;delta count
 		STA	gameDeltaCount
 		LBEQ	@done				;plain BEQ is out of 8-bit branch range here
@@ -2334,6 +2434,11 @@ gameProcTileDeltaMsg:
 		LDA	gameDeltaTile
 		LDY	gameDeltaCol
 		STA	(boardptr1), Y
+
+;	Model updated. Everything below this point is screen writes, so it
+;	is the whole of what a page change has to suppress.
+		LDA	gameDeltaDraw
+		BEQ	@next
 
 ;	Draw the cell - screen row = board row + 5.
 		LDA	gameDeltaRow
@@ -2444,11 +2549,52 @@ gameProcBoardRowsMsg:
 		LDA	#$00
 		STA	boardSyncWaiting
 
+;	Same split as gameProcTileDeltaMsg: the pair is now in boardTiles
+;	whatever page is up, but only paint it if the board page is the one
+;	on screen.
+;
+;	This path matters MORE than the delta one, not less. The server
+;	pushes the WHOLE board unsolicited whenever it starts playing and at
+;	every level change (PushBoardToWatchers), which arrives here as ten
+;	of these - so an unguarded level rollover repaints all twenty rows
+;	over whatever page the player happens to be reading.
+		JSR	gameOnBoardPage
+		BEQ	@nodraw
+
 		LDA	readmsg0 + 2
 		JSR	gameDrawBoardRows
 
+@nodraw:
 		JMP	gameBoardSyncRequestNext
 ;		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameOnBoardPage - is page_detail the page currently on screen?
+;
+;	The board is drawn straight to screen RAM rather than through the
+;	widget engine, so nothing in the framework knows those writes belong
+;	to a page and nothing will suppress them when the page changes. Every
+;	board write therefore has to ask first, and asking in one place means
+;	the four bytes of comparison cannot drift between callers.
+;	OUT	.A		$01 on the board page, $00 otherwise (Z set)
+;-------------------------------------------------------------------------------
+gameOnBoardPage:
+;-------------------------------------------------------------------------------
+		LDA	pageptr0
+		CMP	#<page_detail
+		BNE	@no
+
+		LDA	pageptr0 + 1
+		CMP	#>page_detail
+		BNE	@no
+
+		LDA	#$01
+		RTS
+
+@no:
+		LDA	#$00
+		RTS
 
 
 ;===============================================================================

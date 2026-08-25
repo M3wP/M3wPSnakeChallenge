@@ -260,9 +260,9 @@ _basNext:
 
 init:
 		;LDA	#$8E			;go to uppercase characters
-		;JSR	krnlOutChr
+		;JSR	VAL_KRNL_OUTCHR
 		;LDA	#$08			;disable change character case
-		;JSR	krnlOutChr
+		;JSR	VAL_KRNL_OUTCHR
 	
 		SEI
 		CLD
@@ -289,7 +289,7 @@ init:
 		STA	$D02F
 
 		LDA	#$7F			;disable standard CIA irqs
-		STA	cia1IRQCtl
+		STA	VAL_CIA1_ICR
 
     JSR initROM
     JSR initM65IOFast
@@ -305,6 +305,11 @@ init:
     JSR initHiVars
     JSR initMem
 		JSR	initCore
+
+;	CIA1's ports, once and for all - see mouse.inc's own discipline
+;	note. Nothing per-frame touches the direction registers after this,
+;	so this is the only place they are ever set.
+		JSR	userInitPorts
 
 ;	Reset the stack pointer
 

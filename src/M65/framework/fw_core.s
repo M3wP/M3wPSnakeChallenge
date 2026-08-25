@@ -225,28 +225,45 @@ IP65_ERROR_CONNECTION_CLOSED  = $8A
 	.define	DEBUG_LOADFONT	0
 
 
-cpuIRQ		=	$FFFE
-cpuRESET	=	$FFFC
-cpuNMI		=	$FFFA
+VAL_CPU_IRQ		=	$FFFE
+VAL_CPU_RESET	=	$FFFC
+VAL_CPU_NMI		=	$FFFA
 
-krnlOutChr	= 	$E716
+VAL_KRNL_OUTCHR	= 	$E716
 
-CIA1_PRA        = 	$DC00        		; Port A
-CIA1_PRB	=	$DC01
-CIA1_DDRA	=	$DC02
-CIA1_DDRB	=	$DC03
-cia1IRQCtl	=	$DC0D
+VAL_CIA1_PRA        = 	$DC00        		; Port A
+VAL_CIA1_PRB	=	$DC01
+VAL_CIA1_DDRA	=	$DC02
+VAL_CIA1_DDRB	=	$DC03
+VAL_CIA1_ICR	=	$DC0D
 
-VIC     	= 	$D000         		; VIC REGISTERS
-VICXPOS0    	= 	VIC + $00      		; LOW ORDER X POSITION
-VICYPOS0    	= 	VIC + $01      		; Y POSITION
-VICXPOS1    	= 	VIC + $02      		; LOW ORDER X POSITION
-VICYPOS1    	= 	VIC + $03      		; Y POSITION
-VICXPOS2    	= 	VIC + $04      		; LOW ORDER X POSITION
-VICYPOS2    	= 	VIC + $05      		; Y POSITION
-VICXPOS3    	= 	VIC + $06      		; LOW ORDER X POSITION
-VICYPOS3    	= 	VIC + $07      		; Y POSITION
-VICXPOSMSB 	=	VIC + $10      		; BIT 0 IS HIGH ORDER X POS
+;	Values written to VAL_CIA1_PRA to steer the pot multiplexer, which is
+;	what decides whether VAL_SID_ADCONV1/2 are reading control port 1 or 2.
+;	POTS selects port 1 (the mouse); JOY drives every line high, which
+;	is the state the joystick and button reads want.
+;
+;	SWITCHING BETWEEN THEM IS NOT FREE - see the port-discipline note at
+;	the top of mouse.inc. Neither value may be written immediately
+;	before the read it enables.
+VAL_CIA1_PRA_POTS =	$40
+VAL_CIA1_PRA_JOY  =	$FF
+
+;	Keyboard column C8 on the C65/MEGA65 is driven from UART_E bit 1,
+;	not from the CIA matrix at all. Taken from MEGASPUTM's io.h, via
+;	its input_init() - see mouse.inc's userInitPorts.
+VAL_UART_E_PRA	=	$D607
+VAL_UART_E_DDR	=	$D608
+
+VAL_VIC_BASE     	= 	$D000         		; VIC REGISTERS
+VAL_VIC_XPOS0    	= 	VAL_VIC_BASE + $00      		; LOW ORDER X POSITION
+VAL_VIC_YPOS0    	= 	VAL_VIC_BASE + $01      		; Y POSITION
+VAL_VIC_XPOS1    	= 	VAL_VIC_BASE + $02      		; LOW ORDER X POSITION
+VAL_VIC_YPOS1    	= 	VAL_VIC_BASE + $03      		; Y POSITION
+VAL_VIC_XPOS2    	= 	VAL_VIC_BASE + $04      		; LOW ORDER X POSITION
+VAL_VIC_YPOS2    	= 	VAL_VIC_BASE + $05      		; Y POSITION
+VAL_VIC_XPOS3    	= 	VAL_VIC_BASE + $06      		; LOW ORDER X POSITION
+VAL_VIC_YPOS3    	= 	VAL_VIC_BASE + $07      		; Y POSITION
+VAL_VIC_XPOSMSB 	=	VAL_VIC_BASE + $10      		; BIT 0 IS HIGH ORDER X POS
 VAL_VIC_CTRLREG	=	$D011
 VAL_VIC_RSTRVAL	=	$D012
 VAL_VIC_SPRENAB	= 	$D015
@@ -295,9 +312,9 @@ VAL_VIC_SPRCLR3	= 	$D02A
 ;	runs per frame, let alone per character of real output.
 VAL_HYPR_DBGOUT	=	$D643
 
-SID     	= 	$D400         		; SID REGISTERS
-SID_ADConv1    	= 	SID + $19
-SID_ADConv2    	= 	SID + $1A
+VAL_SID_BASE     	= 	$D400         		; SID REGISTERS
+VAL_SID_ADCONV1    	= 	VAL_SID_BASE + $19
+VAL_SID_ADCONV2    	= 	VAL_SID_BASE + $1A
 
 ;	Matches $D60A[0:6] (MODKEY) exactly, so the byte read there can be
 ;	used as-is - bit 7 (KEYQUEUE, queue-non-empty) is masked off
