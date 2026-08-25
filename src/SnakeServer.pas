@@ -51,6 +51,19 @@ const
 	// constants further down.
 	DEMO_BEE_COUNT = 4;
 
+	// Most food on the board at once, and up here for the same reason as
+	// everything else in this block - TSnakeGame.PlayFood is sized by it.
+	// The reasoning behind the VALUE sits with the other PLAY_FOOD_*
+	// constants below.
+	PLAY_FOOD_MAX = 5;
+
+	// Hard ceiling on live bees, sizing TSnakeGame.PlayBees. NOT the
+	// number actually on the board - that scales with difficulty, see
+	// PlayBeeMax. This is only the array bound, and it exists because
+	// LevelProgress keeps climbing as levels are cleared and would
+	// otherwise ask for bees without limit.
+	PLAY_BEE_CAP = 10;
+
 type
 
 	{ TServerDispatcher }
@@ -214,7 +227,49 @@ type
 		// death cannot live there.
 		Lives: Integer;
 
-		// TODO: score/body-position fields land here with food.
+		// Points scored on this corner's current run. On the SLOT for the
+		// same reason Lives is - it has to survive a death - and reset by
+		// ClaimSlot, not by release, so a finished run's final score stays
+		// on the HUD until somebody else takes the corner.
+		//
+		// The original tracks a separate `bonus` counter to decide when a
+		// bonus life is due; PLAY_BONUS_LIFE's own comment explains why
+		// this needs none.
+		Score: Integer;
+	end;
+
+	// One piece of food sitting on the board, with the timed expiry the
+	// original gives it (tLevelTiles TTL / levelExpireTiles). The TILE is
+	// on Board like everything else - this table exists only to hold what
+	// Board cannot: how long the thing has left, and which of the five
+	// slots it occupies against PLAY_FOOD_MAX.
+	//
+	// Kind is the food TYPE (0..3), the same index the original uses into
+	// tSnakePts and its own effect branch. It is recoverable from the tile
+	// value, but keeping it makes EatFood read as the original does.
+	TPlayFood = record
+		Row, Col: Byte;
+		Kind: Integer;
+		Ticks: Integer;
+		Active: Boolean;
+	end;
+
+	// One bee in REAL PLAY. Deliberately its own record rather than
+	// reusing TDemoBee: the two are live at mutually exclusive times, and
+	// a play bee needs a TTL the attract-reel version has no use for
+	// (that one lives and dies with its wave).
+	//
+	// Target is a SNAKE INDEX picked at spawn and then KEPT - dengland's
+	// call, and it is what stops the bees clumping. If each re-picked the
+	// nearest head every step, bees that drifted near one another would
+	// converge on the same snake and merge into a single moving wall
+	// instead of staying separate threats.
+	TPlayBee = record
+		Row, Col: Byte;
+		Target: Integer;
+		MoveTick: Integer;
+		Ticks: Integer;
+		Active: Boolean;
 	end;
 
 	// One cell of a TileDelta broadcast (mcPlay/$09 - see
@@ -296,6 +351,31 @@ type
 		// fixed circuit with no collision at all (see the comment above
 		// this record), so there is nothing there that can die.
 		Alive: Boolean;
+
+		// --- FOOD EFFECTS (real play only) ---
+		//
+		// The original's moveFast/grow/growNone/growEx, kept as four
+		// separate things for the same reason it does: they decay
+		// independently and two of them CANCEL each other rather than
+		// stacking (see EatFood).
+		//
+		// MoveFast is a SIGNED tick counter that decays one per tick back
+		// toward zero (snakeFastExp), positive for quicker and negative
+		// for slower. It is not a speed - PlayStepTicks reads it and
+		// shifts the gear by one or two, which is exactly what the
+		// original's moveTick arithmetic does.
+		MoveFast: Integer;
+
+		// Grow is the one-shot "the next step lengthens me" flag set by
+		// eating anything. GrowEx holds it TRUE for a while, so the snake
+		// lengthens on every step for that long; GrowNone suppresses it
+		// entirely for a while. Eating the food that sets one of the two
+		// timers CANCELS the other rather than setting its own - so the
+		// two foods are genuine opposites, and a player who has just
+		// eaten one can undo it with the other.
+		Grow: Boolean;
+		GrowNone: Integer;
+		GrowEx: Integer;
 	end;
 
 	// Which mechanic the attract reel is currently showing off. See
@@ -410,6 +490,29 @@ type
 		// either alive or unclaimed.
 		PlayRespawn: array[0..SNAKE_PLAYER_COUNT - 1] of Integer;
 
+		// The gear last BROADCAST for each corner (see PlayGearFor).
+		// Not the current gear - SendSlotStatus always recomputes that -
+		// but the record of what the clients were last told, which is
+		// what lets the tick loop notice a change and send only then.
+		// A snake's gear only moves when its MoveFast crosses zero or
+		// the two-gear threshold, so this is a handful of messages per
+		// pickup rather than one per tick.
+		PlayGear: array[0..SNAKE_PLAYER_COUNT - 1] of Integer;
+
+		// Bees currently on the board. Fixed array with an Active flag,
+		// same shape as PlayFood - but unlike food, the CAP here is not
+		// the mechanic: how many bees the board wants scales with
+		// difficulty (PlayBeeMax) and PLAY_BEE_CAP is only the ceiling
+		// that stops unbounded LevelProgress asking for more.
+		PlayBees: array[0..PLAY_BEE_CAP - 1] of TPlayBee;
+
+		// Food currently on the board, at most PLAY_FOOD_MAX of it.
+		// A fixed array with an Active flag rather than a list: the cap IS
+		// the mechanic (the original's iLevelBonus counter), so making the
+		// storage the cap means there is no separate count to keep in step
+		// with it.
+		PlayFood: array[0..PLAY_FOOD_MAX - 1] of TPlayFood;
+
 		// True while at least one corner is claimed - i.e. the board is
 		// playing rather than attracting. Held as state, not recomputed,
 		// so Tick can spot the EDGE and do the changeover work (build a
@@ -438,6 +541,21 @@ type
 		// like without any further work.
 		Difficulty: TGameDifficulty;
 		LevelProgress: Integer;
+
+		// The running level: ticks left on its clock, which of the four
+		// line-generator patterns it was built from, whether its
+		// last-30-seconds ramp has fired yet, and how many bees have been
+		// eaten on it (see PLAY_BEE_ANGER_PER).
+		//
+		// LevelSecsSent is the last whole second broadcast to watchers -
+		// the clock only goes on the wire when the DISPLAYED value
+		// changes, not every tick.
+		LevelTicks: Integer;
+		LevelVariant: Integer;
+		LevelNumber: Integer;
+		LevelRamped: Boolean;
+		LevelBeesEaten: Integer;
+		LevelSecsSent: Integer;
 
 		// The attract reel: which mechanic is on stage, where its
 		// animation has got to, and the tick counters driving both.
@@ -524,6 +642,52 @@ type
 				var ADeltaCount: Integer);
 		procedure PushBoardToWatchers;
 
+		// FOOD. TickPlayFood ages what is out there and rolls for a new
+		// piece; FoodAt finds the table entry for a board cell (-1 if
+		// none); ClearFoodAt forgets one that something else has removed
+		// from the board; EatFood applies one type's effects to one snake.
+		procedure TickPlayFood(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		function  FoodAt(ARow, ACol: Byte): Integer;
+		procedure ClearFoodAt(ARow, ACol: Byte);
+		procedure EatFood(ASlot, AFood: Integer);
+
+		// BEES. TickPlayBees ages, moves and spawns them; BeeAt finds the
+		// table entry for a board cell (-1 if none); ClearBeeAt forgets
+		// one something else has taken off the board; PlayBeeMax is how
+		// many this board wants right now.
+		procedure TickPlayBees(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		function  BeeAt(ARow, ACol: Byte): Integer;
+		procedure ClearBeeAt(ARow, ACol: Byte);
+		function  PlayBeeMax: Integer;
+
+		// Ticks between steps for one PLAYING snake - the board's base
+		// gear (SnakeStepTicks) shifted by that snake's own MoveFast.
+		function  PlayStepTicks(ASlot: Integer): Integer;
+
+		// The same thing as the HUD sees it: clamped onto the six named
+		// gears, and 0 for a corner nobody is playing.
+		function  PlayGearFor(ASlot: Integer): Integer;
+
+		// This board's base step cadence right now - SnakeStepTicks for
+		// the current progress, one gear quicker once the level has
+		// ramped. Everything in real play paces off this rather than
+		// calling SnakeStepTicks directly, so the ramp reaches snakes and
+		// bees alike.
+		function  BoardStepTicks: Integer;
+
+		// Clock ran out: rebuild on the next pattern, harder, and put
+		// everyone back on their corner.
+		procedure NextLevel;
+
+		// Seconds left on the level clock, for the wire and the HUD.
+		function  LevelSecsLeft: Integer;
+
+		// Add points to a corner, awarding a bonus life if the total
+		// crosses a multiple of PLAY_BONUS_LIFE. Caller holds Lock.
+		procedure AddScore(ASlot, APoints: Integer);
+
 		// Apply a direction request from a player. Rejects the reverse
 		// of the way the snake is actually travelling - see the
 		// implementation.
@@ -535,6 +699,9 @@ type
 		// NOT hold Lock - these acquire it.
 		function  ClaimSlot(APlayer: TPlayer; ASlot: Integer): Integer;
 		function  ReleaseSlot(APlayer: TPlayer): Integer;
+
+		// Broadcast board-wide state to everyone in the zone.
+		procedure GameStatusToAll;
 
 		// Broadcast one slot's state to everyone in the zone. Caller
 		// must hold Lock.
@@ -1416,6 +1583,258 @@ const
 	// "0-4 corners on one continuously-running board" design doing its
 	// job: there is no game-wide game-over to declare.
 	PLAY_START_LIVES = 3;
+
+	// --- FOOD ---------------------------------------------------------
+	//
+	// All of this is the original's (levelTick, snakeCheckEat, snakeMove,
+	// snakeFastExp/snakeGrowExp), with two systematic translations:
+	//
+	// 1. EVERY DURATION IS DOUBLED, expressed in MS here rather than as
+	//    the original's raw counts. The original's effect counters tick
+	//    down once per game-loop pass at roughly 6/sec; QUADRO ticks at
+	//    12/sec (TICK_MS), so a straight copy of "18" would have run for
+	//    half as long as it does in the original. Written as MS so they
+	//    stay honest the next time TICK_MS moves - which it already has
+	//    once.
+	//
+	// 2. THE BATTLE-MODE VALUES ARE THE ONES USED. The original branches
+	//    on iGameMode for three of these (points, growNone, growEx), and
+	//    QUADRO is the battle case by construction: four corners, one
+	//    board, everyone contesting the same food. There is no
+	//    single-player mode here to take the other branch.
+
+	// PLAY_FOOD_MAX (the original's `iLevelBonus < 5`) is declared with
+	// the board size at the top of the unit, because it sizes an array
+	// field. Not scaled up for four players deliberately: contesting a
+	// scarce pickup is the point, and doubling it would make the board a
+	// buffet.
+
+	// Chance of a spawn ATTEMPT succeeding, as 1-in-N per tick, when
+	// there is a free slot. The original rolls 1-in-8 per pass
+	// ((iLevelMax + 1) * 2 with iLevelMax = 3); at twice the tick rate
+	// that is 1-in-16 for the same food-per-second.
+	//
+	// An attempt also fails if the cell it picks is not bare floor, so
+	// the real rate is lower than this and falls as the board fills -
+	// which is the original's behaviour too, and a good one: a crowded
+	// board stops handing out more.
+	PLAY_FOOD_SPAWN_ODDS = 16;
+
+	// How long a piece of food sits before it rots away. The original
+	// gives each one a TTL of random(16,28) EXPIRY CYCLES, and a cycle is
+	// iLevelMax + 1 = 4 passes (levelExpireTiles only runs when iLevelTick
+	// runs out), so 64-112 of its passes - about 11-19 seconds.
+	//
+	// Held in ms and converted, so it is the SECONDS that are the
+	// original's, not a tick count that would silently halve.
+	PLAY_FOOD_TTL_MIN_MS = 11000;
+	PLAY_FOOD_TTL_MAX_MS = 19000;
+	PLAY_FOOD_TTL_MIN = PLAY_FOOD_TTL_MIN_MS div TICK_MS;
+	PLAY_FOOD_TTL_MAX = PLAY_FOOD_TTL_MAX_MS div TICK_MS;
+
+	// Points per food type, in the same order as TILE_FOOD_BASE and the
+	// original's tSnakePts, already doubled for battle mode.
+	//
+	// Note what the ordering says: the food that GROWS you is the
+	// cheapest of the four (200 doubled to 400) and the one that stops
+	// you growing is the dearest (600 doubled to 1200). Length is a
+	// liability in this game, not a reward, so the scoring pays you for
+	// staying short.
+	PLAY_FOOD_PTS_NOGROW = 1200;		// type 0, clubs
+	PLAY_FOOD_PTS_XGROW  = 400;		// type 1, solid circle
+	PLAY_FOOD_PTS_BURST  = 800;		// type 2, open circle
+	PLAY_FOOD_PTS_SHIELD = 1000;		// type 3, heart
+
+	// Type 0 suppresses growth for this long (battle-mode growNone = 9,
+	// i.e. 1.5s - HALF what the original's single-player mode gets).
+	PLAY_FOOD_NOGROW_MS = 1500;
+	PLAY_FOOD_NOGROW_TICKS = PLAY_FOOD_NOGROW_MS div TICK_MS;
+
+	// Type 1 grows you on EVERY step for this long (battle-mode
+	// growEx = 24, i.e. 4s - TWICE the single-player value). The one that
+	// can turn a 5-cell snake into a genuine obstacle in a few seconds,
+	// and the reason battle mode makes it the longer of the two.
+	PLAY_FOOD_XGROW_MS = 4000;
+	PLAY_FOOD_XGROW_TICKS = PLAY_FOOD_XGROW_MS div TICK_MS;
+
+	// Type 3's shield, and the cap on any shield earned by eating
+	// (invunTicks + 24, clamped at 30). The cap is on the EARNED shield
+	// only - the spawn shield and the head-on shield set their own value
+	// outright, as the original's do.
+	PLAY_FOOD_INVUN_MS = 4000;
+	PLAY_FOOD_INVUN_TICKS = PLAY_FOOD_INVUN_MS div TICK_MS;
+	PLAY_INVUN_CAP_MS = 5000;
+	PLAY_INVUN_CAP_TICKS = PLAY_INVUN_CAP_MS div TICK_MS;
+
+	// MoveFast adjustments, one per food type, and the clamps either side
+	// (moveFast +30 / -12). All signed tick counts that decay to zero.
+	PLAY_FAST_NOGROW_MS =  1500;		// type 0: +9
+	PLAY_FAST_XGROW_MS  = -1000;		// type 1: -6
+	PLAY_FAST_BURST_MS  =  4000;		// type 2: +24
+	PLAY_FAST_SHIELD_MS =  2000;		// type 3: +12
+
+	PLAY_FAST_NOGROW = PLAY_FAST_NOGROW_MS div TICK_MS;
+	PLAY_FAST_XGROW  = -((-PLAY_FAST_XGROW_MS) div TICK_MS);
+	PLAY_FAST_BURST  = PLAY_FAST_BURST_MS div TICK_MS;
+	PLAY_FAST_SHIELD = PLAY_FAST_SHIELD_MS div TICK_MS;
+
+	PLAY_FAST_CAP_MS = 5000;		// moveFast +30
+	PLAY_FAST_FLOOR_MS = 2000;		// moveFast -12
+	PLAY_FAST_CAP = PLAY_FAST_CAP_MS div TICK_MS;
+	PLAY_FAST_FLOOR = PLAY_FAST_FLOOR_MS div TICK_MS;
+
+	// Above this much MoveFast left, the gear shifts by TWO instead of
+	// one (the original's `moveFast >= 18`). So a fresh speed burst is
+	// genuinely fierce and then settles into merely quick as it decays,
+	// rather than switching off all at once.
+	PLAY_FAST_HARD_MS = 3000;
+	PLAY_FAST_HARD = PLAY_FAST_HARD_MS div TICK_MS;
+
+	// Every this many points, the corner earns a life (the original's
+	// iGameBonusLife = 50000). Doubled with the points themselves, so it
+	// falls at the same place in the run that it does there.
+	//
+	// No `bonus` counter is needed to go with it, unlike the original:
+	// scores only ever go UP and only ever by one food at a time, so
+	// crossing a multiple can be detected from the before-and-after
+	// division at the point of scoring. See AddScore.
+	PLAY_BONUS_LIFE = 100000;
+
+	// Six digits is what the client's score label is (text_detail_score,
+	// snake_game.s), and the server formats to it - see SendSlotStatus
+	// for why the score goes on the wire as text.
+	PLAY_SCORE_DIGITS = 6;
+	PLAY_SCORE_MAX = 999999;
+
+	// --- LEVELS --------------------------------------------------------
+	//
+	// How long a level runs. dengland's own figure (2026-08-24: "levels
+	// run for 2 minutes"). The original's iLevelTimer is 600 at roughly
+	// 6 passes/sec, which is about 100 seconds - close enough that this
+	// is his number rather than a rescale of theirs.
+	PLAY_LEVEL_MS = 120000;
+	PLAY_LEVEL_TICKS = PLAY_LEVEL_MS div TICK_MS;
+
+	// With this long left, the level RAMPS: one more bee and one gear
+	// quicker. The original does the same thing at iLevelTimer = 150,
+	// i.e. its last quarter (`iLevelBeesMax + 2`, `iSnakeMoveMax =
+	// iGameSpeed - 1`).
+	//
+	// So the countdown is not only a clock - it is the difficulty curve
+	// WITHIN a level, and the last 30 seconds are meant to be the part
+	// you have to survive rather than play. Worth keeping in mind when
+	// the display is built: the number going red is telling the truth.
+	PLAY_LEVEL_RAMP_MS = 30000;
+	PLAY_LEVEL_RAMP_TICKS = PLAY_LEVEL_RAMP_MS div TICK_MS;
+
+	// ONE bee, not the original's two (dengland, 2026-08-25). Same
+	// reasoning as the count itself: these ones move, so each is worth
+	// more than a static one - and on easy this is 3 -> 4, where the
+	// original's was 8 -> 10.
+	PLAY_LEVEL_RAMP_BEES = 1;
+
+	// The status line above the board, as the server formats it:
+	//
+	//     LEVEL  1   TIME 1:59
+	//
+	// FIXED WIDTH so the client can copy it into a fixed buffer with no
+	// length byte and no terminator handling - same deal as the score,
+	// and for the same reason: formatting mm:ss on a 6502 means dividing,
+	// and the server is the machine here that division is free on.
+	PLAY_STATUS_LEN = 20;
+
+	// Below this many seconds the client colours the line red. Sent as a
+	// raw count ALONGSIDE the text purely so the client can make that
+	// comparison without parsing digits back out of its own display.
+	PLAY_STATUS_WARN_SECS = 30;
+
+	// --- BEES ----------------------------------------------------------
+	//
+	// The design was settled 2026-08-24 and is followed here rather than
+	// re-derived; the reasoning is worth reading before changing any of
+	// it, because several of these numbers are load-bearing in ways that
+	// are not obvious from the value.
+	//
+	// How many bees the board wants. DELIBERATELY NOT the original's
+	// scaling, which is `iLevelBeesMax = 5 + iLevelProgress * 3` and runs
+	// to 17 by expert.
+	//
+	// dengland, 2026-08-25: "that's a lot and because they move now, they
+	// occupy more space". The original's bees are STATIC - placed once and
+	// left to expire (verified in the Lua: nothing repositions them) - so
+	// each one denies exactly one cell. QUADRO's move, so each one denies
+	// a moving region and threatens everything near its path. The
+	// original's count simply does not transfer, and matching it would
+	// have made a far denser board than his game ever has.
+	//
+	//   training 2   easy 3   normal 4   hard 5   expert 6
+	//
+	// still climbing past expert as levels clear, up to PLAY_BEE_CAP.
+	PLAY_BEE_BASE = 2;
+	PLAY_BEE_PER_PROGRESS = 1;
+
+	// 1-in-N per tick to place one, when below the current maximum. Same
+	// rate as food and for the same reason: the original rolls 1-in-8 per
+	// pass at roughly half our tick rate.
+	//
+	// An attempt that picks an unsuitable cell is simply wasted rather
+	// than retried, exactly as the original does - which is what makes a
+	// crowded board quietly stop producing more.
+	PLAY_BEE_SPAWN_ODDS = 16;
+
+	// How long a bee sits before it expires. The original gives each one
+	// random(8,16) EXPIRY CYCLES of 4 passes - 32-64 of its passes, call
+	// it 5-11 seconds. Held in ms so it is the SECONDS that are the
+	// original's, not a tick count that would silently halve.
+	//
+	// Deliberately shorter-lived than food: a hazard that accumulated
+	// would eventually fill the board, and the cap alone would make the
+	// oldest bees permanent furniture.
+	PLAY_BEE_TTL_MIN_MS = 5000;
+	PLAY_BEE_TTL_MAX_MS = 11000;
+	PLAY_BEE_TTL_MIN = PLAY_BEE_TTL_MIN_MS div TICK_MS;
+	PLAY_BEE_TTL_MAX = PLAY_BEE_TTL_MAX_MS div TICK_MS;
+
+	// Nothing spawns within this CHEBYSHEV distance of any live head
+	// (dengland: "spawn at least 5 cells from any head"). Supersedes the
+	// original's checkPlaceBee, which blocks the whole 5-wide row band
+	// AND column band through the head - a cross spanning the board,
+	// which reads like a rectangle test that wanted OR.
+	//
+	// Measured against EVERY live head, not just the one being targeted:
+	// a bee appearing on top of a bystander is exactly as unfair as one
+	// appearing on top of its target.
+	PLAY_BEE_SPAWN_CLEAR = 5;
+
+	// Weight of the "move at random" option. The other two - toward the
+	// target, and stall - scale with difficulty; see TickPlayBees, which
+	// carries the table.
+	PLAY_BEE_WEIGHT_RANDOM = 1;
+
+	// EVERY N BEES EATEN, the board allows one more (dengland, 2026-08-25:
+	// "what if every 4 eaten raises the level's limit by 1? Get angry the
+	// bees?").
+	//
+	// Nothing like this is in the original - it is his own idea, and a
+	// good one: bee-hunting is the single most lucrative thing on the
+	// board (PLAY_BEE_PTS), and until now it was pure upside during an
+	// invulnerability burst. This gives the reward a price paid in the
+	// same currency, so a greedy run makes its own board harder.
+	//
+	// Counts SHIELDED KILLS ONLY. Dying to a bee should not anger the
+	// swarm as well - you have already paid for that one.
+	//
+	// Reset each level, along with the rest of the level state.
+	PLAY_BEE_ANGER_PER = 4;
+
+	// Eating a bee while shielded. The original's tSnakePts[5] = 750,
+	// doubled for battle mode like every other score here.
+	//
+	// This is the one thing on the board worth going OUT of your way for,
+	// and it only exists during an invulnerability burst - so the heart
+	// food turns into a timed hunting licence rather than just a safety
+	// net. Worth keeping when the numbers get retuned.
+	PLAY_BEE_PTS = 1500;
 
 
 procedure DoDestroyListMessages;
@@ -2778,11 +3197,40 @@ procedure TSnakeGame.Add(APlayer: TPlayer);
 // spectator-first, and a spectator watching the board wants to see a
 // corner change hands as much as the players do. Mirrors the same
 // broadcast already inside Remove.
+// GameStatusToAll - broadcast board-wide state (currently the level
+// clock) to everyone in the zone. Caller holds Lock.
+//
+// FPlayers rather than Watchers: the clock is cheap, and a spectator
+// sitting on another page should still have a current picture the moment
+// they navigate back to the board.
+procedure TSnakeGame.GameStatusToAll;
+	var
+	j: Integer;
+
+	begin
+	with FPlayers.LockList do
+		try
+		for j:= 0 to Count - 1 do
+			SendGameStatus(Items[j]);
+
+		finally
+		FPlayers.UnlockList;
+		end;
+	end;
+
 procedure TSnakeGame.SlotStatusToAll(ASlot: Integer);
 	var
 	j: Integer;
 
 	begin
+	// Every broadcast carries the current gear (SendSlotStatus computes
+	// it fresh), so this is where the record of what clients have been
+	// told is kept up to date. TickPlaySnakes' change check reads it, and
+	// updating it here means a status sent for some OTHER reason - a
+	// death, a pickup - counts as having reported the gear too, instead
+	// of being followed by a redundant second message.
+	PlayGear[ASlot]:= PlayGearFor(ASlot);
+
 	with FPlayers.LockList do
 		try
 		for j:= 0 to Count - 1 do
@@ -2847,6 +3295,10 @@ function TSnakeGame.ClaimSlot(APlayer: TPlayer; ASlot: Integer): Integer;
 		Slots[ASlot].Name:= APlayer.Name;
 		Slots[ASlot].State:= psPlaying;
 		Slots[ASlot].Lives:= PLAY_START_LIVES;
+
+		// Cleared on CLAIM, not on release - so the last run's final score
+		// stays on the corner's HUD row until somebody takes it on.
+		Slots[ASlot].Score:= 0;
 
 		Result:= ASlot;
 
@@ -4026,16 +4478,34 @@ procedure TSnakeGame.SpawnPlayerSnake(ASlot: Integer;
 			and (c > 0) and (c < BOARD_COLS - 1)
 			and (Board[r][c] <> TILE_FLOOR)
 			and (Board[r][c] <> TILE_WALL) then
+				begin
+				// Food and bees swept up this way have to be struck off
+				// their tables too, or the slot stays spoken for until
+				// the TTL runs out and the board quietly supports less
+				// of them.
+				ClearFoodAt(r, c);
+				ClearBeeAt(r, c);
+
 				EmitCell(r, c, TILE_FLOOR, ADeltas, ADeltaCount);
+				end;
 
 	with PlaySnakes[ASlot] do
 		begin
 		Len:= DEMO_SNAKE_LEN;
 		Player:= ASlot;
-		MoveTick:= SnakeStepTicks(LevelProgress);
+		MoveTick:= BoardStepTicks;
 		InvunTicks:= PLAY_SPAWN_INVUN_TICKS;
 		FlashOn:= True;
 		Alive:= True;
+
+		// A death spends every power-up with it. The original does the
+		// same on a respawn (snakeReset, server.lua:1083 - moveFast,
+		// growEx, growNone and grow all back to nothing), and it is what
+		// stops a speed burst outliving the snake that earned it.
+		MoveFast:= 0;
+		Grow:= False;
+		GrowNone:= 0;
+		GrowEx:= 0;
 
 		// Head at its own offset, body trailing back along the circuit -
 		// InitDemoSnakes' loop verbatim. Walking the circuit rather than
@@ -4156,6 +4626,691 @@ procedure TSnakeGame.SetPlayerLook(APlayer: TPlayer; ADir: TSnakeDir);
 		end;
 	end;
 
+// FoodAt - which PlayFood entry, if any, is sitting on this cell.
+// Returns -1 for none. Caller holds Lock.
+//
+// A linear scan of five, run at most once per snake per step. A position
+// index would be faster and would need keeping in step with the board;
+// this cannot go stale.
+function TSnakeGame.FoodAt(ARow, ACol: Byte): Integer;
+	var
+	i: Integer;
+
+	begin
+	Result:= -1;
+
+	for i:= 0 to PLAY_FOOD_MAX - 1 do
+		if  PlayFood[i].Active
+		and (PlayFood[i].Row = ARow) and (PlayFood[i].Col = ACol) then
+			begin
+			Result:= i;
+			Exit;
+			end;
+	end;
+
+// ClearFoodAt - forget the food on this cell, for when something OTHER
+// than a snake eating it has taken it off the board. Caller holds Lock.
+//
+// The spawn sweep is the case that needs this (SpawnPlayerSnake clears
+// everything that is not floor or wall around an arriving player). Without
+// it the table would still be holding a slot for a tile that no longer
+// exists, and the board would quietly support fewer and fewer pieces of
+// food as the game went on.
+procedure TSnakeGame.ClearFoodAt(ARow, ACol: Byte);
+	var
+	i: Integer;
+
+	begin
+	i:= FoodAt(ARow, ACol);
+
+	if  i >= 0 then
+		PlayFood[i].Active:= False;
+	end;
+
+// EatFood - apply one food's effects to one snake, and pay for it.
+// Caller holds Lock; the food's tile has NOT been cleared yet.
+//
+// snakeCheckEat (server.lua:957) more or less line for line, with the
+// battle-mode branch taken throughout - see the PLAY_FOOD_* constants.
+procedure TSnakeGame.EatFood(ASlot, AFood: Integer);
+	var
+	pts: Integer;
+
+	begin
+	with PlaySnakes[ASlot] do
+		begin
+		case PlayFood[AFood].Kind of
+			// Type 0, clubs - points and speed, but no length. Or rather:
+			// it CANCELS the extra-growth food if that is running, and
+			// only sets its own suppression timer if it is not. Eating
+			// this while already growing spends the food on stopping,
+			// which is the trade.
+			0:	begin
+				pts:= PLAY_FOOD_PTS_NOGROW;
+
+				if  GrowEx > 0 then
+					GrowEx:= 0
+				else
+					GrowNone:= PLAY_FOOD_NOGROW_TICKS;
+
+				Inc(MoveFast, PLAY_FAST_NOGROW);
+				end;
+
+			// Type 1, solid circle - the mirror image: cancels a running
+			// suppression, or starts growing on every step. Cheapest food
+			// on the board and the only one that slows you down.
+			1:	begin
+				pts:= PLAY_FOOD_PTS_XGROW;
+
+				if  GrowNone > 0 then
+					GrowNone:= 0
+				else
+					GrowEx:= PLAY_FOOD_XGROW_TICKS;
+
+				Inc(MoveFast, PLAY_FAST_XGROW);
+				end;
+
+			// Type 2, open circle - pure speed, nothing else.
+			2:	begin
+				pts:= PLAY_FOOD_PTS_BURST;
+				Inc(MoveFast, PLAY_FAST_BURST);
+				end;
+
+			// Type 3, heart - a shield, ADDED to whatever is left of the
+			// one already running and capped, so eating two in a row is
+			// worth less than eating them apart.
+			else
+				begin
+				pts:= PLAY_FOOD_PTS_SHIELD;
+
+				Inc(InvunTicks, PLAY_FOOD_INVUN_TICKS);
+
+				if  InvunTicks > PLAY_INVUN_CAP_TICKS then
+					InvunTicks:= PLAY_INVUN_CAP_TICKS;
+
+				Inc(MoveFast, PLAY_FAST_SHIELD);
+				end;
+			end;
+
+		if  MoveFast > PLAY_FAST_CAP then
+			MoveFast:= PLAY_FAST_CAP
+		else if MoveFast < -PLAY_FAST_FLOOR then
+			MoveFast:= -PLAY_FAST_FLOOR;
+
+		// EVERY food grows you once, on top of whatever else it did -
+		// including the one whose whole job is to stop growth, which sets
+		// GrowNone in the same breath and so suppresses its own segment.
+		Grow:= True;
+		end;
+
+	PlayFood[AFood].Active:= False;
+
+	AddScore(ASlot, pts);
+	end;
+
+// AddScore - pay a corner, and hand out a life on every multiple of
+// PLAY_BONUS_LIFE crossed. Caller holds Lock.
+//
+// The original keeps a `bonus` counter per player and compares
+// floor(score / iGameBonusLife) against it. None is needed here: a score
+// only ever rises, and only by one food at a time, so comparing the
+// division before and against after catches the crossing directly.
+//
+// Does NOT broadcast - the caller does, because a step that scores has
+// other reasons to send a SlotStatus anyway and one is enough.
+procedure TSnakeGame.AddScore(ASlot, APoints: Integer);
+	var
+	was: Integer;
+
+	begin
+	was:= Slots[ASlot].Score div PLAY_BONUS_LIFE;
+
+	Inc(Slots[ASlot].Score, APoints);
+
+	if  Slots[ASlot].Score > PLAY_SCORE_MAX then
+		Slots[ASlot].Score:= PLAY_SCORE_MAX;
+
+	if  (Slots[ASlot].Score div PLAY_BONUS_LIFE) > was then
+		Inc(Slots[ASlot].Lives);
+	end;
+
+// PlayStepTicks - how many ticks corner ASlot's snake waits between
+// steps right now: the board's own gear, shifted by that snake's
+// MoveFast. Caller holds Lock.
+//
+// The shift is the original's, thresholds and all (objectsTick,
+// server.lua:1776): a big MoveFast is worth two gears, any positive one
+// gear, a negative one gear the other way. Deliberately NOT proportional
+// - the original quantises it hard, and that is what makes a speed food
+// read as a distinct state rather than a slider.
+function TSnakeGame.PlayStepTicks(ASlot: Integer): Integer;
+	begin
+	Result:= BoardStepTicks;
+
+	if  PlaySnakes[ASlot].MoveFast >= PLAY_FAST_HARD then
+		Dec(Result, 2)
+	else if PlaySnakes[ASlot].MoveFast > 0 then
+		Dec(Result)
+	else if PlaySnakes[ASlot].MoveFast < 0 then
+		Inc(Result);
+
+	// Only the FAST end is clamped. The original clamps at 0, which is
+	// its own turbo2 - "DO NOT USE turbo settings" (server.lua:46) - so
+	// this stops at TOP instead. The slow end needs no clamp: the base is
+	// already at most VSLOW, so a slowed snake can only reach VSLOW + 1,
+	// which is a legitimate gear to be stuck in for a second.
+	if  Result < SNAKE_SPEED_TOP then
+		Result:= SNAKE_SPEED_TOP;
+	end;
+
+// PlayGearFor - corner ASlot's speed as the HUD shows it: one of the six
+// named gears (SNAKE_SPEED_TOP..SNAKE_SPEED_VSLOW), or 0 for a corner
+// nobody is playing. Caller holds Lock.
+//
+// Clamped onto the ladder, which PlayStepTicks is NOT: a slowed snake on
+// an already-slow board sits at VSLOW + 1, a real seventh gear with no
+// name and no bar segment of its own. It reads as VSLOW here, which is
+// honest enough - it IS the bottom of the range - and keeps the display
+// to the six gears that exist.
+//
+// A DEAD snake reports its board's base gear rather than 0. Its bar
+// would otherwise empty and refill on every death, and the death is
+// already being announced by the lives row right above it.
+function TSnakeGame.PlayGearFor(ASlot: Integer): Integer;
+	begin
+	Result:= 0;
+
+	if  not Assigned(Slots[ASlot].Player) then
+		Exit;
+
+	if  PlaySnakes[ASlot].Alive then
+		Result:= PlayStepTicks(ASlot)
+	else
+		Result:= BoardStepTicks;
+
+	if  Result > SNAKE_SPEED_VSLOW then
+		Result:= SNAKE_SPEED_VSLOW;
+
+	if  Result < SNAKE_SPEED_TOP then
+		Result:= SNAKE_SPEED_TOP;
+	end;
+
+// TickPlayFood - age the food on the board and roll for one more.
+// Caller holds Lock.
+//
+// levelTick's bonus half (server.lua:1942) plus levelExpireTiles.
+// Deliberately NOT modelled on the bee placement rule: checkPlaceBee
+// keeps hazards out of a player's lane, and food is the opposite kind of
+// thing - it is SUPPOSED to appear somewhere you have to go and get it.
+procedure TSnakeGame.TickPlayFood(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	i, free, r, c, kind: Integer;
+
+	begin
+	free:= -1;
+
+	for i:= 0 to PLAY_FOOD_MAX - 1 do
+		begin
+		if  not PlayFood[i].Active then
+			begin
+			if  free < 0 then
+				free:= i;
+
+			Continue;
+			end;
+
+		Dec(PlayFood[i].Ticks);
+
+		if  PlayFood[i].Ticks > 0 then
+			Continue;
+
+		// Rotted. Only wipe the cell if it is still OUR tile - a snake
+		// head arriving on the same tick as the expiry would already have
+		// eaten it and cleared the entry, but a level rebuild or a spawn
+		// sweep can have painted over it without going through
+		// ClearFoodAt, and clearing that to floor would punch a hole in
+		// whatever replaced it.
+		if  (Board[PlayFood[i].Row][PlayFood[i].Col]
+				= TILE_FOOD_BASE + PlayFood[i].Kind) then
+			EmitCell(PlayFood[i].Row, PlayFood[i].Col, TILE_FLOOR,
+					ADeltas, ADeltaCount);
+
+		PlayFood[i].Active:= False;
+
+		if  free < 0 then
+			free:= i;
+		end;
+
+	if  free < 0 then
+		Exit;
+
+	if  Random(PLAY_FOOD_SPAWN_ODDS) <> 0 then
+		Exit;
+
+	// One attempt at one cell, and if it is occupied the roll is simply
+	// wasted - the original does the same rather than searching for
+	// somewhere free. It is what makes a busy board hand out less food
+	// without any explicit rule saying so.
+	r:= 1 + Random(BOARD_ROWS - 2);
+	c:= 1 + Random(BOARD_COLS - 2);
+
+	if  Board[r][c] <> TILE_FLOOR then
+		Exit;
+
+	kind:= Random(FOOD_TYPE_COUNT);
+
+	PlayFood[free].Row:= r;
+	PlayFood[free].Col:= c;
+	PlayFood[free].Kind:= kind;
+	PlayFood[free].Ticks:= PLAY_FOOD_TTL_MIN
+			+ Random(PLAY_FOOD_TTL_MAX - PLAY_FOOD_TTL_MIN + 1);
+	PlayFood[free].Active:= True;
+
+	EmitCell(r, c, TILE_FOOD_BASE + kind, ADeltas, ADeltaCount);
+	end;
+
+// BoardStepTicks - this board's base step cadence right now. Caller
+// holds Lock.
+//
+// SnakeStepTicks for the current progress, one gear quicker once the
+// level has ramped. Real play paces EVERYTHING off this rather than
+// calling SnakeStepTicks directly, which is what makes the ramp reach
+// the bees as well as the snakes - if it only reached the snakes, the
+// last 30 seconds would make the hazard RELATIVELY slower, which is
+// backwards.
+//
+// The demo deliberately still calls SnakeStepTicks directly: the attract
+// reel has no level clock to ramp.
+function TSnakeGame.BoardStepTicks: Integer;
+	begin
+	Result:= SnakeStepTicks(LevelProgress);
+
+	if  LevelRamped then
+		Dec(Result);
+
+	if  Result < SNAKE_SPEED_TOP then
+		Result:= SNAKE_SPEED_TOP;
+	end;
+
+// LevelSecsLeft - the level clock as whole seconds, rounded UP so it
+// only shows zero when the level is genuinely over. Caller holds Lock.
+function TSnakeGame.LevelSecsLeft: Integer;
+	begin
+	Result:= (LevelTicks * TICK_MS + 999) div 1000;
+
+	if  Result < 0 then
+		Result:= 0;
+	end;
+
+// NextLevel - the clock ran out. Rebuild on the next pattern, one step
+// harder, and put everyone back on their corner. Caller holds Lock.
+//
+// THE FOUR LINE-GENERATOR PATTERNS ARE CYCLED HERE. They were ported and
+// verified back when the level geometry was built (levelGenA..D, see
+// BuildLevel and LEVEL_VARIANTS) and have been sitting unused since,
+// because nothing ever asked for a second level. This is the thing that
+// asks.
+//
+// Progress rises every level, exactly as the original does
+// (iLevelProgress increments per level cleared), so an easy board
+// converges on a hard one if you live long enough. Both the things it
+// feeds - SnakeStepTicks and PlayBeeMax - clamp, so it saturates rather
+// than running away.
+//
+// Lives and SCORE are untouched: they live on the slot precisely so they
+// outlast things like this. A level change is not a new game.
+procedure TSnakeGame.NextLevel;
+	var
+	i, deltaCount: Integer;
+	deltas: array of TTileDelta;
+
+	begin
+	Inc(LevelProgress);
+
+	LevelVariant:= (LevelVariant + 1) mod LEVEL_VARIANTS;
+	Inc(LevelNumber);
+
+	LevelTicks:= PLAY_LEVEL_TICKS;
+	LevelRamped:= False;
+	LevelBeesEaten:= 0;
+	LevelSecsSent:= -1;			// force the clock out again
+
+	BuildLevel(LevelVariant, LevelProgress);
+
+	for i:= 0 to PLAY_FOOD_MAX - 1 do
+		PlayFood[i].Active:= False;
+
+	for i:= 0 to PLAY_BEE_CAP - 1 do
+		PlayBees[i].Active:= False;
+
+	// Everyone still holding a corner starts again on it. A snake that
+	// was mid-board when the clock ran out would otherwise find itself
+	// inside whatever the new pattern put there.
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		begin
+		PlaySnakes[i].Alive:= False;
+		PlayRespawn[i]:= 0;
+		end;
+
+	// As in StartPlay: the spawns write straight into Board and go out
+	// with the whole-board push below, so their deltas are thrown away.
+	SetLength(deltas, 64);
+	deltaCount:= 0;
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		if  Assigned(Slots[i].Player) then
+			SpawnPlayerSnake(i, deltas, deltaCount);
+
+	PushBoardToWatchers;
+	end;
+
+// BeeAt / ClearBeeAt - the same pair FoodAt/ClearFoodAt are, and for the
+// same reasons. Caller holds Lock.
+function TSnakeGame.BeeAt(ARow, ACol: Byte): Integer;
+	var
+	i: Integer;
+
+	begin
+	Result:= -1;
+
+	for i:= 0 to PLAY_BEE_CAP - 1 do
+		if  PlayBees[i].Active
+		and (PlayBees[i].Row = ARow) and (PlayBees[i].Col = ACol) then
+			begin
+			Result:= i;
+			Exit;
+			end;
+	end;
+
+procedure TSnakeGame.ClearBeeAt(ARow, ACol: Byte);
+	var
+	i: Integer;
+
+	begin
+	i:= BeeAt(ARow, ACol);
+
+	if  i >= 0 then
+		PlayBees[i].Active:= False;
+	end;
+
+// PlayBeeMax - how many bees this board wants on it right now. Caller
+// holds Lock.
+//
+// Clamped to the array. Bees are the hazard that answers "what stops a
+// good player circulating forever", so this is the one thing that should
+// keep rising as levels are cleared - but far more gently than the
+// original, because these ones MOVE. See the PLAY_BEE_BASE comment.
+function TSnakeGame.PlayBeeMax: Integer;
+	begin
+	Result:= PLAY_BEE_BASE + (LevelProgress * PLAY_BEE_PER_PROGRESS);
+
+	// Angered: every PLAY_BEE_ANGER_PER eaten on this level buys the
+	// swarm one more. dengland's own mechanic - see the constant.
+	Inc(Result, LevelBeesEaten div PLAY_BEE_ANGER_PER);
+
+	if  LevelRamped then
+		Inc(Result, PLAY_LEVEL_RAMP_BEES);
+
+	if  Result > PLAY_BEE_CAP then
+		Result:= PLAY_BEE_CAP;
+	end;
+
+// TickPlayBees - age, move and spawn the bees. Caller holds Lock.
+//
+// The MOVEMENT is TickDemoBees' chooser exactly, and deliberately so:
+// the attract screen has been showing players how bees behave all along,
+// so there should be one definition of that, not two that drift. The
+// differences are only the ones real play needs - a TTL, spawning
+// anywhere rather than in the demo's four corners, and no pen.
+//
+// THE PEN IS GONE. Demo bees are fenced inside the circuit because the
+// demo has no collision and a bee on the track would simply be painted
+// over. Here the spawn-clearance rule does that job instead, and the
+// board's own wall border is the only boundary a bee needs - it cannot
+// leave without failing the floor test first.
+procedure TSnakeGame.TickPlayBees(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	b, k, best, dist, bestdist, live, free: Integer;
+	toward, stall, pick: Integer;
+	dr, dc, nr, nc, r, c: Integer;
+
+	// Chebyshev, the same measure the spawn clearance uses - a diagonal
+	// counts as one step, which is what "5 cells away" means to somebody
+	// looking at the board.
+	function HeadDist(ARow, ACol, ASnake: Integer): Integer;
+		var
+		a, d: Integer;
+
+		begin
+		a:= Abs(ARow - Integer(PlaySnakes[ASnake].Body[0].Row));
+		d:= Abs(ACol - Integer(PlaySnakes[ASnake].Body[0].Col));
+
+		if  a > d then
+			Result:= a
+		else
+			Result:= d;
+		end;
+
+	begin
+	// --- weights ---
+	//
+	// dengland's 2:1:1 (toward : random : stall) is NORMAL, and both ends
+	// scale from it:
+	//
+	//   training 2:1:3   easy 2:1:2   normal 2:1:1
+	//   hard     3:1:1   expert 4:1:1
+	//
+	// STALL NEVER REACHES ZERO, and that is the load-bearing part. A pure
+	// chaser moving at a fixed rate is solvable by geometry - a player
+	// can work out exactly when it arrives. Stalls make arrival time
+	// uncertain, which is the whole reason this hazard is not just
+	// arithmetic. Do not tidy the stall away at expert.
+	toward:= 2;
+	if  LevelProgress > 2 then
+		toward:= 2 + (LevelProgress - 2);
+
+	stall:= 3 - LevelProgress;
+	if  stall < 1 then
+		stall:= 1;
+
+	free:= -1;
+
+	for b:= 0 to PLAY_BEE_CAP - 1 do
+		begin
+		if  not PlayBees[b].Active then
+			begin
+			if  free < 0 then
+				free:= b;
+
+			Continue;
+			end;
+
+		// --- expiry ---
+		Dec(PlayBees[b].Ticks);
+
+		if  PlayBees[b].Ticks <= 0 then
+			begin
+			// Only wipe the cell if it is still OUR tile - see
+			// TickPlayFood's expiry for why that check is not optional.
+			if  Board[PlayBees[b].Row][PlayBees[b].Col] = TILE_BEE then
+				EmitCell(PlayBees[b].Row, PlayBees[b].Col, TILE_FLOOR,
+						ADeltas, ADeltaCount);
+
+			PlayBees[b].Active:= False;
+
+			if  free < 0 then
+				free:= b;
+
+			Continue;
+			end;
+
+		// --- move opportunity ---
+		//
+		// On the BOARD'S step cadence, not every tick. That is what makes
+		// the difficulty table work: a bee's real speed is P(act) x the
+		// snake rate, so the margin between snake and bee narrows from
+		// about 2x at training to 1.2x at expert without either ever
+		// being given a fixed cells/sec figure. Bees stepping every tick
+		// was worked through and rejected - even training bees would
+		// outrun a normal snake.
+		if  PlayBees[b].MoveTick > 0 then
+			begin
+			Dec(PlayBees[b].MoveTick);
+			Continue;
+			end;
+
+		PlayBees[b].MoveTick:= BoardStepTicks - 1;
+
+		// The target is kept for life - EXCEPT that a dead target has no
+		// head to aim at. Re-picking then is a necessary deviation from
+		// "assigned at spawn", not a quiet softening of it: with nobody
+		// to chase, the bee would otherwise stall forever and become
+		// scenery.
+		if  (PlayBees[b].Target < 0)
+		or  (PlayBees[b].Target > SNAKE_PLAYER_COUNT - 1)
+		or  (not PlaySnakes[PlayBees[b].Target].Alive) then
+			begin
+			bestdist:= BOARD_COLS + BOARD_ROWS;
+			best:= -1;
+
+			for k:= 0 to SNAKE_PLAYER_COUNT - 1 do
+				if  PlaySnakes[k].Alive then
+					begin
+					dist:= HeadDist(PlayBees[b].Row, PlayBees[b].Col, k);
+
+					if  dist < bestdist then
+						begin
+						bestdist:= dist;
+						best:= k;
+						end;
+					end;
+
+			PlayBees[b].Target:= best;
+			end;
+
+		pick:= Random(toward + PLAY_BEE_WEIGHT_RANDOM + stall);
+
+		dr:= 0;
+		dc:= 0;
+
+		if  (pick < toward) and (PlayBees[b].Target >= 0) then
+			begin
+			// Close the LARGER axis first. No pathfinding, by design: a
+			// blocked move is simply a lost move for this bee this step,
+			// with no fallback and no routing - which is what makes walls
+			// genuine shelter rather than a brief detour.
+			r:= PlaySnakes[PlayBees[b].Target].Body[0].Row;
+			c:= PlaySnakes[PlayBees[b].Target].Body[0].Col;
+
+			if  Abs(r - Integer(PlayBees[b].Row))
+					> Abs(c - Integer(PlayBees[b].Col)) then
+				begin
+				if  r < PlayBees[b].Row then
+					dr:= -1
+				else if r > PlayBees[b].Row then
+					dr:= 1;
+				end
+			else
+				begin
+				if  c < PlayBees[b].Col then
+					dc:= -1
+				else if c > PlayBees[b].Col then
+					dc:= 1;
+				end;
+			end
+		else if pick < (toward + PLAY_BEE_WEIGHT_RANDOM) then
+			begin
+			case Random(4) of
+				0: dr:= -1;
+				1: dr:= 1;
+				2: dc:= -1;
+			else
+				dc:= 1;
+				end;
+			end;
+
+		if  (dr = 0) and (dc = 0) then
+			Continue;				// stalled, or already level
+
+		nr:= Integer(PlayBees[b].Row) + dr;
+		nc:= Integer(PlayBees[b].Col) + dc;
+
+		// Floor only - which is the whole legality test. It already means
+		// "cannot move through walls, snakes, tails, lava, food or
+		// another bee", with no case analysis and nothing to forget when
+		// a tile type is added. The border ring means there is no bounds
+		// check to write either.
+		if  Board[nr][nc] <> TILE_FLOOR then
+			Continue;
+
+		EmitCell(PlayBees[b].Row, PlayBees[b].Col, TILE_FLOOR,
+				ADeltas, ADeltaCount);
+
+		PlayBees[b].Row:= nr;
+		PlayBees[b].Col:= nc;
+
+		EmitCell(nr, nc, TILE_BEE, ADeltas, ADeltaCount);
+		end;
+
+	// --- spawn ---
+	if  free < 0 then
+		Exit;
+
+	live:= 0;
+	for b:= 0 to PLAY_BEE_CAP - 1 do
+		if  PlayBees[b].Active then
+			Inc(live);
+
+	if  live >= PlayBeeMax then
+		Exit;
+
+	if  Random(PLAY_BEE_SPAWN_ODDS) <> 0 then
+		Exit;
+
+	r:= 1 + Random(BOARD_ROWS - 2);
+	c:= 1 + Random(BOARD_COLS - 2);
+
+	if  Board[r][c] <> TILE_FLOOR then
+		Exit;
+
+	// Clear of EVERY live head, and the nearest one becomes the target -
+	// so one scan does both jobs.
+	bestdist:= BOARD_COLS + BOARD_ROWS;
+	best:= -1;
+
+	for k:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		if  PlaySnakes[k].Alive then
+			begin
+			dist:= HeadDist(r, c, k);
+
+			if  dist < bestdist then
+				begin
+				bestdist:= dist;
+				best:= k;
+				end;
+			end;
+
+	// Nobody alive to be unfair to - and nobody to chase either.
+	if  best < 0 then
+		Exit;
+
+	if  bestdist < PLAY_BEE_SPAWN_CLEAR then
+		Exit;
+
+	PlayBees[free].Row:= r;
+	PlayBees[free].Col:= c;
+	PlayBees[free].Target:= best;
+	PlayBees[free].MoveTick:= BoardStepTicks;
+	PlayBees[free].Ticks:= PLAY_BEE_TTL_MIN
+			+ Random(PLAY_BEE_TTL_MAX - PLAY_BEE_TTL_MIN + 1);
+	PlayBees[free].Active:= True;
+
+	EmitCell(r, c, TILE_BEE, ADeltas, ADeltaCount);
+	end;
+
+
 // TickPlaySnakes - advance every live player snake one tick. Caller
 // holds Lock.
 //
@@ -4167,10 +5322,11 @@ procedure TSnakeGame.SetPlayerLook(APlayer: TPlayer; ADir: TSnakeDir);
 procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		var ADeltaCount: Integer);
 	var
-	i, s, t: Integer;
+	i, s, t, f: Integer;
 	head: TSnakeSeg;
 	prevDir: TSnakeDir;
-	wantFlash, repaint: Boolean;
+	tile: Byte;
+	wantFlash, repaint, growing, eat: Boolean;
 
 	// Resolved in a PRE-PASS, before anything moves. Stepping[] is who
 	// is due a step this tick, TgtRow/TgtCol where their head would
@@ -4258,6 +5414,31 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		if  PlaySnakes[s].InvunTicks > 0 then
 			Dec(PlaySnakes[s].InvunTicks);
 
+		// The food effects age on the tick too, and for the same reason -
+		// the original runs the lot from one effectsTick (server.lua:1700)
+		// independently of whether anything moved. That matters for
+		// MoveFast in particular: it is what decides the step interval, so
+		// deciding it on the step would make a fast snake burn its own
+		// boost quicker than a slow one.
+		if  PlaySnakes[s].MoveFast > 0 then
+			Dec(PlaySnakes[s].MoveFast)
+		else if PlaySnakes[s].MoveFast < 0 then
+			Inc(PlaySnakes[s].MoveFast);
+
+		if  PlaySnakes[s].GrowNone > 0 then
+			Dec(PlaySnakes[s].GrowNone);
+
+		if  PlaySnakes[s].GrowEx > 0 then
+			begin
+			Dec(PlaySnakes[s].GrowEx);
+
+			// Running out is what ENDS continuous growth, not the next
+			// step - otherwise a snake that happened to be between steps
+			// when the timer expired would get one more segment out of it.
+			if  PlaySnakes[s].GrowEx = 0 then
+				PlaySnakes[s].Grow:= False;
+			end;
+
 		wantFlash:= (PlaySnakes[s].InvunTicks > 0)
 				and (((PlaySnakes[s].InvunTicks div DEMO_INVUN_FLASH_TICKS)
 					and 1) = 0);
@@ -4276,7 +5457,7 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 			Continue;
 			end;
 
-		PlaySnakes[s].MoveTick:= SnakeStepTicks(LevelProgress) - 1;
+		PlaySnakes[s].MoveTick:= PlayStepTicks(s) - 1;
 
 		// Due a step. Work out WHERE, but move nothing yet - see the
 		// pre-pass note on the declarations above.
@@ -4326,8 +5507,28 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		// board, head-ons are frequent and often nobody's mistake.
 		// To make it lethal instead, replace this branch with
 		// KillPlayerSnake.
+		//
+		// THIS IS ALSO THE TWO-SNAKES-ONE-FOOD CASE (dengland asked,
+		// 2026-08-25). Two heads can only reach the same piece of food by
+		// targeting the same cell, which is a head-on by definition and
+		// lands here - so neither moves, neither eats, and the food is
+		// still sitting there when they untangle. No double-scoring is
+		// possible, and no special case is needed to prevent it.
+		//
+		// The alternative dengland floated - both get the EFFECT but
+		// neither the points - would mean consuming the food while both
+		// snakes stand still, and would make a contested pickup better
+		// value than an uncontested one. Leaving it on the board says
+		// "neither of you earned that yet", which reads better and is
+		// what the head-on rule already says about everything else.
 		if  Mutual[s] then
 			begin
+			// DID NOT MOVE, so it did not travel in the direction the
+			// pre-pass optimistically committed to. Put Dir back to the
+			// heading it actually arrived on - see the note on the
+			// shielded branch below for what goes wrong otherwise.
+			PlaySnakes[s].Dir:= ArrivedDir[s];
+
 			PlaySnakes[s].InvunTicks:= PLAY_SPAWN_INVUN_TICKS;
 
 			if  not PlaySnakes[s].FlashOn then
@@ -4346,35 +5547,108 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		head.Row:= TgtRow[s];
 		head.Col:= TgtCol[s];
 
-		// THE COLLISION TEST. Anything that is not bare floor stops the
-		// snake dead - wall, another snake, its own body, a hazard. One
-		// test covers the lot, exactly as lava spreading and bees
-		// stepping already only accept TILE_FLOOR, so no case analysis
-		// and nothing to forget when a new tile type is added.
+		// Will this step LENGTHEN the snake? Decided before the collision
+		// test, because the answer is also what says whether the tail is
+		// about to vacate - see the exemption below.
+		//
+		// Food at the target cell cannot change it: the tail is a snake
+		// tile, so the cell being landed on is never both.
+		growing:= PlaySnakes[s].Grow and (PlaySnakes[s].GrowNone = 0)
+				and (PlaySnakes[s].Len < MAX_SNAKE_LEN);
+
+		tile:= Board[head.Row][head.Col];
+
+		// FOOD IS THE ONE non-floor tile a head may enter. The original
+		// gets this for free - snakeCheckCollide only blocks on tile
+		// sheets below 3, and food is sheet 3 - but QUADRO's collision is
+		// deliberately "anything not floor", so food has to be named.
+		eat:= (tile >= TILE_FOOD_BASE)
+				and (tile < TILE_FOOD_BASE + FOOD_TYPE_COUNT);
+
+		// THE COLLISION TEST. Anything that is not bare floor or food
+		// stops the snake dead - wall, another snake, its own body, a
+		// hazard. One test covers the lot, exactly as lava spreading and
+		// bees stepping already only accept TILE_FLOOR, so no case
+		// analysis and nothing to forget when a new tile type is added.
 		//
 		// The border ring means there is no bounds check to write: a
 		// head cannot leave the board without hitting the wall first.
 		// (The original, having no border, relies on a range test that
 		// is commented out - see the LEVEL_* notes.)
-		// The snake's OWN TAIL is exempt. It is still painted on the
-		// board here but vacates below in the same step, so the cell is
-		// genuinely free by the time the head lands on it. Without this
-		// a snake dies for turning tightly enough to follow itself -
-		// which is legal, common, and takes more skill than a loose
-		// turn, so it would punish exactly the wrong thing.
+		// The snake's OWN TAIL is exempt WHEN IT IS ABOUT TO VACATE. It
+		// is still painted on the board here but leaves below in the same
+		// step, so the cell is genuinely free by the time the head lands
+		// on it. Without this a snake dies for turning tightly enough to
+		// follow itself - which is legal, common, and takes more skill
+		// than a loose turn, so it would punish exactly the wrong thing.
 		//
-		// Only the LAST segment. When growth lands, a growing snake
-		// keeps its tail that step and this exemption must go with it.
-		if  (Board[head.Row][head.Col] <> TILE_FLOOR)
-		and not ((head.Row = PlaySnakes[s].Body[PlaySnakes[s].Len - 1].Row)
-			 and (head.Col = PlaySnakes[s].Body[PlaySnakes[s].Len - 1].Col)) then
+		// A GROWING snake keeps its tail this step, so the exemption is
+		// off and following yourself that closely really does kill you.
+		// That is the honest price of the extra-growth food, and it is
+		// why it is the cheapest thing on the board.
+		if  (tile <> TILE_FLOOR) and not eat
+		and (growing
+			or not ((head.Row = PlaySnakes[s].Body[PlaySnakes[s].Len - 1].Row)
+				 and (head.Col = PlaySnakes[s].Body[PlaySnakes[s].Len - 1].Col))) then
 			begin
+			// A BEE IS DESTROYED BY THE CONTACT either way, shield or
+			// no shield - the original clears the tile unconditionally
+			// and only the SCORING depends on being invulnerable
+			// (snakeCheckCollide, server.lua:930).
+			//
+			// So an unshielded snake still takes the bee down with it,
+			// which is worth keeping: a bee can never become a
+			// permanent blockade, however badly the board is going.
+			if  tile = TILE_BEE then
+				begin
+				f:= BeeAt(head.Row, head.Col);
+
+				if  f >= 0 then
+					PlayBees[f].Active:= False;
+
+				Emit(head.Row, head.Col, TILE_FLOOR);
+
+				// Shielded, so this was a KILL rather than a death. The
+				// one thing on the board worth going out of your way
+				// for, and it only exists while a burst is running -
+				// which turns the heart food into a timed hunting
+				// licence rather than just a safety net.
+				if  PlaySnakes[s].InvunTicks > 0 then
+					begin
+					AddScore(s, PLAY_BEE_PTS);
+					SlotStatusToAll(s);
+
+					// And the swarm notices. Only shielded kills count -
+					// see PLAY_BEE_ANGER_PER.
+					Inc(LevelBeesEaten);
+					end;
+				end;
+
 			// A shielded snake shrugs it off and simply does not move,
 			// rather than passing through. Passing through would let a
 			// spawn shield be used to cut corners across walls, which
-			// is a different game.
+			// is a different game. Same rule covers the bee above - you
+			// swat it from where you are, you do not step onto it.
 			if  PlaySnakes[s].InvunTicks > 0 then
 				begin
+				// DID NOT MOVE - so put Dir back to the heading actually
+				// travelled, undoing the pre-pass's optimistic
+				// `Dir := Look`.
+				//
+				// Without this, Dir records a step that never happened,
+				// and the NEXT step shapes its corner piece from a
+				// phantom heading - the segment left behind bends the
+				// wrong way. dengland caught it 2026-08-25: eat a bee
+				// while shielded, turn immediately, and "the tile
+				// displayed for the tail was wrong". Shielded contact is
+				// the common way to hit this, but the head-on draw above
+				// had exactly the same hole.
+				//
+				// It also keeps SetPlayerLook's reversal test honest,
+				// since that tests Dir precisely because it is meant to
+				// be the direction genuinely travelled.
+				PlaySnakes[s].Dir:= ArrivedDir[s];
+
 				if  repaint then
 					RepaintBody(s);
 
@@ -4385,11 +5659,50 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 			Continue;
 			end;
 
-		with PlaySnakes[s].Body[PlaySnakes[s].Len - 1] do
-			Emit(Row, Col, TILE_FLOOR);
+		// Survived the step, so anything edible here is eaten now - after
+		// the collision test and before the move, exactly the order the
+		// original uses (snakeCheckCollide, snakeCheckEat, snakeMove).
+		if  eat then
+			begin
+			f:= FoodAt(head.Row, head.Col);
+
+			if  f >= 0 then
+				begin
+				EatFood(s, f);
+
+				// Points changed, and possibly lives - the HUD reads both
+				// off SlotStatus, so it has to go out now. Rare enough to
+				// cost nothing: a message per pickup, not per tick.
+				SlotStatusToAll(s);
+
+				// Eating sets Grow, so re-ask - this is what makes the
+				// segment arrive on the SAME step as the food, rather
+				// than one step late.
+				growing:= PlaySnakes[s].Grow and (PlaySnakes[s].GrowNone = 0)
+						and (PlaySnakes[s].Len < MAX_SNAKE_LEN);
+				end;
+
+			// No floor emit for the eaten cell: the head is painted over
+			// it below, which is the same write.
+			end;
+
+		// GROWING is simply not vacating the tail. Making room first and
+		// letting the shift below duplicate the last segment into it
+		// leaves the new tail sitting on the cell the old one already
+		// occupies - already painted, so it costs no delta either.
+		if  growing then
+			Inc(PlaySnakes[s].Len)
+		else
+			with PlaySnakes[s].Body[PlaySnakes[s].Len - 1] do
+				Emit(Row, Col, TILE_FLOOR);
 
 		for i:= PlaySnakes[s].Len - 1 downto 1 do
 			PlaySnakes[s].Body[i]:= PlaySnakes[s].Body[i - 1];
+
+		// One segment per food, unless GrowEx is holding the flag on -
+		// which is the whole difference between the two growth foods.
+		if  PlaySnakes[s].GrowEx = 0 then
+			PlaySnakes[s].Grow:= False;
 
 		PlaySnakes[s].Body[1].Shape:= SegShape(prevDir, PlaySnakes[s].Dir);
 		with PlaySnakes[s].Body[1] do
@@ -4409,6 +5722,19 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		if  repaint then
 			RepaintBody(s);
 		end;
+
+	// Anyone's gear moved? A speed food changes it the moment it is
+	// eaten and again as the effect decays out, and the HUD's speed bar
+	// is driven off SlotStatus, so the change has to be noticed and
+	// announced.
+	//
+	// A separate pass at the end rather than inline above, because a gear
+	// can move on a tick where the snake did NOT step - MoveFast decays
+	// every tick - and because the dead/respawning branch would otherwise
+	// need its own copy of the same check.
+	for s:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		if  PlayGearFor(s) <> PlayGear[s] then
+			SlotStatusToAll(s);
 	end;
 
 // PushBoardToWatchers - resend the WHOLE board to everyone watching,
@@ -4460,13 +5786,31 @@ procedure TSnakeGame.StartPlay;
 	// does (iLevelProgress = iGameDifficulty).
 	LevelProgress:= Ord(Difficulty);
 
-	BuildLevel(0, LevelProgress);
+	LevelVariant:= 0;
+	LevelNumber:= 1;
+	LevelTicks:= PLAY_LEVEL_TICKS;
+	LevelRamped:= False;
+	LevelBeesEaten:= 0;
+	LevelSecsSent:= -1;
+
+	BuildLevel(LevelVariant, LevelProgress);
 
 	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
 		begin
 		PlaySnakes[i].Alive:= False;
 		PlayRespawn[i]:= 0;
 		end;
+
+	for i:= 0 to PLAY_BEE_CAP - 1 do
+		PlayBees[i].Active:= False;
+
+	// The attract reel's own food is painted over by BuildLevel above and
+	// was never in this table anyway (TickDemoFood writes tiles straight
+	// to the board - it is a display, not a simulation). Clearing it here
+	// is about the PREVIOUS game's food, on a board that has just been
+	// rebuilt underneath it.
+	for i:= 0 to PLAY_FOOD_MAX - 1 do
+		PlayFood[i].Active:= False;
 
 	// Spawns are written straight into Board here and go out with the
 	// board push below, so the deltas they generate are thrown away
@@ -4496,6 +5840,12 @@ procedure TSnakeGame.StopPlay;
 		PlaySnakes[i].Alive:= False;
 		PlayRespawn[i]:= 0;
 		end;
+
+	for i:= 0 to PLAY_FOOD_MAX - 1 do
+		PlayFood[i].Active:= False;
+
+	for i:= 0 to PLAY_BEE_CAP - 1 do
+		PlayBees[i].Active:= False;
 
 	// Back to the demo's own board - its bar, and its snakes laid out
 	// on the circuit. InitDemoSnakes writes them into Board, so the
@@ -4987,7 +6337,23 @@ procedure TSnakeGame.Tick;
 	// but the stack caps a payload at 235 = 1 + 78 x 3).
 	// TickDemoSnakes drops anything past the end rather than
 	// overrunning, so this is a ceiling, not an assumption.
-	SetLength(deltas, 48);
+	//
+	// Real play adds a lot on top of that. Up to PLAY_FOOD_MAX expiries
+	// plus one spawn (TickPlayFood); BEES ARE THE BIG ONE - every moving
+	// bee costs TWO cells, the one it left and the one it entered, so a
+	// full board of them at PLAY_BEE_CAP is 20 on its own. A spawning
+	// snake also sweeps its start area, a (2 * PLAY_SPAWN_CLEAR + 1)
+	// square, though only the non-floor cells there emit.
+	//
+	// 78 IS A HARD CEILING, not a comfortable round number: the stack
+	// caps a payload at 235 bytes and a delta is 3, so 1 + 78 x 3 = 235
+	// is exactly one message. Going above it would silently truncate on
+	// the wire rather than overflow here.
+	//
+	// EmitCell drops anything past the end rather than overrunning, and
+	// Board stays authoritative either way, so the worst case is a cell
+	// that looks stale until the next full sync - not a desync.
+	SetLength(deltas, 78);
 	Lock.Acquire;
 		try
 		claimed:= False;
@@ -5013,6 +6379,48 @@ procedure TSnakeGame.Tick;
 			deltaCount:= 0;
 
 			TickPlaySnakes(deltas, deltaCount);
+
+			// AFTER the snakes, so a piece of food that rots on the same
+			// tick as a head arrives on it has already been eaten - the
+			// snake gets it, rather than losing it by a tick.
+			TickPlayFood(deltas, deltaCount);
+			TickPlayBees(deltas, deltaCount);
+
+			// --- the level clock ---
+			//
+			// Run AFTER everything that moves, so a level that ends this
+			// tick rebuilds on top of a finished board rather than
+			// halfway through one.
+			if  LevelTicks > 0 then
+				begin
+				Dec(LevelTicks);
+
+				// The last-30-seconds ramp: one more bee, one gear
+				// quicker. Fires ONCE - LevelRamped is what both
+				// PlayBeeMax and BoardStepTicks read, so it has to latch
+				// rather than be re-tested.
+				if  (not LevelRamped)
+				and (LevelTicks <= PLAY_LEVEL_RAMP_TICKS) then
+					LevelRamped:= True;
+				end;
+
+			// Only on the wire when the DISPLAYED value changes - one
+			// message a second, not one a tick.
+			if  LevelSecsLeft <> LevelSecsSent then
+				begin
+				LevelSecsSent:= LevelSecsLeft;
+				GameStatusToAll;
+				end;
+
+			if  LevelTicks <= 0 then
+				begin
+				// Rebuilds and pushes the whole board itself, so the
+				// deltas gathered above are stale the moment it runs -
+				// drop them rather than sending a description of a board
+				// that no longer exists.
+				NextLevel;
+				Exit;
+				end;
 
 			if  deltaCount = 0 then
 				Exit;
@@ -5402,14 +6810,47 @@ procedure TSnakeGame.Remove(APlayer: TPlayer);
 procedure TSnakeGame.SendGameStatus(APlayer: TPlayer);
 	var
 	m: TBaseMessage;
+	t: AnsiString;
+	secs, c: Integer;
 
 	begin
 	m:= TBaseMessage.Create;
 	m.Category:= mcPlay;
 	m.Method:= $06;
 
-	SetLength(m.Data, 1);
+	// [state, secsLo, secsHi]. The seconds are new (2026-08-25) and are
+	// what drives the client's level clock.
+	//
+	// ON GameStatus RATHER THAN A NEW MESSAGE, deliberately. Method
+	// numbers are FOUR BITS - 16 per category, total - and $0F is the
+	// only one left; a clock is not what to spend it on. This message
+	// already carries board-wide state, the payload had 253 spare bytes,
+	// and the client reads fixed offsets and ignores trailing data.
+	//
+	// The consequence is that GameStatus is no longer sent only once, on
+	// join - it now arrives every second. The client had been treating
+	// its arrival AS the join confirmation, so it now has to latch that
+	// (see gameProcGameStatusMsg).
+	secs:= LevelSecsLeft;
+
+	SetLength(m.Data, 3 + PLAY_STATUS_LEN);
 	m.Data[0]:= Ord(State);
+	m.Data[1]:= secs and $FF;
+	m.Data[2]:= (secs shr 8) and $FF;
+
+	// The display text, already formatted. The raw seconds above are NOT
+	// redundant with it - the client needs a number to test against
+	// PLAY_STATUS_WARN_SECS, and parsing digits back out of its own
+	// display string to get one would be daft.
+	t:= 'LEVEL ' + Format('%2d', [LevelNumber])
+			+ '   TIME ' + IntToStr(secs div 60)
+			+ ':' + Format('%.2d', [secs mod 60]);
+
+	while Length(t) < PLAY_STATUS_LEN do
+		t:= t + ' ';
+
+	for c:= 1 to PLAY_STATUS_LEN do
+		m.Data[2 + c]:= Ord(t[c]);
 
     APlayer.AddSendMessage(m);
 	end;
@@ -5417,6 +6858,8 @@ procedure TSnakeGame.SendGameStatus(APlayer: TPlayer);
 procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
 	var
 	m: TBaseMessage;
+	s: AnsiString;
+	c: Integer;
 
 	begin
 	m:= TBaseMessage.Create;
@@ -5447,6 +6890,44 @@ procedure TSnakeGame.SendSlotStatus(APlayer: TPlayer; ASlot: Integer);
 	// payload had room and the client reads fixed offsets, so growing
 	// this message costs nothing and spends no method number.
 	m.Data[3]:= Slots[ASlot].Lives;
+
+	// Score, appended 2026-08-25, as PLAY_SCORE_DIGITS ASCII DIGITS
+	// rather than a binary number.
+	//
+	// Deliberate: the client's score row is a label, and a label wants
+	// text. Sending binary would buy four bytes on the wire and cost a
+	// 24-bit-to-decimal conversion on the client for a number the server
+	// has already got in a form it can print.
+	//
+	// The MEGA65 could do that conversion cheaply - the 45GS02 has a
+	// hardware divider at $D768 (dengland, 2026-08-25) - but leaning on
+	// it would put a 45GS02-only dependency in the client for no gain,
+	// and this codebase would rather stay portable to a plain 6502 where
+	// the choice is free. Which it is here: the server is the one machine
+	// in this system that formatting a number costs nothing on.
+	//
+	// Zero-padded to a FIXED WIDTH, which is what lets the client copy it
+	// into a fixed buffer with no length byte and no terminator handling.
+	// AddScore's clamp at PLAY_SCORE_MAX is what guarantees it never
+	// needs more digits than the label has room for.
+	s:= IntToStr(Slots[ASlot].Score);
+
+	while Length(s) < PLAY_SCORE_DIGITS do
+		s:= '0' + s;
+
+	SetLength(m.Data, 4 + PLAY_SCORE_DIGITS + 1);
+
+	for c:= 1 to PLAY_SCORE_DIGITS do
+		m.Data[3 + c]:= Ord(s[c]);
+
+	// Speed gear, appended 2026-08-25 - TICKS PER STEP, so SMALLER IS
+	// FASTER, the same convention the SNAKE_SPEED_* constants use. 0
+	// means nobody is playing this corner.
+	//
+	// Sent as the gear rather than as a bar length: how many cells a gear
+	// lights up is a display decision (dengland's own 1/1/1/2/2/3
+	// progression), and it belongs on the side that does the drawing.
+	m.Data[3 + PLAY_SCORE_DIGITS + 1]:= PlayGearFor(ASlot);
 
     APlayer.AddSendMessage(m);
 	end;

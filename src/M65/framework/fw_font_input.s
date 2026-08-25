@@ -165,6 +165,193 @@ userNOP:
 		RTI
 
 
+;===============================================================================
+; PANIC REPORT
+;
+; Built 2026-08-25 to chase an unhandled-interrupt lockup, and KEPT
+; (dengland: "leave the debug out routine and the panic diagnostic in
+; there"). It costs one byte of state and a handful of code on a path
+; that, in a healthy client, never executes at all.
+;
+; VERIFIED on hardware the day it was written, by poking a $00 over the
+; first byte of gamePollTick and checking the reported PC was exactly
+; that address + 2. Do the same after any change to userIRQ's prologue -
+; a reporter that prints a plausible WRONG address is worse than none,
+; because it will be believed.
+;===============================================================================
+
+;	Set once userIRQ has taken an unhandled-interrupt fault and reported
+;	it. Never cleared: the report is deliberately one-shot, see the call
+;	site.
+dbgPanicSeen:
+		.byte	$00
+
+;	THE FAULT, KEPT IN RAM as well as printed (dengland, 2026-08-25:
+;	"if we're not watching the serial we'll miss it").
+;
+;	The serial report is only seen by whoever happens to have the port
+;	open at that instant, and the port is exclusive - so most of the time
+;	nobody is listening. These four bytes survive until the next reload
+;	and can be read back over the monitor at any point afterwards, which
+;	makes an unattended crash just as diagnosable as a watched one.
+;
+;	CAPTURED BEFORE ANYTHING IS PRINTED, deliberately: VAL_HYPR_DBGOUT is
+;	a hypervisor trap per character and this is being called from inside
+;	an interrupt handler, which is not a combination anyone has tested.
+;	If that turns out to hang or misbehave, the evidence is already
+;	safely in RAM rather than lost with it.
+;
+;	Addresses shift on every build - pull them from the .dbg file rather
+;	than remembering them.
+dbgPanicPC:
+		.res	2
+dbgPanicP:
+		.byte	$00
+dbgPanicIRQ:
+		.byte	$00
+
+;-------------------------------------------------------------------------------
+;	dbgPanicReport - print what caused an unhandled interrupt, once, on
+;	the hypervisor serial debug port. Called from userIRQ's non-raster
+;	branch with the full IRQ frame still on the stack.
+;
+;	Output is one line:
+;
+;		!PANIC PC=xxxx P=xx IRQ=xx
+;
+;	PC   - where the fault came FROM. If it was a BRK this points just
+;	       PAST the offending byte (BRK is 2 bytes and pushes PC+2), so
+;	       a field of $00s reads as an address a little way into it.
+;	P    - the status pushed by the BRK/IRQ. BIT 4 SET MEANS BRK; clear
+;	       means a genuine interrupt from some source we never enabled.
+;	       This is the single byte that settles which it is.
+;	IRQ  - VAL_VIC_IRQFLGS, so if it is NOT a BRK we can still see
+;	       whether the VIC raised something (sprite collision, lightpen)
+;	       or whether it came from outside the VIC entirely.
+;
+;	THE STACK FRAME. userIRQ has pushed 6 bytes on top of the 3 the
+;	BRK/IRQ itself pushed. PLUS THE 2 THIS JSR PUSHED - so every offset
+;	below is shifted up by 2 from what it is at the call site. Getting
+;	that wrong reads Y and X and calls them a program counter, which
+;	looks entirely plausible and is entirely wrong.
+;
+;		$0103,X  elemptr0 + 1      $0108,X  P (from PHP)
+;		$0104,X  elemptr0          $0109,X  P (from BRK/IRQ)
+;		$0105,X  Y                 $010A,X  PCL
+;		$0106,X  X                 $010B,X  PCH
+;		$0107,X  A
+;
+;	If userIRQ's prologue ever changes, these offsets change with it.
+;-------------------------------------------------------------------------------
+dbgPanicReport:
+;-------------------------------------------------------------------------------
+;	CAPTURE FIRST. Nothing slow, nothing that can fail, and no JSR - so
+;	the stack offsets here are the ones documented above and the evidence
+;	is banked before the hypervisor traps below are ever attempted.
+		TSX
+
+		LDA	$010B, X			;PCH
+		STA	dbgPanicPC + 1
+		LDA	$010A, X			;PCL
+		STA	dbgPanicPC
+		LDA	$0109, X			;P as pushed - bit 4 = BRK
+		STA	dbgPanicP
+		LDA	VAL_VIC_IRQFLGS
+		STA	dbgPanicIRQ
+
+;	Then print, from the CAPTURED copy rather than from the stack again -
+;	so what goes out of the port and what stays in RAM cannot disagree.
+		LDX	#$00
+@banner:
+		LDA	dbgPanicText, X
+		BEQ	@frame
+
+		JSR	dbgPutChar
+
+		INX
+		BNE	@banner
+
+@frame:
+		LDA	dbgPanicPC + 1
+		JSR	dbgPutHex
+		LDA	dbgPanicPC
+		JSR	dbgPutHex
+
+		LDA	#' '
+		JSR	dbgPutChar
+		LDA	#'P'
+		JSR	dbgPutChar
+		LDA	#'='
+		JSR	dbgPutChar
+
+		LDA	dbgPanicP
+		JSR	dbgPutHex
+
+		LDA	#' '
+		JSR	dbgPutChar
+		LDA	#'I'
+		JSR	dbgPutChar
+		LDA	#'='
+		JSR	dbgPutChar
+
+		LDA	dbgPanicIRQ
+		JSR	dbgPutHex
+
+		LDA	#$0D
+		JSR	dbgPutChar
+		LDA	#$0A
+;		JMP	dbgPutChar
+;		RTS
+
+;-------------------------------------------------------------------------------
+;	dbgPutChar - one character out of the hypervisor serial debug port.
+;	The CLV is not optional - it is how the trap returns (dengland,
+;	2026-08-25). Slow: a hypervisor round trip per character.
+;	IN	.A		character
+;-------------------------------------------------------------------------------
+dbgPutChar:
+;-------------------------------------------------------------------------------
+		STA	VAL_HYPR_DBGOUT
+		CLV
+
+		RTS
+
+;-------------------------------------------------------------------------------
+;	dbgPutHex - one byte as two hex digits.
+;
+;	Table lookup rather than the usual compare-and-add-7 carry trick -
+;	there is no reason to be clever on a path that runs once, and this
+;	one cannot be got subtly wrong.
+;	IN	.A		byte
+;	USED	.A, .Y
+;-------------------------------------------------------------------------------
+dbgPutHex:
+;-------------------------------------------------------------------------------
+		PHA
+
+		LSR	A
+		LSR	A
+		LSR	A
+		LSR	A
+		TAY
+		LDA	dbgHexDigits, Y
+		JSR	dbgPutChar
+
+		PLA
+		AND	#$0F
+		TAY
+		LDA	dbgHexDigits, Y
+
+		JMP	dbgPutChar
+;		RTS
+
+dbgHexDigits:
+		.byte	"0123456789ABCDEF"
+
+dbgPanicText:
+		.byte	$0D, $0A, "!PANIC PC=", $00
+
+
 	.export	userIRQ
 ;-------------------------------------------------------------------------------
 userIRQ:
@@ -204,6 +391,29 @@ userIRQ:
 		
 ;	Some other interrupt source??  Peculiar...  And a real problem!  How
 ;	do I acknowledge it if its not a BRK when I don't know what it would be?
+;
+;	DIAGNOSTIC (2026-08-25): report the fault once over the hypervisor
+;	serial debug port, then carry on painting red exactly as before.
+;
+;	Because it is NOT acknowledged, whatever raised this fires again the
+;	instant we RTI - so this branch runs thousands of times a second and
+;	the red screen is really a livelock, not a single event. That is why
+;	the report is LATCHED: VAL_HYPR_DBGOUT is a hypervisor trap per
+;	character and would otherwise bury the one line that matters under
+;	thousands of identical ones. What gets printed is the FIRST fault,
+;	which is the only one that says anything.
+;
+;	A/X/Y are all saved above and restored below, so this is free to
+;	use them.
+		LDA	dbgPanicSeen
+		BNE	@red
+
+		LDA	#$01
+		STA	dbgPanicSeen
+
+		JSR	dbgPanicReport
+
+@red:
 		LDA	#$02
 		STA	VAL_VIC_BRDRCLR
 		STA	VAL_VIC_BKGDCLR

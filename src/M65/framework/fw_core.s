@@ -282,6 +282,19 @@ VAL_VIC_SPRCLR1	= 	$D028
 VAL_VIC_SPRCLR2	= 	$D029
 VAL_VIC_SPRCLR3	= 	$D02A
 
+;	HYPERVISOR SERIAL DEBUG OUT. Storing a character here traps to the
+;	hypervisor, which puts it out on the serial debug interface - i.e.
+;	it appears in whatever is watching the monitor port, with no
+;	handshake to poll and nothing to configure.
+;
+;	The store MUST be followed by CLV - that is how the trap returns.
+;	See dbgPutChar (fw_font_input.s), which is the only caller.
+;
+;	SLOW (dengland, 2026-08-25 - a hypervisor round trip per BYTE), so
+;	this is for one-shot diagnostics only. Never put it on a path that
+;	runs per frame, let alone per character of real output.
+VAL_HYPR_DBGOUT	=	$D643
+
 SID     	= 	$D400         		; SID REGISTERS
 SID_ADConv1    	= 	SID + $19
 SID_ADConv2    	= 	SID + $1A

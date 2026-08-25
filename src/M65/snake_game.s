@@ -80,6 +80,7 @@ gameStateInit:
 		STA	boardSyncDone
 		STA	boardSyncReqFrame
 		STA	gameState
+		STA	gameJoinDone
 		STA	gameWatching
 		STA	gameBkgPresented
 		STA	gameBoardSyncPending
@@ -93,6 +94,8 @@ gameStateInit:
 		LDX	#$03
 @clrslots:
 		STA	slotStates, X
+		STA	slotLives, X
+		STA	slotSpeed, X
 		DEX
 		BPL	@clrslots
 
@@ -130,6 +133,10 @@ gameResetPlayGame:
 		LDA	#$00
 		STA	boardSyncWaiting
 		STA	boardSyncDone
+
+;	The next connection's first GameStatus is a fresh join, so the latch
+;	has to be armed again or clientPlayJoinedSelf never fires for it.
+		STA	gameJoinDone
 
 ;	Also forget whatever we'd last told the server about watching -
 ;	the connection that heard WatchStart is gone, so gamePollTick needs
@@ -229,14 +236,66 @@ SNAKE_DIR_NONE  = $FF
 ;	drawn right to left.
 ;
 ;	Drawn straight to screen RAM rather than put in the label's text,
-;	because it CANNOT go through a label: screenCharXlat maps ASCII to
-;	screen codes and folds everything from $7F up onto $66, so the
-;	reachable output range is only $00..$3F. $DC is not expressible as
-;	label text at all.
+;	Written straight to screen RAM by gameLivesPresent, because it CANNOT
+;	go through a label: screenASCIIToScreen folds everything from $7F up
+;	onto $66, so the reachable output range for label text is only
+;	$00..$3F. $DC is not expressible that way at all.
 ;
-;	10 fits the HUD column exactly (each block is $0A wide).
+;	10 fits the HUD column exactly (each block is $0A wide). A bonus life
+;	can push a corner past it, so the present hook clamps.
 LIVES_PIP_CHAR  = $DC
 LIVES_PIP_MAX   = 10
+
+;	SPEED BAR. The corner's PWR2 row is a left-to-right gauge of how fast
+;	that snake is currently moving - one $00A0 solid block per cell
+;	(dengland, 2026-08-25). Written straight to screen RAM for the same
+;	reason the lives pips are: $A0 is well past what label text can
+;	reach.
+;
+;	The server sends the GEAR (ticks per step, so SMALLER IS FASTER - see
+;	SendSlotStatus), not a cell count: how many cells a gear lights up is
+;	a display decision and belongs on this side.
+;
+;	The progression is dengland's own - 1, 1, 1, 2, 2, 3 more cells per
+;	gear, i.e. 1, 2, 3, 5, 7, 10 lit. It ACCELERATES on purpose: the six
+;	gears are 2.0, 2.4, 3.0, 4.0, 6.0 and 12.0 steps/sec, so an even
+;	six-step ramp would badly understate what top gear feels like. It
+;	fills the whole 10-wide block exactly at TOP.
+;
+;	Indexed by the gear byte directly, so entry 0 is the "nobody is
+;	playing this corner" case and lights nothing.
+SPEED_BAR_CHAR  = $A0
+
+;	COLOURED BY GEAR (dengland, 2026-08-25), not one fixed colour - so
+;	the row says how fast you are twice over, by length and by hue, and
+;	a speed food reads at a glance without counting cells.
+;
+;	Red at the bottom through to white at the top, which is a heat ramp:
+;	the bar looks like it is being driven harder as it fills. Note two
+;	gears deliberately SHARE light green - dengland's own list - so the
+;	colour changes at four points along a six-gear ladder rather than
+;	every gear, and the ones that do change land where the speed jumps
+;	are biggest.
+;
+;	Raw palette values, not scheme indices - see gameHudFillClr.
+gameSpeedClrs:
+		.byte	$00				;0 - unclaimed, unused
+		.byte	CLR_LOG_C64_WHITE		;1 - TOP      12.0/sec
+		.byte	CLR_LOG_C64_LIGHTGREEN		;2 - FASTEST   6.0
+		.byte	CLR_LOG_C64_LIGHTGREEN		;3 - FAST      4.0
+		.byte	CLR_LOG_C64_YELLOW		;4 - NORMAL    3.0
+		.byte	CLR_LOG_C64_ORANGE		;5 - SLOW      2.4
+		.byte	CLR_LOG_C64_RED			;6 - VSLOW     2.0
+
+gameSpeedCells:
+		.byte	$00			;0 - unclaimed
+		.byte	10			;1 - TOP      12.0/sec
+		.byte	7			;2 - FASTEST   6.0
+		.byte	5			;3 - FAST      4.0
+		.byte	3			;4 - NORMAL    3.0
+		.byte	2			;5 - SLOW      2.4
+		.byte	1			;6 - VSLOW     2.0
+SPEED_GEAR_MAX  = 6
 
 ;	TPlayerState's psPlaying ordinal (SnakeClasses.pas: psNone, psIdle,
 ;	psReady, psPreparing, psWaiting, psPlaying, ...) - what SlotStatus
@@ -344,18 +403,104 @@ gameLastDir:
 gameJoyLast:
 		.byte	$FF
 
-;	Lives remaining on each corner, from SlotStatus's 4th payload byte
-;	(see gameProcSlotStatusMsg). Drawn as pips by gameLivesPresent.
+;	The status line above the board - "LEVEL  1   TIME 1:59" - as the
+;	server formatted it (see SendGameStatus). Fixed width, so this is a
+;	straight copy with no terminator to write: the NUL is part of the
+;	initialised data and never moves.
+;
+;	label_detail_status points permanently in here, the same arrangement
+;	the score rows use.
+STATUS_TEXT_LEN = 20
+
+statusText:
+		.asciiz	"                    "
+
+;	1 once this client has been told it is in the game. GameStatus used
+;	to arrive exactly ONCE, on join, so its arrival WAS the confirmation -
+;	but it now carries the level clock and arrives every second, so the
+;	join half has to fire only on the first one (see
+;	gameProcGameStatusMsg).
+gameJoinDone:
+		.byte	$00
+
+;	Seconds at or below which the status line turns red. Matches
+;	PLAY_STATUS_WARN_SECS on the server - the last 30 seconds are when
+;	the level ramps (an extra bee and a gear quicker), so the colour is
+;	reporting a real change, not just counting down.
+STATUS_WARN_SECS = 30
+
+;	Each corner's score, as the SIX ASCII DIGITS the server sent (see
+;	TSnakeGame.SendSlotStatus - the score goes on the wire already
+;	formatted, so nothing here has to divide anything).
+;
+;	These are the actual TEXT of the four score labels, not a copy of it:
+;	label_detail_scoreN's textptr points straight in here, so updating a
+;	score is a 6-byte copy plus an invalidate, with no separate render
+;	step. Initialised rather than .res'd because they are live text from
+;	the moment the page first draws, which is before any SlotStatus has
+;	necessarily arrived.
+;
+;	SCORE_TEXT_SIZE is 7, not 6 - the NUL each .asciiz adds is what the
+;	label's own draw stops on.
+SCORE_TEXT_LEN  = 6
+SCORE_TEXT_SIZE = SCORE_TEXT_LEN + 1
+
+slotScoreText:
+		.asciiz	"000000"
+		.asciiz	"000000"
+		.asciiz	"000000"
+		.asciiz	"000000"
+
+;	Where each corner's digits start. A table rather than a multiply by
+;	SCORE_TEXT_SIZE, which is neither a shift nor worth a loop for four
+;	entries.
+gameScoreTexts:
+		.word	slotScoreText + (0 * SCORE_TEXT_SIZE)
+		.word	slotScoreText + (1 * SCORE_TEXT_SIZE)
+		.word	slotScoreText + (2 * SCORE_TEXT_SIZE)
+		.word	slotScoreText + (3 * SCORE_TEXT_SIZE)
+
+;	Lives remaining and current speed gear on each corner, from
+;	SlotStatus's last three payload bytes (see gameProcSlotStatusMsg).
+;	Drawn as bars by gameLivesPresent/gameSpeedPresent.
+;
+;	These have to be KEPT, not just drawn once and forgotten: a present
+;	hook can run at any time - a page re-entry, a panel repaint by some
+;	unrelated control - and it has to be able to redraw the row from
+;	scratch without a fresh message from the server.
 slotLives:
 		.res	$04
+slotSpeed:
+		.res	$04
 
-;	Scratch for gameLivesPresent - it has to hold the corner index and
-;	the pip count across the screen-pointer setup.
-gameLivesTmp:
+;	Scratch for gameHudBarPresent and its two DMA helpers. A present hook
+;	has both index registers busy (one for the screen row, one for table
+;	lookups) and cannot keep any of this in registers.
+gameHudKind:
 		.byte	$00
-gameLivesCol:
+gameHudCorner:
 		.byte	$00
-gameLivesClr:
+gameHudCount:
+		.byte	$00
+gameHudGap:
+		.byte	$00
+gameHudChar:
+		.byte	$00
+gameHudClr:
+		.byte	$00
+gameHudRow:
+		.byte	$00
+gameHudLeft:
+		.byte	$00
+gameHudWidth:
+		.byte	$00
+gameHudCol:
+		.byte	$00
+gameHudLen:
+		.byte	$00
+gameHudFillVal:
+		.byte	$00
+gameHudTmp:
 		.byte	$00
 
 ;	1 once WatchStart (mcPlay/$0C) has been sent to the server - i.e.
@@ -903,9 +1048,392 @@ gameDetailBkgPresent:
 
 
 ;-------------------------------------------------------------------------------
+;	THE HUD ROWS.
+;
+;	Each corner's 5-row block on page_detail is [START button, score,
+;	lives, speed, blank]. The SCORE row is ordinary label text; the LIVES
+;	and SPEED rows are graphic bars, drawn by the present hooks below
+;	INSTEAD OF the framework's default one.
+;
+;	WHY NOT LABEL TEXT: screenASCIIToScreen folds every character from
+;	$7F up onto $66, so label text cannot reach $A0 (solid block) or $DC
+;	(pip) at all. Giving those two codes an ASCII name in
+;	screenASCIIXLAT was tried and backed out (dengland, 2026-08-25) - it
+;	claims two printable characters framework-wide, INCLUDING inside
+;	usernames and chat, which go through the same translation, and it
+;	puts two more comparisons in front of every ordinary character drawn.
+;	A control that wants graphics fills them itself.
+;
+;	WHY NOT ctrlsControlDefPresent AND THEN OVERDRAW: that erases the row
+;	with one DMA job and then paints part of it again, doing the same
+;	cells twice and briefly showing the wrong thing. These hooks REPLACE
+;	the default present and lay the row down in one pass - two character
+;	fills (the bar, and the gap beside it) and one colour fill, all DMA,
+;	no per-cell writes and nothing drawn twice.
+;-------------------------------------------------------------------------------
+
+;	Which of the two bars a present call is for. Parked by the two entry
+;	points below for their shared tail, since .A cannot carry it across
+;	the state and tag reads.
+HUD_KIND_LIVES  = $00
+HUD_KIND_SPEED  = $01
+
+;	Screen code for an empty cell - what the gap beside a bar is filled
+;	with. Not $20-the-character: this goes straight to screen RAM without
+;	passing through any translation, so it is a SCREEN CODE, and it only
+;	happens to be the same number.
+HUD_BLANK_CHAR  = $20
+
+;-------------------------------------------------------------------------------
+;	gameLivesPresent / gameSpeedPresent - present hooks for the four
+;	corners' lives and speed rows. Each control's TAG byte says which
+;	corner it is, so one pair of handlers covers all eight rows.
+;
+;	Present hooks rather than a one-off draw, because the HUD panel
+;	repaints its own background on every dirty pass - anything painted
+;	over the top from outside would be wiped by the next repaint. This
+;	way the bar is drawn by the same pass that would have erased it,
+;	which is also how the label they replace worked.
+;-------------------------------------------------------------------------------
+gameLivesPresent:
+;-------------------------------------------------------------------------------
+		LDA	#HUD_KIND_LIVES
+		JMP	gameHudBarPresent
+
+;-------------------------------------------------------------------------------
+gameSpeedPresent:
+;-------------------------------------------------------------------------------
+		LDA	#HUD_KIND_SPEED
+;		JMP	gameHudBarPresent
+
+;-------------------------------------------------------------------------------
+;	gameHudBarPresent - the shared tail. Works out how long this corner's
+;	bar is and what colour, then lays the whole row down in three DMA
+;	jobs.
+;
+;	The VISIBLE/DIRTY gates are ctrlsControlDefPresent's own, repeated
+;	here because this REPLACES it rather than calling it. The dirty flag
+;	itself is cleared by the caller after the hook returns (see
+;	ctrlsPanelDefPresent), so nothing here touches it.
+;
+;	The control's own colour byte is deliberately NOT consulted - both
+;	kinds work theirs out below. That leaves CLR_PAPER sitting unused in
+;	these four defs, which is honest: it is what the row would be if the
+;	default present ever ran on it.
+;	IN	elemptr0	the control
+;		.A		HUD_KIND_*
+;-------------------------------------------------------------------------------
+gameHudBarPresent:
+;-------------------------------------------------------------------------------
+		STA	gameHudKind
+
+		LDY	#ELEMENT::state
+		LDA	(elemptr0), Y
+		AND	#STATE_VISIBLE
+		LBEQ	@exit
+
+		LDA	(elemptr0), Y
+		AND	#STATE_DIRTY
+		LBEQ	@exit
+
+		LDY	#ELEMENT::tag
+		LDA	(elemptr0), Y
+		CMP	#$04
+		LBCS	@exit				;bad tag - shouldn't happen
+
+		STA	gameHudCorner
+		TAX
+
+;	An unclaimed corner shows nothing at all. That falls out of a count
+;	of zero - the gap fill then covers the whole row - so there is no
+;	separate "erase it" path to keep in step with this one.
+		LDA	slotStates, X
+		CMP	#PLAYER_STATE_PLAYING
+		BNE	@empty
+
+		LDA	gameHudKind
+		BEQ	@lives
+
+;-------------------------------------------------------------------------------
+;	SPEED. The gear comes straight off the wire, so it is bounds-checked
+;	against the table rather than trusted.
+;
+;	Coloured by GEAR, deliberately not by corner like the lives row: this
+;	bar is not meant to identify whose row it is, it is meant to say how
+;	fast. X still holds the gear from the bounds check, which is the same
+;	index both tables want.
+;-------------------------------------------------------------------------------
+		LDA	slotSpeed, X
+		CMP	#SPEED_GEAR_MAX + 1
+		BCS	@empty
+
+		TAX
+		LDA	gameSpeedCells, X
+		STA	gameHudCount
+
+		LDA	#SPEED_BAR_CHAR
+		STA	gameHudChar
+
+		LDA	gameSpeedClrs, X
+		STA	gameHudClr
+
+		JMP	@geom
+
+;-------------------------------------------------------------------------------
+;	LIVES. Clamped because a bonus life can push a corner past what the
+;	block is wide.
+;
+;	Coloured as that corner's snake BODY, taken from gameTileColrs rather
+;	than hardcoded per control, so a palette change moves the HUD and the
+;	board together. Body tile for player p is TILE_SNAKE_BASE +
+;	(p * SNAKE_ROLE_COUNT + SNAKE_ROLE_BODY) * SHAPE_COUNT; every shape
+;	in the block shares one colour, and SNAKE_ROLE_BODY is 0, so that
+;	reduces to base + p * 12.
+;
+;	Those table entries are RAW PALETTE values (CLR_LOG_C64_*), which is
+;	exactly what colour RAM wants - no scheme lookup, and none of the
+;	CLR_SPEC_TEXT business a control colour byte would have needed.
+;-------------------------------------------------------------------------------
+@lives:
+		LDA	slotLives, X
+		CMP	#LIVES_PIP_MAX + 1
+		BCC	@count
+
+		LDA	#LIVES_PIP_MAX
+
+@count:
+		STA	gameHudCount
+
+		LDA	#LIVES_PIP_CHAR
+		STA	gameHudChar
+
+		LDA	gameHudCorner
+		ASL	A
+		ASL	A
+		ASL	A				;p * 8
+		STA	gameHudTmp
+		LDA	gameHudCorner
+		ASL	A
+		ASL	A				;p * 4
+		CLC
+		ADC	gameHudTmp			;p * 12
+		CLC
+		ADC	#TILE_SNAKE_BASE
+		TAX
+
+		LDA	gameTileColrs, X
+		STA	gameHudClr
+
+		JMP	@geom
+
+;	Nothing to show. Colour still matters - the row is about to be filled
+;	edge to edge with blanks, and they have to be SOME colour.
+@empty:
+		LDA	#$00
+		STA	gameHudCount
+		STA	gameHudChar
+		STA	gameHudClr
+
+@geom:
+		LDY	#ELEMENT::posy
+		LDA	(elemptr0), Y
+		STA	gameHudRow
+
+		LDY	#ELEMENT::posx
+		LDA	(elemptr0), Y
+		STA	gameHudLeft
+
+		LDY	#ELEMENT::width
+		LDA	(elemptr0), Y
+		STA	gameHudWidth
+
+;	A bar can never be longer than its own block, whatever the tables
+;	say - and if it were, the gap subtraction below would go negative and
+;	hand dmaFillRow a count of ~250.
+		CMP	gameHudCount
+		BCS	@fill
+
+		STA	gameHudCount
+
+@fill:
+;	Colour across the WHOLE width first, so the gap beside the bar is the
+;	same colour as the bar. It is one row, not a bar sitting on some
+;	other background - and it means the colour job is one fill whichever
+;	way the bar is aligned.
+		JSR	gameHudFillClr
+
+;	Then the two character runs. Which one is on the left depends on the
+;	bar: lives drain RIGHT TO LEFT, so the row reads as a gauge emptying
+;	toward the left, and speed fills LEFT TO RIGHT, so a longer bar means
+;	faster at a glance. One gauge going down, one going up - both
+;	dengland's own call.
+		LDA	gameHudWidth
+		SEC
+		SBC	gameHudCount
+		STA	gameHudGap
+
+		LDA	gameHudKind
+		BEQ	@right
+
+;	Speed - bar at the left edge, gap after it.
+		LDA	gameHudLeft
+		STA	gameHudCol
+		LDA	gameHudCount
+		STA	gameHudLen
+		LDA	gameHudChar
+		JSR	gameHudFillChars
+
+		LDA	gameHudLeft
+		CLC
+		ADC	gameHudCount
+		STA	gameHudCol
+		LDA	gameHudGap
+		STA	gameHudLen
+		LDA	#HUD_BLANK_CHAR
+
+		JMP	gameHudFillChars
+;		RTS
+
+;	Lives - gap first, bar hard against the right edge.
+@right:
+		LDA	gameHudLeft
+		STA	gameHudCol
+		LDA	gameHudGap
+		STA	gameHudLen
+		LDA	#HUD_BLANK_CHAR
+		JSR	gameHudFillChars
+
+		LDA	gameHudLeft
+		CLC
+		ADC	gameHudGap
+		STA	gameHudCol
+		LDA	gameHudCount
+		STA	gameHudLen
+		LDA	gameHudChar
+
+		JMP	gameHudFillChars
+;		RTS
+
+@exit:
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameHudFillChars - one DMA fill: gameHudLen cells of screen code .A,
+;	starting at column gameHudCol on row gameHudRow.
+;
+;	Columns are doubled because CHR16 cells are 2 bytes wide; dmaFillRow's
+;	own dest-skip of 2 then writes only the LOW byte of each, leaving the
+;	$00 high byte initMem put there - the same trick ctrlsEraseBkg uses,
+;	and the reason a 16-bit screen can be filled with an 8-bit job.
+;
+;	A count of ZERO IS NOT DRAWN. That is not an optimisation: a DMA job
+;	count of 0 is a real hardware hazard on this platform, not a harmless
+;	no-op, which is why ctrlsEraseBkg guards its own call the same way.
+;	Both callers above genuinely produce zero - an empty bar has no bar,
+;	a full one has no gap.
+;	IN	gameHudRow	screen row
+;		gameHudCol	first column
+;		gameHudLen	cells
+;		.A		screen code to fill with
+;-------------------------------------------------------------------------------
+gameHudFillChars:
+;-------------------------------------------------------------------------------
+		STA	gameHudFillVal
+
+		LDA	gameHudLen
+		BEQ	@exit
+
+		LDX	gameHudRow
+
+		LDA	gameHudCol
+		ASL	A				;2 bytes per cell
+		STA	gameHudTmp
+
+		LDA	screenRowsLo, X
+		CLC
+		ADC	gameHudTmp
+		STA	dmaDst
+		LDA	screenRowsHi, X
+		ADC	#$00
+		STA	dmaDst + 1
+
+		LDA	#$01				;screen RAM is at $010000
+		STA	dmaDstBank
+
+		LDA	gameHudLen
+		STA	dmaCnt
+
+		LDA	gameHudFillVal
+
+		JMP	dmaFillRow
+;		RTS
+
+@exit:
+		RTS
+
+
+;-------------------------------------------------------------------------------
+;	gameHudFillClr - one DMA fill of gameHudClr across the control's whole
+;	width, on row gameHudRow starting at column gameHudLeft.
+;
+;	+1 on the byte offset because under FCLRHI the system colour value
+;	lives in the HIGH byte of a colour cell (see STCOLR16) - the low byte
+;	stays whatever initMem's boot-time zero-fill left it as. Colour rows
+;	share the SCREEN row's low byte and take their high byte from
+;	colourRowsHiPhys, because colour RAM's real physical address is
+;	$01F800, not $D800.
+;	IN	gameHudRow	screen row
+;		gameHudLeft	first column
+;		gameHudWidth	cells
+;		gameHudClr	raw palette colour
+;-------------------------------------------------------------------------------
+gameHudFillClr:
+;-------------------------------------------------------------------------------
+		LDA	gameHudWidth
+		BEQ	@exit				;zero-count DMA is a hazard
+
+		LDX	gameHudRow
+
+		LDA	gameHudLeft
+		ASL	A				;2 bytes per cell
+		CLC
+		ADC	#$01				;colour is the HIGH byte
+		STA	gameHudTmp
+
+		LDA	screenRowsLo, X
+		CLC
+		ADC	gameHudTmp
+		STA	dmaDst
+		LDA	colourRowsHiPhys, X
+		ADC	#$00
+		STA	dmaDst + 1
+
+		LDA	#$01				;colour RAM is at $01F800
+		STA	dmaDstBank
+
+		LDA	gameHudWidth
+		STA	dmaCnt
+
+		LDA	gameHudClr
+		AND	#$0F
+
+		JMP	dmaFillRow
+;		RTS
+
+@exit:
+		RTS
+
+
+;-------------------------------------------------------------------------------
 ;	gameLivesInvalidate - mark one corner's lives row for redraw.
 ;	Preserves X, which the caller (gameProcSlotStatusMsg) is still using
 ;	as the corner index afterwards.
+;
+;	Three near-identical routines here rather than one taking a table
+;	pointer: the pointer would have to live in zero page to be indexed
+;	indirectly, and borrowing a framework temp for it across
+;	ctrlsControlInvalidate is not worth saving a dozen bytes.
 ;	IN	.X		corner 0..3
 ;-------------------------------------------------------------------------------
 gameLivesInvalidate:
@@ -940,136 +1468,78 @@ gameLivesCtrls:
 
 
 ;-------------------------------------------------------------------------------
-;	gameLivesPresent - the four corners' PWR1 rows draw the corner's
-;	remaining lives as pips instead of label text. One handler for all
-;	four; each control's TAG byte says which corner it is.
+;	gameScoreInvalidate - as above, for the score row.
 ;
-;	A present hook rather than a one-off draw, because the HUD panel
-;	repaints its own background on every dirty pass - anything painted
-;	over the top from outside would be wiped by the next repaint. This
-;	way the pips are redrawn by the same pass that would have erased
-;	them, which is also how the label they replace worked.
-;
-;	Pips fill RIGHT TO LEFT from the end of the block (dengland,
-;	2026-08-25), so the row reads as a gauge draining toward the left
-;	rather than a string growing rightward.
+;	No present hook to go with this one: the score really IS label text.
+;	Each score label points permanently at its own slotScoreText buffer,
+;	which gameProcSlotStatusMsg writes the server's digits into, so all
+;	this has to do is set the dirty flag.
+;	IN	.X		corner 0..3
 ;-------------------------------------------------------------------------------
-gameLivesPresent:
+gameScoreInvalidate:
 ;-------------------------------------------------------------------------------
-		LDY	#ELEMENT::tag
-		LDA	(elemptr0), Y
-		TAX
 		CPX	#$04
-		BCS	@present			;bad tag - just present as-is
+		BCS	@exit				;defensive - shouldn't happen
 
-;	Colour this row as that corner's snake BODY before presenting, so
-;	the framework's own erase/draw paints in it and nothing here has to
-;	touch colour RAM by hand.
-;
-;	CLR_SPEC_TEXT is the escape hatch for exactly this: control colours
-;	are normally SCHEME indices remapped through current_clrs, but
-;	screenCtrlToLogClr tests BIT #$30 first and, if either CLR_SPEC_*
-;	bit is set, masks to the low nibble and returns it untouched. So a
-;	raw palette colour can be carried in a control's own colour byte.
-;	(dengland pointed this out - I had gone and written colour RAM
-;	directly, which worked but bypassed the framework for no reason.)
-;
-;	Taken from gameTileColrs rather than hardcoded per control, so a
-;	palette change moves the HUD and the board together. Body tile for
-;	player p is TILE_SNAKE_BASE + (p * SNAKE_ROLE_COUNT +
-;	SNAKE_ROLE_BODY) * SHAPE_COUNT; every shape in the block shares one
-;	colour, and SNAKE_ROLE_BODY is 0, so that reduces to base + p * 12.
 		TXA
-		ASL	A				;p * 2
-		ASL	A				;p * 4
-		ASL	A				;p * 8
-		STA	gameLivesClr
-		TXA
-		ASL	A
-		ASL	A				;p * 4
-		CLC
-		ADC	gameLivesClr			;p * 12
-		CLC
-		ADC	#TILE_SNAKE_BASE
-		TAY
+		PHA
 
-		LDA	gameTileColrs, Y
-		ORA	#CLR_SPEC_TEXT
-		LDY	#ELEMENT::colour
-		STA	(elemptr0), Y
-
-@present:
-		JSR	ctrlsControlDefPresent
-
-;	Only paint pips for a corner that is actually being played. An
-;	unclaimed corner shows nothing at all - a row of zero pips, which
-;	the erase above has already left behind.
-		LDY	#ELEMENT::tag
-		LDA	(elemptr0), Y
+		ASL	A				;word table
 		TAX
-		CPX	#$04
-		BCS	@bail
 
-		LDA	slotStates, X
-		CMP	#PLAYER_STATE_PLAYING
-		BNE	@bail
+		LDA	gameScoreCtrls, X
+		STA	elemptr0
+		LDA	gameScoreCtrls + 1, X
+		STA	elemptr0 + 1
 
-		LDA	slotLives, X
-		BNE	@havelives
+		JSR	ctrlsControlInvalidate
 
-;	Nothing to draw. Its own RTS rather than a branch to the one at the
-;	end - the pip setup below is long enough that @exit is out of
-;	branch range from up here.
-@bail:
-		RTS
-
-@havelives:
-		CMP	#LIVES_PIP_MAX + 1
-		BCC	@count
-
-		LDA	#LIVES_PIP_MAX			;clamp - the block is only 10 wide
-
-@count:
-		STA	gameLivesTmp
-
-;	Screen row for this control, via the same row tables the board
-;	render uses. Only the CHARACTERS are written here - the colour is
-;	already correct, painted by the present above from this control's
-;	own colour byte (see the CLR_SPEC_TEXT note at the top).
-		LDY	#ELEMENT::posy
-		LDA	(elemptr0), Y
-		TAY
-
-		LDA	screenRowsLo, Y
-		STA	tempptr0
-		LDA	screenRowsHi, Y
-		STA	tempptr0 + 1
-		LDA	#$01				;bank - screen RAM is at $010000
-		STA	tempptr0 + 2
-		LDA	#$00				;top
-		STA	tempptr0 + 3
-
-;	Start at the RIGHTMOST cell of the control and walk left, so the
-;	pips are anchored to the end of the block however many there are.
-		LDY	#ELEMENT::posx
-		LDA	(elemptr0), Y
-		LDY	#ELEMENT::width
-		CLC
-		ADC	(elemptr0), Y
-		SEC
-		SBC	#$01
-		STA	gameLivesCol
-
-@loop:
-		LDA	#LIVES_PIP_CHAR
-		STCELL16 tempptr0, gameLivesCol
-
-		DEC	gameLivesCol
-		DEC	gameLivesTmp
-		BNE	@loop
+		PLA
+		TAX
 
 @exit:
 		RTS
+
+gameScoreCtrls:
+		.word	label_detail_score0
+		.word	label_detail_score1
+		.word	label_detail_score2
+		.word	label_detail_score3
+
+
+;-------------------------------------------------------------------------------
+;	gameSpeedInvalidate - as above, for the speed row.
+;	IN	.X		corner 0..3
+;-------------------------------------------------------------------------------
+gameSpeedInvalidate:
+;-------------------------------------------------------------------------------
+		CPX	#$04
+		BCS	@exit				;defensive - shouldn't happen
+
+		TXA
+		PHA
+
+		ASL	A				;word table
+		TAX
+
+		LDA	gameSpeedCtrls, X
+		STA	elemptr0
+		LDA	gameSpeedCtrls + 1, X
+		STA	elemptr0 + 1
+
+		JSR	ctrlsControlInvalidate
+
+		PLA
+		TAX
+
+@exit:
+		RTS
+
+gameSpeedCtrls:
+		.word	label_detail_pwr2_0
+		.word	label_detail_pwr2_1
+		.word	label_detail_pwr2_2
+		.word	label_detail_pwr2_3
 
 
 ;-------------------------------------------------------------------------------
@@ -1510,8 +1980,62 @@ gameProcGameStatusMsg:
 		LDA	readmsg0 + 2
 		STA	gameState
 
+;	Status line - STATUS_TEXT_LEN characters, already formatted by the
+;	server, straight into the label's own text.
+		LDY	#STATUS_TEXT_LEN - 1
+@copystatus:
+		LDA	readmsg0 + 5, Y
+		STA	statusText, Y
+		DEY
+		BPL	@copystatus
+
+;	Red for the last STATUS_WARN_SECS, ordinary text colour otherwise.
+;	Set on the control here rather than from a present hook because it is
+;	a plain label - the framework's own draw picks the colour up, and
+;	CLR_SPEC_TEXT is what lets a raw palette value ride in the control's
+;	colour byte (see gameHudBarPresent for the full note).
+;
+;	The seconds arrive as a separate 16-bit count precisely so this test
+;	needs no digit parsing.
+		LDA	readmsg0 + 4			;seconds, high byte
+		BNE	@normal				;over 255 left - plenty
+
+		LDA	readmsg0 + 3			;seconds, low byte
+		CMP	#STATUS_WARN_SECS + 1
+		BCS	@normal
+
+		LDA	#CLR_LOG_C64_RED | CLR_SPEC_TEXT
+		BRA	@setclr
+
+@normal:
+		LDA	#CLR_LOG_C64_WHITE | CLR_SPEC_TEXT
+
+@setclr:
+		LDX	#<label_detail_status
+		STX	elemptr0
+		LDX	#>label_detail_status
+		STX	elemptr0 + 1
+
+		LDY	#ELEMENT::colour
+		STA	(elemptr0), Y
+
+		JSR	ctrlsControlInvalidate
+
+;	The JOIN half fires only on the FIRST GameStatus. This message used
+;	to arrive exactly once, so its arrival was the confirmation; it now
+;	carries the level clock and arrives every second, and re-running the
+;	join handling on each one would flip the Join/Part buttons about
+;	once a second forever.
+		LDA	gameJoinDone
+		BNE	@exit
+
+		LDA	#$01
+		STA	gameJoinDone
+
 		JMP	clientPlayJoinedSelf
-;		RTS
+
+@exit:
+		RTS
 
 
 ;-------------------------------------------------------------------------------
@@ -1536,13 +2060,45 @@ gameProcSlotStatusMsg:
 		LDA	readmsg0 + 3			;state
 		STA	slotStates, X
 
+;	Score - SCORE_TEXT_LEN ASCII digits, copied straight into this
+;	corner's label text. The server sends it already formatted and
+;	zero-padded to a fixed width, so there is nothing to convert and no
+;	terminator to write: the NUL after each buffer is part of the
+;	initialised data and never moves.
+;
+;	Done BEFORE any JSR below, so nothing can be using tempptr0 in
+;	between.
+		TXA
+		ASL	A				;word table
+		TAY
+
+		LDA	gameScoreTexts, Y
+		STA	tempptr0
+		LDA	gameScoreTexts + 1, Y
+		STA	tempptr0 + 1
+
+		LDY	#SCORE_TEXT_LEN - 1
+@copyscore:
+		LDA	readmsg0 + 6, Y
+		STA	(tempptr0), Y
+		DEY
+		BPL	@copyscore
+
 		LDA	readmsg0 + 5			;lives
 		STA	slotLives, X
 
-;	The pips live on this corner's PWR1 row and are only redrawn by its
-;	present hook, so a life lost has to invalidate that control or the
-;	row keeps showing the old count until something else dirties it.
+;	Speed gear - the byte after the score digits. Ticks per step, so
+;	smaller is faster; gameSpeedPresent turns it into a bar length.
+		LDA	readmsg0 + 6 + SCORE_TEXT_LEN
+		STA	slotSpeed, X
+
+;	All three rows are only redrawn by their own present hook (or, for
+;	the score, its own label draw), so each has to be invalidated or it
+;	keeps showing the old value until something unrelated dirties the
+;	panel. All three preserve X.
 		JSR	gameLivesInvalidate
+		JSR	gameScoreInvalidate
+		JSR	gameSpeedInvalidate
 
 ;	If this is OUR corner, forget what direction we last sent. A death
 ;	respawns the snake on a fresh heading chosen by the server, and
@@ -2329,9 +2885,10 @@ panel_detail_bkg:
 			.byte	$00			;tag	.byte
 			.word	page_detail
 			.word	panel_detail_bkg_ctrls	;controls
-			.byte	$00
+			.byte	$01
 
 panel_detail_bkg_ctrls:
+			.word	label_detail_status
 			.word	$0000
 
 ;	panel_detail_hud - the right-hand HUD column only (cols 30-39,
@@ -2482,7 +3039,7 @@ label_detail_score0:
 			.byte	$01		;height	.byte
 			.byte	$00		;tag	.byte
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_score	;textptr	.word
+			.word	slotScoreText + (0 * SCORE_TEXT_SIZE)	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2502,7 +3059,7 @@ label_detail_score1:
 			.byte	$01		;height	.byte
 			.byte	$00		;tag	.byte
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_score	;textptr	.word
+			.word	slotScoreText + (1 * SCORE_TEXT_SIZE)	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2522,7 +3079,7 @@ label_detail_score2:
 			.byte	$01		;height	.byte
 			.byte	$00		;tag	.byte
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_score	;textptr	.word
+			.word	slotScoreText + (2 * SCORE_TEXT_SIZE)	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2542,7 +3099,35 @@ label_detail_score3:
 			.byte	$01		;height	.byte
 			.byte	$00		;tag	.byte
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_score	;textptr	.word
+			.word	slotScoreText + (3 * SCORE_TEXT_SIZE)	;textptr	.word
+			.byte	$00		;textoffx .byte
+			.byte	$FF		;textaccel .byte
+			.byte	$00		;accelchar .byte
+			.word	$0000		;actvctrl .word
+
+;	The level/clock line, on screen row 4 - the row directly above the
+;	board, which starts at row 5 (board row + 5, see gameDrawBoardRows).
+;	Its text is statusText, which gameProcGameStatusMsg writes the
+;	server's own formatted line into once a second.
+;
+;	Colour is set at runtime, not here: it goes red for the last
+;	STATUS_WARN_SECS. The value below is only what it looks like before
+;	the first GameStatus arrives.
+label_detail_status:
+;			.word	$0000		;prepare
+			.word	$0000		;present
+			.word	ctrlsLabelDefChanged	;changed
+			.word	$0000		;keypress .word
+			.byte	STATE_VISIBLE | STATE_ENABLED
+			.byte	OPT_NONAVIGATE
+			.byte	CLR_LOG_C64_WHITE | CLR_SPEC_TEXT	;colour	.byte
+			.byte	$05		;posx	.byte
+			.byte	$04		;posy	.byte
+			.byte	$14		;width	.byte
+			.byte	$01		;height	.byte
+			.byte	$00		;tag	.byte
+			.word	panel_detail_bkg	;panel	.word
+			.word	statusText	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2562,7 +3147,7 @@ label_detail_pwr1_0:
 			.byte	$01		;height	.byte
 			.byte	$00		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr1	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2582,7 +3167,7 @@ label_detail_pwr1_1:
 			.byte	$01		;height	.byte
 			.byte	$01		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr1	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2602,7 +3187,7 @@ label_detail_pwr1_2:
 			.byte	$01		;height	.byte
 			.byte	$02		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr1	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2622,7 +3207,7 @@ label_detail_pwr1_3:
 			.byte	$01		;height	.byte
 			.byte	$03		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr1	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2630,7 +3215,7 @@ label_detail_pwr1_3:
 
 label_detail_pwr2_0:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameSpeedPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2640,9 +3225,9 @@ label_detail_pwr2_0:
 			.byte	$08		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$00		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr2	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2650,7 +3235,7 @@ label_detail_pwr2_0:
 
 label_detail_pwr2_1:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameSpeedPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2660,9 +3245,9 @@ label_detail_pwr2_1:
 			.byte	$0D		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$01		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr2	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2670,7 +3255,7 @@ label_detail_pwr2_1:
 
 label_detail_pwr2_2:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameSpeedPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2680,9 +3265,9 @@ label_detail_pwr2_2:
 			.byte	$12		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$02		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr2	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2690,7 +3275,7 @@ label_detail_pwr2_2:
 
 label_detail_pwr2_3:
 ;			.word	$0000		;prepare
-			.word	$0000		;present
+			.word	gameSpeedPresent	;present
 			.word	ctrlsLabelDefChanged	;changed
 			.word	$0000		;keypress .word
 			.byte	STATE_VISIBLE | STATE_ENABLED
@@ -2700,9 +3285,9 @@ label_detail_pwr2_3:
 			.byte	$17		;posy	.byte
 			.byte	$0A		;width	.byte
 			.byte	$01		;height	.byte
-			.byte	$00		;tag	.byte
+			.byte	$03		;tag	.byte	(corner)
 			.word	panel_detail_hud	;panel	.word
-			.word	text_detail_pwr2	;textptr	.word
+			.word	text_detail_bar	;textptr	.word
 			.byte	$00		;textoffx .byte
 			.byte	$FF		;textaccel .byte
 			.byte	$00		;accelchar .byte
@@ -2847,13 +3432,16 @@ text_ovrvw_score3:
 text_ovrvw_score4:
 			.asciiz	" 5.  ---------------------  000000"
 
-text_detail_score:
-			.asciiz	"000000"
-text_detail_pwr1:
-			.asciiz	"          "	;lives row - pips are drawn by
-							;	gameLivesPresent, not text
-text_detail_pwr2:
-			.asciiz	"PWR2:--"
+;	No text_detail_score here any more - the four score labels point at
+;	slotScoreText instead, which is RAM the SlotStatus handler writes the
+;	server's own digits straight into. One shared RODATA string could
+;	never have shown four different scores.
+;	The lives and speed rows have no text of their own - their present
+;	hooks (gameLivesPresent/gameSpeedPresent) fill the row by DMA and
+;	never read textptr. This blank exists only so the field is not left
+;	pointing at nothing, in case the default present is ever restored.
+text_detail_bar:
+			.asciiz	"          "
 text_detail_start0:
 			.asciiz	"[1 START]"
 text_detail_start1:

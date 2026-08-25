@@ -9640,6 +9640,18 @@ colourRowsHiPhys:
 			.byte	>$FCB0, >$FD00, >$FD50, >$FDA0, >$FDF0
 			.byte	>$FE40, >$FE90, >$FEE0, >$FF30, >$FF80
 
+;	The 8 characters PETSCII has no glyph for at their own value, so
+;	drawing them needs a substitution.
+;
+;	NOT an extension point for graphics. Adding entries here to make
+;	screen codes above $3F reachable from label text was tried and backed
+;	out (2026-08-25): it would have claimed two printable characters
+;	framework-wide - including in usernames and chat, which go through
+;	this same translation - and it puts two more comparisons in front of
+;	EVERY ordinary character drawn, since the search walks the whole
+;	table before falling through to the arithmetic. A control that wants
+;	to draw graphics fills them itself, with a DMA job, from its own
+;	present hook. See gameHudBarPresent in snake_game.s.
 screenASCIIXLAT:
 	.byte	KEY_ASC_BSLASH, KEY_ASC_CARET, KEY_ASC_USCORE, KEY_ASC_BQUOTE
 	.byte	KEY_ASC_OCRLYB, KEY_ASC_PIPE, KEY_ASC_CCRLYB, KEY_ASC_TILDE, $00
