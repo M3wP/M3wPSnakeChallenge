@@ -633,7 +633,7 @@ panel_config_theme:
 			.byte	$00		;tag	.byte
 			.word	page_config
 			.word	panel_config_theme_ctrls;controls .word
-			.byte	$06
+			.byte	$06 + GAME_CONFIG_THEME_EXTRA
 
 panel_config_theme_ctrls:
 			.word	label_config_theme
@@ -642,6 +642,14 @@ panel_config_theme_ctrls:
 			.word	label_config_theme_name
 			.word	label_config_interface
 			.word	checkbx_config_flashchat
+;	PER-GAME SLOT - a game may append ONE control of its own to this
+;	otherwise-generic panel by setting GAME_CONFIG_THEME_EXTRA to 1 and
+;	defining GAME_CONFIG_THEME_EXTRA_CTRL, both in its top-level file
+;	before this include. Chess uses it for checkbx_config_flashckplyr;
+;	Snake sets the count to 0. The count byte above tracks it.
+	.if GAME_CONFIG_THEME_EXTRA
+			.word	GAME_CONFIG_THEME_EXTRA_CTRL
+	.endif
 			.word	$0000
 
 label_config_theme:

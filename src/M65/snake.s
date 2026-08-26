@@ -29,6 +29,9 @@ GAME_INET_PORT	= 19763				;Chess is 19762, Yahtzee 7632
 ;	fw_startup.s. Snake loads its charset another way; Chess sets this 1.
 	.define	DEBUG_LOADFONT	0
 
+;	Snake adds no control of its own to the generic preferences panel.
+GAME_CONFIG_THEME_EXTRA	= 0
+
 
 .include "framework/fw_core.s"
 .include "framework/fw_startup.s"
