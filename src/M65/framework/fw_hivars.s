@@ -30,6 +30,34 @@
 
 .segment "HIVARS"
 
+;	THE .reloc IS LOAD-BEARING - DO NOT REMOVE IT.
+;
+;	The BASIC stub at the top of the program does .org $07FF, and until
+;	this line nothing anywhere calls .reloc. Per the ca65 manual (11.77):
+;	"By default, absolute/relocatable mode is global (valid even when
+;	switching segments)" - so the assembler is STILL in absolute mode
+;	when it reaches the .segment directive above, and the program counter
+;	simply carries on from wherever CODE ended.
+;
+;	Without this line every label below is baked by ca65, as a constant,
+;	at CODE_end+1 - and ld65 cannot correct it, because an absolute value
+;	leaves no relocation for the linker to fix up. The map file still
+;	reports the segment at $E000, which is what makes this look fine when
+;	it is not: only the emitted bytes disagree.
+;
+;	That is harmless while CODE is small - the vars just land in unused
+;	RAM above the program - and catastrophic once CODE grows enough to
+;	push them past $D000, where every write lands on an IO register
+;	instead. Snake was 833 bytes from that when this was found
+;	(2026-08-26). chess.s, being bigger, was already over the line, which
+;	is why it always carried an .org $E000 here and dengland remembered
+;	it as necessary - it was.
+;
+;	.reloc rather than that .org because the address then comes from
+;	HIMEM in m65.cfg alone, instead of being repeated here where the two
+;	could drift apart. Verified byte-identical to the .org version.
+	.reloc
+
 RX_BLOCK_BUF:
 			.res	256
 
