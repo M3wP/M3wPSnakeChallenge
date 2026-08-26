@@ -39,6 +39,11 @@ ETHSRCS  := $(wildcard mega-ip/*.asm)
 ETHBIN   := eth.bin
 ETHLST   := eth.lst
 FWSRCS   := $(wildcard framework/*.s)
+# Wildcarded rather than listed, so a new game .s file needs no Makefile
+# edit to be tracked. filter-out drops the top-level file, already in
+# $(SRC). Chess's copy of this Makefile had no such rule at all until
+# 2026-08-26 and could push a stale binary - keep the two in step.
+GAMESRCS := $(filter-out $(SRC),$(wildcard *.s))
 INCSRCS  := $(wildcard *.inc)
 PALSRCS  := $(wildcard *.pal)
 BINSRCS  := $(wildcard *.bin)
@@ -56,7 +61,7 @@ $(ETHBIN): $(ETHSRCS)
 
 # snake.s pulls in framework/*.s, snake_game.s, bigglesworth.s, mouse.inc
 # etc. via .include, so any of them changing should trigger a rebuild too.
-$(OBJ): $(SRC) $(ETHBIN) $(FWSRCS) snake_game.s bigglesworth.s $(INCSRCS) $(PALSRCS) $(BINSRCS) | $(OBJDIR)
+$(OBJ): $(SRC) $(ETHBIN) $(FWSRCS) $(GAMESRCS) $(INCSRCS) $(PALSRCS) $(BINSRCS) | $(OBJDIR)
 	"$(CA65)" --cpu 4510 -g $(SRC) -o $(OBJ)
 
 $(OBJDIR):
