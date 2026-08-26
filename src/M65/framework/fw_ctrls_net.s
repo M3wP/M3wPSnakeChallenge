@@ -3181,26 +3181,27 @@ clientProcServerMsg:
 
 ;-------------------------------------------------------------------------------
 ;	clientProcPlayMsg - clientMsgProcs' mcPlay category entry (see the
-;	table above). Method $04 (GameChat) is handled generically right
-;	here, same as room/lobby chat - see clientProcPlayGameChatMsg.
-;	$04 and not $0E since 2026-08-25 - see clientSendGameChat for why.
-;	Everything else is game-specific wire shape (chess's original also
-;	dispatched join/part/game status/slot status/starting-colours/
-;	board sync/available moves/move made here) - GAME HOOK
-;	gameProcPlayMsg, defined in the game's own file (see snake_game.s),
-;	handles the rest.
+;	table above). The whole mcPlay wire shape is game-defined, so this
+;	hands EVERY method to GAME HOOK gameProcPlayMsg (see snake_game.s /
+;	chess_game.s) without inspecting any of them.
+;
+;	In-game chat is not special-cased here, though the framework does
+;	provide clientProcPlayGameChatMsg as a SERVICE a game may JMP to -
+;	the same relationship as clientPlayJoinedSelf/clientPlayPartedSelf,
+;	services the game calls rather than hooks the framework calls.
+;	Chat really is game-specific: a game may not have it at all, and
+;	where it is displayed differs (Snake logs to lpanel_play_log, since
+;	it has spectators on the play page; chess shows it on the board
+;	screen instead, which is where a chess player actually is).
+;
+;	**$04 is a CONVENTION, not a rule** - it is the recommended method
+;	number for GameChat so ports stay consistent, and both games use it,
+;	but nothing in framework/ enforces it. ($04 and not $0E since
+;	2026-08-25 - see clientSendGameChat for why.)
 ;-------------------------------------------------------------------------------
 clientProcPlayMsg:
 ;-------------------------------------------------------------------------------
-		LDA	imsgdat2
-		CMP	#$04
-		BEQ	@gamechat
-
 		JMP	gameProcPlayMsg
-;		RTS
-
-@gamechat:
-		JMP	clientProcPlayGameChatMsg
 
 
 ;-------------------------------------------------------------------------------
@@ -9674,12 +9675,13 @@ screenASCIIXLATSubXirod:
 text_token_null:
 			.asciiz	""
 
+;	PER-GAME - see GAME_VERSION_* in the top-level game file.
 text_ident_vernam:
-			.asciiz	"alpha"
+			.asciiz	GAME_VERSION_NAME
 text_ident_pltfrm:
 			.asciiz	"M65"
 text_ident_verlbl:
-			.asciiz	"0.00.01A"
+			.asciiz	GAME_VERSION_LABEL
 
 text_init_text0:
 			.asciiz	"INITIALISING..."
@@ -9691,7 +9693,7 @@ text_splsh_text0:
 text_splsh_text1:
 			.asciiz	"OF ECCLESTIAL SOLUTIONS"
 text_splsh_text2:
-			.asciiz	"VERSION:  0.00.01A"
+			.asciiz	.concat("VERSION:  ", GAME_VERSION_LABEL)
 text_splsh_text3:
 			.asciiz	"FOR THE COMMUNITY!"
 text_splsh_text4:

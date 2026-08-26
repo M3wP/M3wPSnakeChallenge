@@ -207,6 +207,12 @@ gameResetPlayGame:
 gameProcPlayMsg:
 ;-------------------------------------------------------------------------------
 		LDA	imsgdat2
+;	In-game chat. The framework no longer intercepts $04 - it offers
+;	clientProcPlayGameChatMsg as a service and leaves the dispatch to
+;	the game, since a game may display chat elsewhere or not have it.
+		CMP	#$04
+		BEQ	@gamechat
+
 		CMP	#$06
 		BEQ	@gamestat
 
@@ -223,6 +229,9 @@ gameProcPlayMsg:
 		BEQ	@shake
 
 		JMP	clientProcUnknownMsg
+
+@gamechat:
+		JMP	clientProcPlayGameChatMsg
 ;		RTS
 
 @shake:
