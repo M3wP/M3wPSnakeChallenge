@@ -9,6 +9,23 @@
 ; into whichever segment is already open when it's reached.
 ;===============================================================================
 
+;===============================================================================
+;	GAME IDENTITY - the only two things left in framework/ that differ
+;	per game, so they're defined here (before the includes) rather than
+;	edited into the framework on every port. If a third ever appears,
+;	it belongs here too, not in a framework file.
+;
+;	The framework's own contract with the game is otherwise just seven
+;	hooks (gameStateInit, gamePollTick, gameKeyPress, gameProcPlayMsg,
+;	gameResetPlayGame, gameLoadPalette, gameTilesLoadHack) plus
+;	page_ovrvw, all supplied by snake_game.s.
+;===============================================================================
+
+GAME_INET_PORT	= 19763				;Chess is 19762, Yahtzee 7632
+
+	.define	GAME_TITLE_TEXT	"SNAKE CHALLENGE QUADRO!"
+
+
 .include "framework/fw_core.s"
 .include "framework/fw_startup.s"
 .include "framework/fw_ui_shell.s"

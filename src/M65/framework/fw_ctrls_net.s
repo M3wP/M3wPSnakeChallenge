@@ -441,7 +441,7 @@ inetConnect:
 		JMP	@haveerror
 
 :
-		LDAX 	#19763
+		LDAX 	#GAME_INET_PORT
 		STAX 	inet_port
 
 ; 	connect
@@ -572,9 +572,14 @@ inetConnect:
 		CMP	pickCtrl + 1
 		BNE	@exit
 
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
+;	We're the picked control and we've just been hidden, so the pick has
+;	to be dropped - but it must go through userMouseUnPickCtrl, NOT by
+;	zeroing pickCtrl here. Zeroing only forgets the POINTER; STATE_PICK
+;	stays set on the control itself, and there's then nothing left
+;	pointing at it to ever take the flag off again. It sits there until
+;	the button is shown once more (a reconnect, here) and paints in
+;	CLR_FOCUS as though the mouse were on it.
+		JSR	userMouseUnPickCtrl
 
 @exit:
 		LDA	#$00
@@ -699,9 +704,9 @@ inetDisconnected:
 		CMP	pickCtrl + 1
 		BNE	@done
 
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
+;	See inetConnect - drop the pick properly so STATE_PICK doesn't stay
+;	stranded on a control nothing points at any more.
+		JSR	userMouseUnPickCtrl
 
 @done:
 		LDA	#<button_cnct_upd
@@ -2596,9 +2601,9 @@ clientProcRoomJoinMsg:
 		CMP	pickCtrl + 1
 		BNE	@cont
 
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
+;	See inetConnect - drop the pick properly so STATE_PICK doesn't stay
+;	stranded on a control nothing points at any more.
+		JSR	userMouseUnPickCtrl
 
 
 ;	Disable Game Name and Password edits
@@ -2771,9 +2776,9 @@ clientProcRoomPartMsg:
 		CMP	pickCtrl + 1
 		BNE	@cont
 
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
+;	See inetConnect - drop the pick properly so STATE_PICK doesn't stay
+;	stranded on a control nothing points at any more.
+		JSR	userMouseUnPickCtrl
 
 
 ;	Enable Game Name and Password edits
@@ -3819,9 +3824,9 @@ clientPlayJoinedSelf:
 		CMP	pickCtrl + 1
 		BNE	@cont
 
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
+;	See inetConnect - drop the pick properly so STATE_PICK doesn't stay
+;	stranded on a control nothing points at any more.
+		JSR	userMouseUnPickCtrl
 
 @cont:
 		LDA	#<edit_play_game
@@ -3889,9 +3894,9 @@ clientPlayPartedSelf:
 		CMP	pickCtrl + 1
 		BNE	@cont
 
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
+;	See inetConnect - drop the pick properly so STATE_PICK doesn't stay
+;	stranded on a control nothing points at any more.
+		JSR	userMouseUnPickCtrl
 
 @cont:
 		LDA	#<edit_play_game
@@ -4201,13 +4206,16 @@ clientRoomMoreChng:
 		LDA	#STATE_VISIBLE
 		JSR	ctrlsExcludeState
 
-;		JSR	userMouseUnPickCtrl
-;		JSR	ctrlsDeactivateCtrl
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
-;		STA	actvCtrl
-;		STA	actvCtrl + 1
+;	The panel that was on screen has just been hidden, so whatever was
+;	picked inside it has to be dropped - but through userMouseUnPickCtrl,
+;	NOT by zeroing pickCtrl. Zeroing forgets the POINTER and leaves
+;	STATE_PICK set on the control, with nothing left pointing at it to
+;	clear the flag later; toggle back to this panel and that control
+;	comes up painted in CLR_FOCUS as though the mouse were sitting on it.
+;	Nothing re-prepares a panel on a more/less toggle, so it stays wrong.
+;	(actvCtrl needs no equivalent - the ctrlsActivateCtrl below goes
+;	through ctrlsDeactivateCtrl, which does clear STATE_ACTIVE properly.)
+		JSR	userMouseUnPickCtrl
 
 ;	Activate the button that just became visible (button_room_less),
 ;	not a control buried inside the newly-shown panel - activating
@@ -4297,13 +4305,9 @@ clientRoomLessChng:
 		LDA	#STATE_VISIBLE
 		JSR	ctrlsExcludeState
 
-;		JSR	userMouseUnPickCtrl
-;		JSR	ctrlsDeactivateCtrl
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
-;		STA	actvCtrl
-;		STA	actvCtrl + 1
+;	See clientRoomMoreChng - drop the hidden panel's pick properly so
+;	STATE_PICK doesn't stay stranded on a control nothing points at.
+		JSR	userMouseUnPickCtrl
 
 		LDA	#<edit_room_text
 		STA	elemptr0
@@ -4713,13 +4717,9 @@ clientPlayMoreChng:
 		LDA	#STATE_VISIBLE
 		JSR	ctrlsExcludeState
 
-;		JSR	userMouseUnPickCtrl
-;		JSR	ctrlsDeactivateCtrl
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
-;		STA	actvCtrl
-;		STA	actvCtrl + 1
+;	See clientRoomMoreChng - drop the hidden panel's pick properly so
+;	STATE_PICK doesn't stay stranded on a control nothing points at.
+		JSR	userMouseUnPickCtrl
 
 ;	Activate the button that just became visible (button_play_less),
 ;	not a control buried inside the newly-shown panel - activating
@@ -4808,13 +4808,9 @@ clientPlayLessChng:
 		LDA	#STATE_VISIBLE
 		JSR	ctrlsExcludeState
 
-;		JSR	userMouseUnPickCtrl
-;		JSR	ctrlsDeactivateCtrl
-		LDA	#$00
-		STA	pickCtrl
-		STA	pickCtrl + 1
-;		STA	actvCtrl
-;		STA	actvCtrl + 1
+;	See clientRoomMoreChng - drop the hidden panel's pick properly so
+;	STATE_PICK doesn't stay stranded on a control nothing points at.
+		JSR	userMouseUnPickCtrl
 
 		LDA	#<edit_play_text
 		STA	elemptr0
@@ -6630,10 +6626,18 @@ ctrlsPageSelect:
 
 ;	Clear picked, down and active controls
 
+;	Unlike the other places that drop a pick, zeroing the pointers is
+;	the RIGHT thing here and does not strand STATE_PICK on anything: we
+;	set ctrlsPrep above, so ctrlsPagePrepare runs before anything is
+;	drawn again, and ctrlsControlDefPrepare masks STATE_ACTIVE, PICK and
+;	DOWN off every control it walks. tab_main is listed in each page's
+;	panels array, so the tab buttons are covered by that sweep too.
+;	Don't "fix" this into a userMouseUnPickCtrl call - the flags are
+;	already going to be cleared a moment later, page-wide.
 		LDA	#$00
 		STA	pickCtrl
 		STA	pickCtrl + 1
-		STA	downCtrl 
+		STA	downCtrl
 		STA	downCtrl + 1
 		STA	actvCtrl
 		STA	actvCtrl + 1
@@ -9681,7 +9685,7 @@ text_init_text0:
 			.asciiz	"INITIALISING..."
 
 text_splsh_title:
-			.asciiz	"SNAKE CHALLENGE QUADRO!"
+			.asciiz	GAME_TITLE_TEXT
 text_splsh_text0:
 			.asciiz	"WRITTEN BY:  DANIEL ENGLAND"
 text_splsh_text1:
