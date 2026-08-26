@@ -146,6 +146,52 @@ gameResetPlayGame:
 		STA	gameBkgPresented
 		STA	gameBoardSyncPending
 
+		LDX	#$03
+@clrslots:
+		STA	slotStates, X
+		STA	slotLives, X
+		STA	slotSpeed, X
+		DEX
+		BPL	@clrslots
+
+;	THE CORNER LATCHES, and clearing them here is what fixes the oldest
+;	bug in this client - a START press that did nothing whatever and
+;	left no trace anywhere to find it by (dengland, first reported
+;	2026-08-25, root-caused 2026-08-26 from his own observation that it
+;	followed a BOARD CHANGE).
+;
+;	gameMySlot is normally cleared by a SlotStatus for our own corner
+;	arriving with isyou=0. That works while we are still watching the
+;	board it comes from - but a board change sends Part FIRST, so by the
+;	time the server releases the corner and announces it we are no
+;	longer a watcher and the message is never delivered. gameMySlot was
+;	therefore left pointing at the corner held on the PREVIOUS board.
+;
+;	gameSlotPress reads exactly that, concludes we are already seated,
+;	and returns without doing anything - for EVERY corner, on every
+;	board afterwards, until the client is restarted. Silently, because
+;	a no-op press is precisely what "already seated" is supposed to
+;	look like. That is why it left nothing in the log to chase.
+;
+;	gameSlotWanted has the same hole from the other end: a claim still
+;	in flight when we leave is never answered, so it stays set and
+;	blocks every later press on its own.
+;
+;	BOTH ARE $FF HERE, not the $00 above - slot 0 is a real corner, so
+;	zero is the one value that must never mean "none". Clearing these to
+;	zero would leave the client certain it was sitting in corner 0,
+;	which is the very corner reported dead.
+		LDA	#SLOT_CLAIM_NONE
+		STA	gameSlotWanted
+		STA	gameMySlot
+
+;	And forget the heading, for the same class of reason: leaving a
+;	board with a direction latched has the first press of that same
+;	direction on the NEXT board deduped away and ignored.
+		LDA	#SNAKE_DIR_NONE
+		STA	gameLastDir
+		STA	gameJoyLast
+
 		JMP	clientPlayPartedSelf
 ;		RTS
 

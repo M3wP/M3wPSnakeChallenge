@@ -36,15 +36,41 @@ const
 	// TSnakeGame.DemoSnakes is declared in the type block below.
 	SNAKE_PLAYER_COUNT = 4;
 
+	// The boss's render slot, and the resulting total. Their REASONING
+	// lives with the tile encoding further down (see TILE_SNAKE_BASE) -
+	// they are only hoisted up here because the boss became a real snake
+	// (2026-08-26), so PlaySnakes, TLavaHeads and every Z-order helper
+	// are now sized by the total rather than by the player count.
+	//
+	// Deliberately still NOT folded into SNAKE_PLAYER_COUNT: that is the
+	// number of CORNERS a human can claim, and it sizes Slots and
+	// DemoSnakes. The boss is not a player and must never be handed a
+	// slot, a life count or a respawn.
+	SNAKE_SLOT_BOSS = SNAKE_PLAYER_COUNT;
+	SNAKE_RENDER_SLOTS = SNAKE_PLAYER_COUNT + 1;
+
 	// How many lava pools a wave seeds, and the hard ceiling on cells in
-	// one pool. Up here for the same reason again - TDemoLava's cell
-	// array and TSnakeGame.DemoLava both need them in scope. The
+	// one pool. Up here for the same reason again - TLavaPool's cell
+	// array and TSnakeGame.DemoLava/PlayLava all need them in scope. The
 	// reasoning behind the VALUES sits with the lava constants below.
 	//
-	// The CAP is only the array bound. What a pool actually grows to
-	// scales with difficulty - see LavaMaxCells.
+	// The CAP is only the array bound, and it is SHARED: real play's
+	// pools are the same record as the reel's. What a pool actually
+	// grows to scales with difficulty - see LavaMaxCells.
+	//
+	// RAISED 32 -> 48 (2026-08-26) when real play's lava was widened.
+	// At 32 the hard and expert boards both asked for more than the
+	// bound and got it clipped to the same number, which quietly undid
+	// the whole point of PLAY_STAGE_LAVA_TIER on exactly the boards
+	// where the second lava level should bite hardest - the two stages
+	// came out identical in extent and differed only by a pool. Three
+	// pools of 48 is around 29% of the interior molten at once, which is
+	// the most the board can carry and still be playable.
+	//
+	// The reel is unaffected: its own ladder tops out around 20.
 	DEMO_LAVA_SEEDS = 2;
-	DEMO_LAVA_CELLS_CAP = 32;
+	PLAY_LAVA_SEEDS = 3;
+	LAVA_CELLS_CAP = 48;
 
 	// Bees in the attract wave, one per corner. Up here too -
 	// TSnakeGame.DemoBees needs it. Reasoning with the other bee
@@ -411,20 +437,41 @@ type
 	TDemoWave = (dwLava, dwBees, dwFood, dwBoss);
 
 	// A lava pool's life: creep outward, sit at full extent, drain back.
-	// dlpIdle is the beat between waves.
-	TDemoLavaPhase = (dlpIdle, dlpGrow, dlpHold, dlpRecede);
+	// lpIdle is the beat between cycles - the gap on the attract reel
+	// before the next wave, and the breather in real play before the
+	// pools re-seed somewhere else.
+	//
+	// SHARED BY THE ATTRACT REEL AND REAL PLAY since lava was given a
+	// play stage (2026-08-26), which is why none of these three types
+	// carry the Demo prefix any more. The same reasoning the bees are
+	// held to: the attract screen has been teaching players how lava
+	// behaves all along, so there had better be one definition of it
+	// rather than two that drift.
+	TLavaPhase = (lpIdle, lpGrow, lpHold, lpRecede);
 
 	// One spreading lava pool. Cells are kept in CREATION ORDER, which
 	// is doing three jobs at once: it fixes each cell's colour tier, it
 	// makes recession newest-first (just walk backwards), and it means
 	// the whole pool is one flat array with no per-cell bookkeeping.
-	TDemoCell = record
+	TLavaCell = record
 		Row, Col: Byte;
 	end;
 
-	TDemoLava = record
-		Cells: array[0..DEMO_LAVA_CELLS_CAP - 1] of TDemoCell;
+	TLavaPool = record
+		Cells: array[0..LAVA_CELLS_CAP - 1] of TLavaCell;
 		Count: Integer;
+	end;
+
+	// The heads lava must keep clear of, gathered by the caller.
+	//
+	// Passed in rather than looked up, because the two callers read
+	// different arrays - the reel's DemoSnakes, real play's live
+	// PlaySnakes - and threading a "which mode am I" flag down into the
+	// growth primitive to pick between them would put the one thing that
+	// genuinely differs in the one place that should not care.
+	TLavaHeads = record
+		Count: Integer;
+		Row, Col: array[0..SNAKE_RENDER_SLOTS - 1] of Integer;
 	end;
 
 	// One bee. Target is a SNAKE INDEX picked at spawn and then KEPT -
@@ -537,11 +584,34 @@ type
 		// live at mutually exclusive times, but keeping them apart means
 		// the attract reel's state is still intact when play ends and
 		// the board falls back to it, instead of having to be rebuilt.
-		PlaySnakes: array[0..SNAKE_PLAYER_COUNT - 1] of TSnake;
+		//
+		// SIZED SNAKE_RENDER_SLOTS, NOT SNAKE_PLAYER_COUNT - the extra
+		// entry is the BOSS (SNAKE_SLOT_BOSS), and putting it in this
+		// array rather than beside it is the whole implementation
+		// strategy for the boss. Every Z-order helper - SolidSnakeAt,
+		// TopSnakeAt, SnakeSegAt, VacateCell - walks this array, so the
+		// boss gets collision, overlap handling and correct repainting
+		// underneath other snakes for free, and cannot be quietly missed
+		// by a helper that was written before it existed. A boss living
+		// outside the array would have been walked straight past by all
+		// four of them.
+		//
+		// THE PRICE is that every loop over this array now has to mean
+		// what it says. Loops that are about PLAYERS - input, respawn,
+		// lives, scoring, slot status, the head-on pre-pass - still run
+		// to SNAKE_PLAYER_COUNT - 1 and must stay that way; only the
+		// board-geometry questions run the full range.
+		PlaySnakes: array[0..SNAKE_RENDER_SLOTS - 1] of TSnake;
 
 		// Ticks until a dead corner's snake respawns, 0 when it is
 		// either alive or unclaimed.
 		PlayRespawn: array[0..SNAKE_PLAYER_COUNT - 1] of Integer;
+
+		// This corner's head needs repainting because the player has
+		// TURNED, independently of whether it is about to step. Set by
+		// SetPlayerLook on the message thread, drained at the top of
+		// TickPlaySnakes - see there.
+		PlayHeadDirty: array[0..SNAKE_PLAYER_COUNT - 1] of Boolean;
 
 		// The gear last BROADCAST for each corner (see PlayGearFor).
 		// Not the current gear - SendSlotStatus always recomputes that -
@@ -627,11 +697,66 @@ type
 		LevelKeyTimer: Integer;
 		LevelKeyWindow: Integer;
 
+		// --- REAL PLAY'S LAVA (stages 4 and 7) ---
+		//
+		// The same pools, phases and pacing counters the attract reel
+		// runs, kept separately for exactly the reason PlaySnakes is
+		// kept apart from DemoSnakes: the two are live at mutually
+		// exclusive times, and not sharing means the reel's state
+		// survives a game intact.
+		//
+		// dengland chose "grow, hold, recede, repeat" over a board that
+		// steadily closes in (2026-08-26): the dangerous ground MOVES
+		// rather than accumulating, so a bad seed near a player is
+		// survivable and the board keeps breathing all level. lpIdle is
+		// therefore the gap between cycles, and each new cycle re-seeds
+		// somewhere else - see TickPlayLava.
+		PlayLava: array[0..PLAY_LAVA_SEEDS - 1] of TLavaPool;
+		PlayLavaPhase: TLavaPhase;
+		PlayLavaStep: Integer;
+		PlayLavaHold: Integer;
+
+		// Whether THIS burst's warning shake has been cued yet. A latch
+		// rather than an equality test on PlayLavaHold - which is how
+		// the attract reel does it - because that only fires reliably
+		// while the gap divides exactly by the step interval, and both
+		// are constants somebody will reasonably want to tune.
+		PlayLavaShook: Boolean;
+
+		// --- THE BOSS (stage 8) ---
+		//
+		// The boss SNAKE itself is PlaySnakes[SNAKE_SLOT_BOSS] - see
+		// there. These are the only things about it a player snake has
+		// no equivalent of.
+		//
+		// BossLives is dengland's rule (2026-08-26): the boss starts
+		// with the same PLAY_START_LIVES a player does, and a hit spends
+		// one. It does NOT respawn on losing one, it just goes
+		// invulnerable and keeps coming - which is why this is a plain
+		// counter here and not a Slots entry.
+		//
+		// BossWake is the dormant spell at the start of the level, also
+		// his: the boss is laid down with the level rather than arriving
+		// later, "so we don't have spawn in issues and floating to
+		// account for", but it sits still and unkillable until this runs
+		// out. Unkillability is not a separate flag - the wake timer is
+		// spent as invulnerability, so the boss visibly flashes while
+		// dormant and the tell costs nothing.
+		BossLives: Integer;
+		BossWake: Integer;
+
+		// Segments the boss is still owed, from things it has destroyed
+		// - see PLAY_BOSS_GROW_FOOD. A plain pending COUNT rather than
+		// TSnake's own Grow/GrowEx pair, because those are tick timers
+		// serving foods that cancel one another, and none of that
+		// applies to something which simply gets bigger as it eats.
+		BossGrow: Integer;
+
 		// The attract reel: which mechanic is on stage, where its
 		// animation has got to, and the tick counters driving both.
 		DemoWave: TDemoWave;
-		DemoLava: array[0..DEMO_LAVA_SEEDS - 1] of TDemoLava;
-		DemoLavaPhase: TDemoLavaPhase;
+		DemoLava: array[0..DEMO_LAVA_SEEDS - 1] of TLavaPool;
+		DemoLavaPhase: TLavaPhase;
 		DemoLavaStep: Integer;
 
 		// Ticks left in the lava's HOLD phase. Its own counter, not
@@ -716,6 +841,10 @@ type
 		// piece; FoodAt finds the table entry for a board cell (-1 if
 		// none); ClearFoodAt forgets one that something else has removed
 		// from the board; EatFood applies one type's effects to one snake.
+		// Which food kind to put down - a flat roll everywhere except
+		// the boss stage, which has its own table. See RandomFoodKind.
+		function  RandomFoodKind: Integer;
+
 		procedure TickPlayFood(var ADeltas: array of TTileDelta;
 				var ADeltaCount: Integer);
 		function  FoodAt(ARow, ACol: Byte): Integer;
@@ -739,6 +868,68 @@ type
 		function  BeeAt(ARow, ACol: Byte): Integer;
 		procedure ClearBeeAt(ARow, ACol: Byte);
 		function  PlayBeeMax: Integer;
+
+		// LAVA - THE SHARED PRIMITIVES, used by both the attract reel and
+		// real play. These three hold everything subtle about lava: the
+		// frontier-weighted growth, the floor-only legality test, the
+		// head clearance, the age-tiered colouring, and the "only clear
+		// a cell that is still OURS" care on the way back out.
+		//
+		// The two tick procedures keep their own phase machines, because
+		// what genuinely differs is only the pacing and where a cycle
+		// SEEDS - the reel drops its pools at fixed points inside its
+		// circuit, real play scatters them anywhere legal.
+		procedure LavaSeedPool(var APool: TLavaPool; ARow, ACol,
+				AMaxCells: Integer; var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		function  LavaGrowOnce(var APool: TLavaPool; ATop, ALeft, ABottom,
+				ARight, AMaxCells, AClear: Integer; const AHeads: TLavaHeads;
+				var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer): Boolean;
+		function  LavaRecedeOnce(var APool: TLavaPool;
+				var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer): Boolean;
+
+		// LAVA, REAL PLAY (stages 4 and 7). TickPlayLava runs the phase
+		// machine; ClearLavaAt forgets a cell something else has taken
+		// off the board, the same courtesy ClearFoodAt and ClearBeeAt
+		// do.
+		procedure TickPlayLava(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure ClearLavaAt(ARow, ACol: Byte);
+		procedure ResetPlayLava;
+
+		// How bad this stage's lava is - see PLAY_STAGE_LAVA_TIER. Both
+		// levers the tier pulls, so the two lava stages in a cycle are
+		// genuinely different levels rather than the same one twice.
+		function  LavaTier: Integer;
+		function  LavaPools: Integer;
+		function  PlayLavaMaxCells: Integer;
+
+		// Whose heads the lava must keep clear of, gathered for
+		// LavaGrowOnce - the reel's snakes or the live ones.
+		procedure DemoLavaHeads(out AHeads: TLavaHeads);
+		procedure PlayLavaHeads(out AHeads: TLavaHeads);
+
+		// THE BOSS (stage 8). SpawnBoss lays it down with the level;
+		// TickBoss is its whole simulation; HitBoss is a shielded
+		// player's head arriving on it; KillBoss is the last life going.
+		procedure SpawnBoss(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure TickBoss(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure HitBoss(ASlot: Integer; var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure KillBoss(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+		procedure ClearBoss(var ADeltas: array of TTileDelta;
+				var ADeltaCount: Integer);
+
+		// Is the boss on the board and simulating right now? Not the
+		// same question as StageHasBoss, which only says what the LEVEL
+		// is - the boss can be dead with the level still running out its
+		// last tick.
+		function  BossOnBoard: Boolean;
 
 		// Which stage of the cycle this level is, and what it runs.
 		// See PLAY_STAGE_*.
@@ -1167,11 +1358,10 @@ const
 	// works, and every shaping helper (SegShape, the turn telegraph,
 	// the flash) applies to it unchanged.
 	//
-	// Deliberately NOT folded into SNAKE_PLAYER_COUNT - that is the
-	// number of CORNERS a human can claim, and it sizes Slots and
-	// DemoSnakes. The boss is not a player.
-	SNAKE_SLOT_BOSS = SNAKE_PLAYER_COUNT;
-	SNAKE_RENDER_SLOTS = SNAKE_PLAYER_COUNT + 1;
+	// SNAKE_SLOT_BOSS and SNAKE_RENDER_SLOTS are DECLARED AT THE TOP OF
+	// THE FILE, not here, because the type block needs them in scope -
+	// see there. This is still where their reasoning belongs, since the
+	// tile encoding is what they are for.
 
 	// One MORE block of 6 shapes straight after those (63..68): the
 	// invulnerability flash body, white, shared by every snake.
@@ -1200,6 +1390,21 @@ const
 	// respecify: they are three entries in the client's table.
 	TILE_LAVA_BASE = TILE_SNAKE_FLASH_BASE + SHAPE_COUNT;
 	LAVA_TIER_COUNT = 3;
+
+	// --- THE TILE DELTA BUDGET ---
+	//
+	// PLAY_DELTAS_PER_MSG is arithmetic, not taste: the stack caps a
+	// payload at 235 bytes, a delta is 3 bytes, and there is one count
+	// byte, so 1 + 78 x 3 = 235 is exactly one full message. It is the
+	// CHUNK SIZE, not a limit - see SendTileDeltas, which splits.
+	//
+	// PLAY_DELTAS_MAX is how many cells one tick may change before the
+	// gather buffer starts dropping them. Sized for the real worst case
+	// (four full-length flashing players, a flashing boss, a full swarm
+	// on the move, food turning over) rather than for one message, which
+	// is what it was pinned to until 2026-08-26.
+	PLAY_DELTAS_PER_MSG = 78;
+	PLAY_DELTAS_MAX = 320;
 
 	// Total distinct tile values. The client indexes gameTileChars /
 	// gameTileColrs by raw tile value with NO bounds check (snake_game.s
@@ -1436,7 +1641,7 @@ const
 	// cycle runs DEMO_WAVE_FIRST..DEMO_WAVE_LAST, so an unimplemented
 	// wave is simply not in the reel yet rather than dead air on screen.
 	//
-	// DEMO_LAVA_SEEDS (2) and DEMO_LAVA_CELLS_CAP have to be
+	// DEMO_LAVA_SEEDS (2) and LAVA_CELLS_CAP have to be
 	// declared ahead of the type block - see the top of the unit.
 	// DEMO_LAVA_SEEDS = 2 puts one pool either side of centre, which is
 	// dengland's layout for the ATTRACT screen; the seeding code spaces
@@ -1456,7 +1661,7 @@ const
 	// which is dengland's own calibration (2026-08-24): expert/"insane"
 	// at 20-21, hard/"bad" three below that, normal two below again.
 	// Progress keeps climbing as levels are cleared, so late levels go
-	// past expert until DEMO_LAVA_CELLS_CAP stops them.
+	// past expert until LAVA_CELLS_CAP stops them.
 	DEMO_LAVA_CELLS_BASE = 12;
 	DEMO_LAVA_CELLS_PER_LEVEL = 2;
 
@@ -1705,12 +1910,32 @@ const
 	// has to be available in the level it affects, and a group-wide
 	// budget would leave some levels with no key at all.
 	//
-	// Lava stages get none because they have no key mechanic; the BOSS
-	// stage gets one, which is my reading rather than dengland's
-	// instruction - he described two groups and the boss is a third.
-	// Escaping the boss sooner seemed worth having on the table.
+	// LAVA AND BOSS STAGES GET NONE. Lava never had a key mechanic; the
+	// boss stage lost the one I had given it (dengland, 2026-08-26: "we
+	// don't have keys on the boss level either"), and once the boss's
+	// clock was frozen the key could not have worked there anyway - all
+	// it does is cut LevelTicks, and on a boss level LevelTicks is not
+	// what ends the level. It would have been a 2000-point pickup that
+	// silently did nothing.
 	PLAY_STAGE_KEYS: array[0..PLAY_LEVEL_STAGES - 1] of Integer =
-			(2, 2, 2, 0, 1, 1, 0, 1);
+			(2, 2, 2, 0, 1, 1, 0, 0);
+
+	// HOW BAD EACH LAVA STAGE IS: 0 for a level with no lava, then 1 for
+	// the cycle's first lava level and 2 for its second (dengland,
+	// 2026-08-26: "can we make the first level of lava less terrifying
+	// than the second?").
+	//
+	// It DID already scale with difficulty and progress, both of which
+	// feed PlayLavaMaxCells - but LevelProgress rises by only three
+	// between stages 4 and 7, and on a board sitting at its MaxProgress
+	// ceiling it does not rise at all, so within one cycle the two lava
+	// levels came out near enough identical. This is the explicit
+	// difference, on top of whatever the progress scaling is doing.
+	//
+	// The tier pulls TWO levers - LavaPools and PlayLavaMaxCells - so
+	// stage 7 gets both more pools and bigger ones.
+	PLAY_STAGE_LAVA_TIER: array[0..PLAY_LEVEL_STAGES - 1] of Integer =
+			(0, 0, 0, 1, 0, 0, 2, 0);
 
 	// --- HOW OFTEN THE BASE SPEED STEPS UP -----------------------------
 	//
@@ -1904,6 +2129,14 @@ const
 	// you growing is the dearest (600 doubled to 1200). Length is a
 	// liability in this game, not a reward, so the scoring pays you for
 	// staying short.
+	// THE BOSS STAGE'S FOOD WEIGHTING, indexed by food kind - clubs
+	// (no-grow, faster), solid circle (extra-grow, slower), open circle
+	// (pure speed), heart (shield). Out of ten. See RandomFoodKind for
+	// why the boss stage wants a different table at all; every other
+	// stage rolls flat.
+	PLAY_FOOD_WEIGHT_BOSS: array[0..FOOD_RANDOM_KINDS - 1] of Integer =
+			(2, 1, 3, 4);
+
 	PLAY_FOOD_PTS_NOGROW = 1200;		// type 0, clubs
 	PLAY_FOOD_PTS_XGROW  = 400;		// type 1, solid circle
 	PLAY_FOOD_PTS_BURST  = 800;		// type 2, open circle
@@ -1927,6 +2160,25 @@ const
 	// outright, as the original's do.
 	PLAY_FOOD_INVUN_MS = 4000;
 	PLAY_FOOD_INVUN_TICKS = PLAY_FOOD_INVUN_MS div TICK_MS;
+
+	// WHEN A SHIELD STARTS TO RUN OUT, and how the flash changes to say
+	// so (dengland, 2026-08-26: "can we make the shield flash half the
+	// speed once it is at a certain value, say half the normal
+	// increment? This will alert the player its going to end").
+	//
+	// The threshold is half of what one heart food grants, so "about to
+	// end" means the same length of time however the shield was
+	// acquired - a spawn, a head-on, a heart, or two hearts stacked up
+	// to the cap. Reading it off the food increment rather than off the
+	// snake's own remaining time is what makes that true.
+	//
+	// The flash then runs at HALF SPEED. Slowing rather than quickening
+	// is his call and it is the better one for this hardware: the flash
+	// already toggles every tick (DEMO_INVUN_FLASH_TICKS is 1), so there
+	// is no faster available - the only direction left with any contrast
+	// in it is slower.
+	PLAY_INVUN_WARN_TICKS = PLAY_FOOD_INVUN_TICKS div 2;
+	PLAY_INVUN_WARN_SLOW = 2;
 	PLAY_INVUN_CAP_MS = 5000;
 	PLAY_INVUN_CAP_TICKS = PLAY_INVUN_CAP_MS div TICK_MS;
 
@@ -2037,6 +2289,14 @@ const
 	PLAY_BEE_BASE = 2;
 	PLAY_BEE_PER_PROGRESS = 1;
 
+	// ...and the progress term is then DIVIDED by this, which is where
+	// the swarm was thinned out once bees could actually strike rather
+	// than merely be run into (2026-08-26). Kept as a divisor on the
+	// slope rather than folded into PLAY_BEE_PER_PROGRESS because that
+	// is an integer and 1/2 is not - see PlayBeeMax for the resulting
+	// ladder.
+	PLAY_BEE_PROGRESS_DIV = 2;
+
 	// 1-in-N per tick to place one, when below the current maximum. Same
 	// rate as food and for the same reason: the original rolls 1-in-8 per
 	// pass at roughly half our tick rate.
@@ -2099,6 +2359,321 @@ const
 	// food turns into a timed hunting licence rather than just a safety
 	// net. Worth keeping when the numbers get retuned.
 	PLAY_BEE_PTS = 1500;
+
+	// --- LAVA IN REAL PLAY (stages 4 and 7) ---
+	//
+	// Lava had existed only on the attract reel until 2026-08-26, where
+	// its whole job was to look good inside a fenced circuit that
+	// nothing could walk into. In play it is a hazard on the same board
+	// as four snakes, so the numbers are NOT the reel's.
+	//
+	// THREE POOLS is the array bound and what the SECOND lava stage
+	// uses; the first uses two. See PLAY_STAGE_LAVA_TIER.
+	//
+	// THE PACING IS THE WHOLE FEEL OF THE STAGE, and it matters more here
+	// than anywhere else because a lava stage has NO BEES (PlayBeeMax
+	// returns 0) - whatever the lava is not doing, nothing else is doing
+	// either.
+	//
+	// RETUNED FASTER AND WIDER 2026-08-26, watching it live. dengland
+	// could not choose between quicker, further-spreading lava and
+	// putting half a swarm of bees on the level, which was really one
+	// observation from two sides: a burst every fifty seconds left too
+	// much empty board between them.
+	//
+	// Quicker lava was the better answer, and not only because it is a
+	// constant rather than a feature. Bees and lava sharing a level was
+	// his own rule to avoid, and keeping it is what makes the eight
+	// stages read as changes of SUBJECT rather than as a difficulty
+	// slider - three levels about the swarm, then one about the ground.
+	//
+	// There is a mechanical objection to the bees too: they have NO
+	// PATHFINDING, and a blocked move is simply a lost move (see
+	// TickPlayBees), so a board with real pools on it would leave the
+	// swarm bunched and stalling against their edges. That is not what
+	// half a swarm was meant to add.
+	PLAY_LAVA_STEP_TICKS = 5;
+	PLAY_LAVA_PER_STEP = 2;
+
+	// How far ONE pool spreads, before the shared LAVA_CELLS_CAP array
+	// bound. Widened with the pacing above - board1 (easy, progress 4)
+	// now runs 2 pools of 30, about 60 cells of the 28x18 interior.
+	PLAY_LAVA_CELLS_BASE = 14;
+	PLAY_LAVA_CELLS_PER_PROGRESS = 4;
+
+	// EACH POOL IS SMALLER when there are more of them - this many cells
+	// off the per-pool extent per tier above the first (dengland,
+	// 2026-08-26, watching stage 7: "maybe with the three of them they
+	// needn't spread so much").
+	//
+	// A REDUCTION, where this was a BONUS an hour earlier, and his
+	// instinct is the better one. What matters is the total budget, not
+	// the size of any one pool - and three big pools mostly buy you one
+	// big pool, because they run into each other and the whole point of
+	// having three distinct hazards is lost. Three SMALLER pools scatter
+	// the danger instead, which is harder to route around without simply
+	// being more lava.
+	//
+	// The tiers still climb, and now climb more steeply the harder the
+	// board (total cells at full extent, tier 1 -> tier 2):
+	//
+	//   training  44 ->  48     easy    60 ->  72
+	//   normal    76 ->  96     hard    96 -> 132
+	//   expert    96 -> 144
+	//
+	// It also un-flattens the top of the ladder as a side effect:
+	// subtracting BEFORE the LAVA_CELLS_CAP clamp means hard and expert
+	// no longer both clip to the same figure at tier 2, which they did
+	// while this was a bonus.
+	PLAY_LAVA_TIER_CELLS_LESS = 6;
+
+	// ...but never below this, or a training board's second lava stage
+	// would be three specks.
+	PLAY_LAVA_CELLS_MIN = 12;
+
+	// Time at full extent before draining, and the clear board a lava
+	// level opens on - which is also the pause between bursts.
+	//
+	// The opening gap is not politeness: the corner spawns and the level
+	// rebuild land on the same tick, and lava blooming while players are
+	// still finding their bearings would be read as the level itself
+	// killing them. It is short enough now to still be a beat rather
+	// than a lull.
+	PLAY_LAVA_HOLD_MS = 12000;
+	PLAY_LAVA_HOLD_TICKS = PLAY_LAVA_HOLD_MS div TICK_MS;
+	PLAY_LAVA_GAP_MS = 6000;
+	PLAY_LAVA_GAP_TICKS = PLAY_LAVA_GAP_MS div TICK_MS;
+
+	// Lava may not appear within this many cells of a live head, at
+	// growth OR at seeding. THREE, not the reel's two: the reel's snakes
+	// crawl on a fixed circuit, while a real snake at expert speed
+	// covers 12 cells a second, and lava blooming two cells ahead of
+	// that is an unavoidable death nobody could have read.
+	PLAY_LAVA_HEAD_CLEAR = 3;
+
+	// Attempts at finding somewhere legal to drop a seed. A seed needs
+	// bare floor clear of every head, which most of the board is, so
+	// this is generous - but a board with four snakes spread across it
+	// during the last-30-seconds ramp is exactly when it could fail, and
+	// a pool that fails to seed simply sits out the cycle.
+	PLAY_LAVA_SEED_TRIES = 40;
+
+	// Seeds keep this far in from the border wall, so a pool grows into
+	// the board rather than immediately hemming itself against the edge
+	// - which is also the lane the corner spawns run along.
+	PLAY_LAVA_SEED_INSET = 3;
+
+	// ...and this far from EACH OTHER, Chebyshev, so a cycle's pools
+	// land in genuinely different parts of the board instead of merging
+	// into one big blob that cost twice the budget.
+	//
+	// Seven on a 14x24 usable area comfortably fits three pools while
+	// still leaving most placements legal. A preference rather than a
+	// rule - see the seeding loop, which relaxes it rather than losing a
+	// pool on a crowded board.
+	PLAY_LAVA_SEED_APART = 7;
+
+	// THE ERUPTION SHAKES THE SCREEN, cued just BEFORE the pools appear
+	// so the ground moves and then the lava arrives - dengland's own
+	// staging for the attract reel ("just before and then during the
+	// first parts of the lava eruption", 2026-08-25), and he spotted its
+	// absence in play the moment he spectated a lava level.
+	//
+	// The reel had it and real play did not, which is exactly backwards:
+	// on the attract screen it is decoration, but in play it is the only
+	// warning a burst is coming, and a burst arriving in silence is the
+	// difference between a hazard you can read and one that simply
+	// appears under you.
+	//
+	// Frames, not ticks, for the same reason the reel's are: the client
+	// jitters the scroll registers per frame and owns the whole effect
+	// after one message (see SendShake).
+	PLAY_LAVA_SHAKE_LEAD_MS = 800;
+	PLAY_LAVA_SHAKE_MS = 2200;
+
+	PLAY_LAVA_SHAKE_LEAD_TICKS = PLAY_LAVA_SHAKE_LEAD_MS div TICK_MS;
+	PLAY_LAVA_SHAKE_FRAMES = PLAY_LAVA_SHAKE_MS div FRAME_MS;
+
+	// --- THE BOSS (stage 8) ---
+	//
+	// dengland's design, 2026-08-26, in his own words and order:
+	//
+	//   "the boss can die and has the same starting number of lives"
+	//   "instead of respawning though, just go invunerable and lose a
+	//    life"
+	//   "there from the start for the time being but maybe idle for a
+	//    while and unkillable - that way we don't have spawn in issues
+	//    and floating to account for"
+	//   contact with a player: NORMAL SNAKE RULES
+	//   "the boss should not die if it runs into a player but the same
+	//    both players run into each other logic for snakes should apply
+	//    (becomming invunerable in that case)"
+	//   "let's use the both collide to kill the boss"
+	//   "instead of time going down normally on this level, you have to
+	//    clear it with killing the boss"
+	//
+	// THE HEAD-ON IS THE WEAPON, and that last decision is what makes
+	// this stage its own thing rather than a fast bee level with a
+	// bigger snake in it. The only way to hurt the boss is to meet it
+	// HEAD TO HEAD, which is the one thing every instinct says not to
+	// do; touch any other part of it and the ordinary rules apply, which
+	// is to say you die. Nothing else on the board works this way.
+	//
+	// It follows from the existing head-on rule rather than being bolted
+	// on beside it: a mutual collision already costs neither party a
+	// life and hands both a shield to get clear with
+	// (snakeApplyCollide), so the boss taking damage there is the ONE
+	// thing added, and the player's side of it is untouched. It also
+	// means the weapon needs no pickup - no heart food, no shield, no
+	// setup - so a stage-8 board that has gone badly is still winnable.
+	//
+	// TWELVE segments, laid out as a SERPENTINE so they fit the 4x4 patch
+	// BuildLevel guarantees clear at the centre (LEVEL_CENTRE_CLEAR) - a
+	// straight twelve would not, and widening that guarantee would
+	// change every level's geometry to suit one stage in eight. The box
+	// holds sixteen cells, so twelve is a comfortable fit with room to
+	// lengthen this again.
+	//
+	// Was SIX, which dengland called correctly the moment he saw it in
+	// play: "the boss is too small". Six is barely longer than a
+	// player's own starting snake (DEMO_SNAKE_LEN is five), so the thing
+	// meant to be the climax of the eight-stage cycle read as just
+	// another snake in a different colour.
+	PLAY_BOSS_LEN = 12;
+
+	// IT GROWS AS IT FEEDS, and a lot ("also grow more from effects. A
+	// lot more probably" - dengland). It eats nothing in the scoring
+	// sense, but everything it walks over is destroyed, and now every
+	// one of those makes it longer.
+	//
+	// Six per food and two per bee, so a boss level's own swarm feeds the
+	// thing hunting you - a nice reversal of the bee levels, where the
+	// swarm is the threat and the food is yours.
+	//
+	// THESE NUMBERS ARE LARGE ON PURPOSE. The first attempt used 3 and 1
+	// and measured a boss growing from 12 segments to 13 in a hundred
+	// seconds, because it chases HEADS and only ever eats what it
+	// happens to cross. Rate alone could not fix that - see the
+	// opportunistic grab in TickBoss, which is the other half.
+	PLAY_BOSS_GROW_FOOD = 6;
+	PLAY_BOSS_GROW_BEE = 2;
+
+	// WHICH FOODS THE BOSS WILL TURN ASIDE FOR, by kind - clubs
+	// (no-grow), solid circle (extra-grow), open circle (speed), heart
+	// (shield). dengland: "it just wants the grow ones really maybe the
+	// invincibility ones".
+	//
+	// It keeps the boss's appetite legible: it goes for what makes it
+	// BIGGER, and ignores speed and the food whose entire purpose is to
+	// STOP growth. Note this governs only what it detours for - it
+	// destroys and grows from anything it crosses regardless.
+	//
+	// NOTE the heart does NOT make the boss invulnerable, only larger.
+	// Invulnerability is what gates damage AND what makes it flee
+	// (TickBoss), so a boss that could eat a shield would spend the
+	// level running away un-hittable - which is neither the threat nor
+	// the fight. Worth revisiting only if that changes.
+	PLAY_BOSS_WANTS: array[0..FOOD_RANDOM_KINDS - 1] of Boolean =
+			(False, True, False, True);
+
+	// ...bounded, but by TASTE rather than by the wire.
+	//
+	// This was 28, chosen because the boss repaints its whole body every
+	// tick while flashing and the tick delta budget was a hard 78 for
+	// the entire board. That ceiling is gone - SendTileDeltas splits
+	// across messages now (see PLAY_DELTAS_PER_MSG) - so the only
+	// question left is how big a snake the board can carry and still be
+	// playable. Forty of roughly 460 free cells is a wall you plan
+	// around rather than dodge.
+	PLAY_BOSS_LEN_MAX = 40;
+
+	// The boss's opening dormancy, spent AS INVULNERABILITY (see
+	// BossWake) - it sits still, flashing, and cannot be hurt. Long
+	// enough to read the board and get moving; short enough that it is
+	// not a dead quarter-minute.
+	PLAY_BOSS_WAKE_MS = 6000;
+	PLAY_BOSS_WAKE_TICKS = PLAY_BOSS_WAKE_MS div TICK_MS;
+
+	// Reeling after a hit: it keeps coming, but cannot be hit again for
+	// this long. NOT optional and not merely a fairness gesture - a
+	// head-on leaves the two of them nose to nose with the PLAYER also
+	// shielded, so without a gate the very next step is another head-on,
+	// and all three of the boss's lives would go inside one exchange
+	// nobody had to work for.
+	//
+	// It should also be read alongside PLAY_SPAWN_INVUN_TICKS, the
+	// shield the draw hands the player: while both are up, neither can
+	// touch the other, which is the disengage window the whole exchange
+	// needs given the boss is the faster of the two.
+	// It is ALSO how long the boss spends running away (see TickBoss), so
+	// it has to be long enough to actually break contact - at a board's
+	// base cadence this is a dozen or so steps, which puts real distance
+	// between them. Shortening it makes the fight one long shove again.
+	PLAY_BOSS_HIT_INVUN_MS = 4000;
+	PLAY_BOSS_HIT_INVUN_TICKS = PLAY_BOSS_HIT_INVUN_MS div TICK_MS;
+
+	// THE BOSS RUNS AT PLAYER SPEED - ticks FEWER between steps than the
+	// board's base cadence, and now zero of them.
+	//
+	// It was 1, at dengland's own request ("the boss should have a 1
+	// gear speed advantage though, increasing its base movement
+	// speed"), and he took it back the same session after playing
+	// against it: "I think we do dial down the gear of the boss to
+	// normal for a snake again."
+	//
+	// What the advantage really cost was the FIGHT. A boss you cannot
+	// outrun is not more frightening, it is less interactive: it decides
+	// every meeting, arrives before you are ready, and the head-on -
+	// the only weapon there is - becomes something that happens to you
+	// rather than something you set up. At equal speed you can position,
+	// turn inside it, and choose the moment.
+	//
+	// It also removed the last excuse for treating boss collisions
+	// differently from any other snake's. Nobody is quicker, so nobody
+	// "gets there first", and the mutual-collision rule applies on its
+	// own terms - see the head-on in TickPlaySnakes.
+	//
+	// Kept as a constant rather than deleted: it is one number, the
+	// arithmetic around it is already written and clamped, and this is
+	// exactly the sort of thing that gets tried again.
+	PLAY_BOSS_GEAR_BONUS = 0;
+
+	// The boss's chase weighting, in the bees' own terms (toward :
+	// random : stall) - see TickPlayBees, whose chooser this is. Heavier
+	// on the chase than any bee, because there is only one of it and it
+	// is the whole level.
+	//
+	// STALL IS STILL NOT ZERO, for the same reason it never reaches zero
+	// for bees: a pure chaser moving at a fixed rate is solvable by
+	// arithmetic, and a player could compute exactly where it will be.
+	PLAY_BOSS_WEIGHT_TOWARD = 6;
+	PLAY_BOSS_WEIGHT_RANDOM = 1;
+	PLAY_BOSS_WEIGHT_STALL = 1;
+
+	// Landing a hit on the boss - worth several bees, since it means
+	// having deliberately driven head-first into the one thing on the
+	// board that is faster than you.
+	PLAY_BOSS_HIT_PTS = 5000;
+
+	// Killing it outright, paid to whoever lands the last hit ON TOP of
+	// that hit's own points. The level's whole objective, and the
+	// biggest single award in the game.
+	PLAY_BOSS_KILL_PTS = 20000;
+
+	// The victory beat after the boss dies, before the next level is
+	// built. Not decoration: killing the boss releases the frozen clock
+	// (see KillBoss), and NextLevel then arrives on the ordinary path
+	// with the shake and the final SlotStatus already sent rather than
+	// being thrown away by the rebuild.
+	PLAY_BOSS_CLEAR_MS = 2500;
+	PLAY_BOSS_CLEAR_TICKS = PLAY_BOSS_CLEAR_MS div TICK_MS;
+
+	// Frames of screen shake cued when the boss takes a hit and when it
+	// finally dies. The client owns the effect (see SendShake); these
+	// are the only two moments in real play that use it, and they are
+	// the two that most need to be unmistakable.
+	PLAY_BOSS_HIT_SHAKE = 8;
+	PLAY_BOSS_KILL_SHAKE = 25;
 
 
 procedure DoDestroyListMessages;
@@ -3939,27 +4514,63 @@ procedure TSnakeGame.RemoveWatcher(APlayer: TPlayer);
 // first caller (the attract-mode bounce), but any future per-tick
 // gameplay update rides the same message. Not gated on Watchers itself;
 // callers are expected to only call this per-Watcher (see Tick).
+// SendTileDeltas - broadcast changed cells, SPLIT ACROSS AS MANY
+// MESSAGES AS IT TAKES. Caller holds Lock.
+//
+// One message holds at most PLAY_DELTAS_PER_MSG cells, because the stack
+// caps a payload at 235 bytes and a delta is three: 1 + 78 x 3 = 235
+// exactly. Anything longer than that used to be DROPPED - Tick gathered
+// into a 78-entry array and EmitCell silently discarded the overflow.
+//
+// THAT CEILING WAS NEVER A BOSS PROBLEM, though the boss is what
+// exposed it (dengland, 2026-08-26: "isn't that going to apply to any
+// snake?"). It applies to every snake on the board: MAX_SNAKE_LEN is 64,
+// a snake repaints its WHOLE body whenever its invulnerability flash
+// flips, and that flip happens every tick - so one well-fed player with
+// a shield could exceed the budget on its own, quietly, with nothing to
+// show for it but stale cells until the next full sync.
+//
+// Chunking costs the client a second message on the rare heavy tick.
+// That is the right trade: the alternative is not "cheaper", it is
+// "wrong", and the client's handler is address-driven and stateless
+// per message, so two arriving together apply exactly as one would.
 procedure TSnakeGame.SendTileDeltas(APlayer: TPlayer; const ADeltas: array of TTileDelta);
 	var
 	m: TBaseMessage;
-	i: Integer;
+	i, n, sent, chunk: Integer;
 
 	begin
-	m:= TBaseMessage.Create;
-	m.Category:= mcPlay;
-	m.Method:= $09;
+	sent:= 0;
+	n:= Length(ADeltas);
 
-	SetLength(m.Data, 1 + Length(ADeltas) * 3);
-	m.Data[0]:= Length(ADeltas);
-
-	for i:= 0 to High(ADeltas) do
+	// A zero-length send is not worth a message - and the loop below
+	// would not produce one anyway, so say it here rather than leave the
+	// caller wondering.
+	while sent < n do
 		begin
-		m.Data[1 + i * 3]:= ADeltas[i].Row;
-		m.Data[1 + i * 3 + 1]:= ADeltas[i].Col;
-		m.Data[1 + i * 3 + 2]:= ADeltas[i].Tile;
-		end;
+		chunk:= n - sent;
 
-	APlayer.AddSendMessage(m);
+		if  chunk > PLAY_DELTAS_PER_MSG then
+			chunk:= PLAY_DELTAS_PER_MSG;
+
+		m:= TBaseMessage.Create;
+		m.Category:= mcPlay;
+		m.Method:= $09;
+
+		SetLength(m.Data, 1 + chunk * 3);
+		m.Data[0]:= chunk;
+
+		for i:= 0 to chunk - 1 do
+			begin
+			m.Data[1 + i * 3]:= ADeltas[sent + i].Row;
+			m.Data[1 + i * 3 + 1]:= ADeltas[sent + i].Col;
+			m.Data[1 + i * 3 + 2]:= ADeltas[sent + i].Tile;
+			end;
+
+		APlayer.AddSendMessage(m);
+
+		Inc(sent, chunk);
+		end;
 	end;
 
 // Shake (mcPlay/$0C) - payload is [frames]. "We can just send a message
@@ -4107,6 +4718,24 @@ function SegShape(ADirIn, ADirOut: TSnakeDir): Integer;
 		Result:= SHAPE_ES;
 	end;
 
+// The reverse of ADir.
+//
+// Written out rather than done with arithmetic on the ordinals, even
+// though TSnakeDir's pairs happen to sit next to each other: that is a
+// coincidence of the declaration order, and a reordering would break
+// this silently and in a way that only showed up as snakes turning
+// inside out.
+function OppositeDir(ADir: TSnakeDir): TSnakeDir;
+	begin
+	case ADir of
+		sdUp:    Result:= sdDown;
+		sdDown:  Result:= sdUp;
+		sdLeft:  Result:= sdRight;
+	else
+		Result:= sdLeft;
+		end;
+	end;
+
 // Move one cell in ADir.
 procedure StepCell(var ARow, ACol: Byte; ADir: TSnakeDir);
 	begin
@@ -4218,7 +4847,7 @@ procedure TSnakeGame.InitDemoSnakes;
 
 	// The reel starts on the first wave, after the same settling beat.
 	DemoWave:= dwLava;
-	DemoLavaPhase:= dlpIdle;
+	DemoLavaPhase:= lpIdle;
 	DemoLavaStep:= 0;
 	DemoLavaHold:= 0;
 	DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
@@ -4230,6 +4859,17 @@ procedure TSnakeGame.InitDemoSnakes;
 	DemoFoodLeft:= 0;
 	DemoBossLeft:= 0;
 	DemoShakePending:= 0;
+
+	// Real play's own hazards. StartPlay arms both properly, but a board
+	// spends its whole life in attract mode until somebody claims a
+	// corner and these must not be reading rubbish before then - the
+	// boss slot in particular is walked by every Z-order helper.
+	ResetPlayLava;
+
+	PlaySnakes[SNAKE_SLOT_BOSS].Alive:= False;
+	PlaySnakes[SNAKE_SLOT_BOSS].Floating:= False;
+	BossLives:= 0;
+	BossWake:= 0;
 
 	for b:= 0 to High(DemoBees) do
 		DemoBees[b].Active:= False;
@@ -4461,15 +5101,24 @@ procedure TSnakeGame.TickDemoSnakes(var ADeltas: array of TTileDelta;
 		end;
 	end;
 
-// How far one pool spreads at this level progress - see
-// DEMO_LAVA_CELLS_BASE. Clamped to the array bound so a long game can't
-// walk off the end of TDemoLava.Cells.
+// --- LAVA, SHARED ----------------------------------------------------
+//
+// The three primitives below are the whole of what lava DOES; the two
+// tick procedures that call them (TickDemoLava, TickPlayLava) are only
+// phase machines and pacing. Split out 2026-08-26 when lava was given
+// real play stages - see TLavaPhase's own note on why there is one
+// definition of this rather than two.
+
+// How far one ATTRACT-REEL pool spreads at this level progress - see
+// DEMO_LAVA_CELLS_BASE. Real play has its own, PlayLavaMaxCells, on its
+// own numbers. Both clamp to the shared array bound so a long game
+// can't walk off the end of TLavaPool.Cells.
 function LavaMaxCells(AProgress: Integer): Integer;
 	begin
 	Result:= DEMO_LAVA_CELLS_BASE + AProgress * DEMO_LAVA_CELLS_PER_LEVEL;
 
-	if  Result > DEMO_LAVA_CELLS_CAP then
-		Result:= DEMO_LAVA_CELLS_CAP;
+	if  Result > LAVA_CELLS_CAP then
+		Result:= LAVA_CELLS_CAP;
 	end;
 
 // The colour tier for the AGE-th cell of a lava pool. Fixed when the
@@ -4495,109 +5144,222 @@ function LavaTile(AAge, AMax: Integer): Byte;
 	Result:= TILE_LAVA_BASE + tier;
 	end;
 
+// LavaSeedPool - start a pool at (ARow, ACol). Caller holds Lock.
+//
+// Refuses anything but bare floor and simply leaves the pool empty,
+// which every caller then treats as "this pool sits this cycle out".
+procedure TSnakeGame.LavaSeedPool(var APool: TLavaPool; ARow, ACol,
+		AMaxCells: Integer; var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	begin
+	APool.Count:= 0;
+
+	if  (ARow <= 0) or (ARow >= BOARD_ROWS - 1)
+	or  (ACol <= 0) or (ACol >= BOARD_COLS - 1) then
+		Exit;
+
+	if  Board[ARow][ACol] <> TILE_FLOOR then
+		Exit;
+
+	APool.Cells[0].Row:= ARow;
+	APool.Cells[0].Col:= ACol;
+	APool.Count:= 1;
+
+	EmitCell(ARow, ACol, LavaTile(0, AMaxCells), ADeltas, ADeltaCount);
+	end;
+
+// LavaGrowOnce - try once to grow APool by a single cell. Caller holds
+// Lock. Returns False if the attempt came to nothing, which is normal
+// and not an error: the caller retries a bounded number of times.
+//
+// Deliberately NOT a true Game-of-Life rule - a real one is
+// unpredictable enough to either die out or run away across the whole
+// board, and neither is what this wants. This gives the same organic
+// creeping look with a hard bound.
+function TSnakeGame.LavaGrowOnce(var APool: TLavaPool; ATop, ALeft, ABottom,
+		ARight, AMaxCells, AClear: Integer; const AHeads: TLavaHeads;
+		var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer): Boolean;
+	var
+	src: TLavaCell;
+	have, nr, nc, k: Integer;
+
+	begin
+	Result:= False;
+
+	have:= APool.Count;
+
+	if  (have < 1) or (have >= AMaxCells) then
+		Exit;
+
+	// Source from the advancing FRONT, not the whole pool - see
+	// DEMO_LAVA_FRONTIER. Cells are in creation order, so the front is
+	// simply the tail of the array.
+	if  have > DEMO_LAVA_FRONTIER then
+		src:= APool.Cells[have - 1 - Random(DEMO_LAVA_FRONTIER)]
+	else
+		src:= APool.Cells[Random(have)];
+
+	nr:= src.Row;
+	nc:= src.Col;
+
+	case Random(4) of
+		0: Dec(nr);
+		1: Inc(nr);
+		2: Dec(nc);
+	else
+		Inc(nc);
+		end;
+
+	// The caller's box. For the reel that is one clear cell inside its
+	// circuit; for real play it is the board's own playable interior.
+	if  (nr <= ATop) or (nr >= ABottom)
+	or  (nc <= ALeft) or (nc >= ARight) then
+		Exit;
+
+	// Floor, or FOOD, which it burns up on the way through (dengland,
+	// 2026-08-26). Everything else refuses it, and that one test is the
+	// whole legality rule - it still means "cannot spread through walls,
+	// over snake bodies and tails, onto a bee, or over the boss" with no
+	// per-hazard special cases and nothing to forget when a tile type is
+	// added.
+	//
+	// It is also why lava can never bury a snake and desynchronise the
+	// board from the models, the failure the spawn sweep and the tail
+	// vacate both had to be fixed for.
+	//
+	// Burning food matters more than it sounds on a lava stage: the
+	// swarm is switched off there, so food is the only thing on the
+	// board worth crossing it for, and lava that politely flowed around
+	// the prize made the decision for the player. Now the pools take the
+	// board AND what is on it, and a piece of food inside a spreading
+	// pool is a closing window rather than a permanent invitation.
+	if  Board[nr][nc] <> TILE_FLOOR then
+		begin
+		if  (Board[nr][nc] < TILE_FOOD_BASE)
+		or  (Board[nr][nc] >= TILE_FOOD_BASE + FOOD_TYPE_COUNT) then
+			Exit;
+
+		// Struck off the table as well as painted over - the same
+		// courtesy the spawn sweep pays, and for the same reason: a food
+		// slot left spoken for means the board quietly supports less
+		// food until the TTL runs out. Harmless in the attract reel,
+		// whose food is written straight to tiles and is not in this
+		// table at all.
+		ClearFoodAt(nr, nc);
+		end;
+
+	// ...but a cell being empty right now is not enough on its own:
+	// lava appearing directly in front of a snake would be an
+	// unavoidable death nobody could have read. Keep clear of every
+	// head the caller listed, the way the original keeps bee spawns
+	// clear (checkPlaceBee).
+	//
+	// NOTE the original's rule is not the box it looks like:
+	// isOutsideRect ANDs the two axis tests, so it actually blocks the
+	// whole row band AND column band through the head, a cross spanning
+	// the board. Fine for a bee, which spawns once - far too much for
+	// lava, which would be locked out of most of the board by four
+	// snakes at once. So this is the box the original reads as
+	// intending.
+	for k:= 0 to AHeads.Count - 1 do
+		if  (Abs(nr - AHeads.Row[k]) <= AClear)
+		and (Abs(nc - AHeads.Col[k]) <= AClear) then
+			Exit;
+
+	APool.Cells[APool.Count].Row:= nr;
+	APool.Cells[APool.Count].Col:= nc;
+	EmitCell(nr, nc, LavaTile(APool.Count, AMaxCells), ADeltas, ADeltaCount);
+	Inc(APool.Count);
+
+	Result:= True;
+	end;
+
+// LavaRecedeOnce - give up APool's NEWEST cell. Caller holds Lock.
+// Returns False when the pool is already empty.
+//
+// Newest-first, so a pool drains back toward its own bright centre
+// rather than hollowing out from the middle.
+function TSnakeGame.LavaRecedeOnce(var APool: TLavaPool;
+		var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer): Boolean;
+	begin
+	Result:= False;
+
+	if  APool.Count <= 0 then
+		Exit;
+
+	Dec(APool.Count);
+
+	// ONLY CLEAR A CELL THAT IS STILL OURS. Lava writes its own tiles,
+	// so anything else standing there now means something took the cell
+	// over since - a snake moving through where lava used to be, a spawn
+	// sweep clearing a corner - and blanking it would erase that
+	// instead, which reads as corruption. Cheap insurance: the pool just
+	// gives the cell up.
+	//
+	// ClearLavaAt exploits this directly, parking a swept cell on (0, 0)
+	// - the border wall, which can never be lava - so this test skips it
+	// without needing to know it happened.
+	with APool.Cells[APool.Count] do
+		if  (Board[Row][Col] >= TILE_LAVA_BASE)
+		and (Board[Row][Col] < TILE_LAVA_BASE + LAVA_TIER_COUNT) then
+			EmitCell(Row, Col, TILE_FLOOR, ADeltas, ADeltaCount);
+
+	Result:= True;
+	end;
+
+// DemoLavaHeads / PlayLavaHeads - the heads LavaGrowOnce must keep away
+// from. Caller holds Lock.
+procedure TSnakeGame.DemoLavaHeads(out AHeads: TLavaHeads);
+	var
+	k: Integer;
+
+	begin
+	AHeads.Count:= 0;
+
+	for k:= 0 to High(DemoSnakes) do
+		begin
+		AHeads.Row[AHeads.Count]:= DemoSnakes[k].Body[0].Row;
+		AHeads.Col[AHeads.Count]:= DemoSnakes[k].Body[0].Col;
+		Inc(AHeads.Count);
+		end;
+	end;
+
+// LIVE snakes only, and the boss counts. It has no lives to lose to a
+// lava bloom, but lava spreading over the cell it is about to step into
+// would block it silently, and a boss stuck in a lava pocket is a level
+// that cannot be cleared. Bees are NOT listed: they are not on a lava
+// stage at all (PlayBeeMax returns 0 there).
+procedure TSnakeGame.PlayLavaHeads(out AHeads: TLavaHeads);
+	var
+	k: Integer;
+
+	begin
+	AHeads.Count:= 0;
+
+	for k:= 0 to SNAKE_RENDER_SLOTS - 1 do
+		if  PlaySnakes[k].Alive then
+			begin
+			AHeads.Row[AHeads.Count]:= PlaySnakes[k].Body[0].Row;
+			AHeads.Col[AHeads.Count]:= PlaySnakes[k].Body[0].Col;
+			Inc(AHeads.Count);
+			end;
+	end;
+
+// TickDemoLava - the attract reel's lava wave. Caller holds Lock.
+//
+// PHASE MACHINE AND PACING ONLY since 2026-08-26; everything lava
+// actually does now lives in LavaSeedPool/LavaGrowOnce/LavaRecedeOnce,
+// shared with real play. The behaviour here is unchanged - the
+// primitives were lifted from this routine, not written to replace it.
 procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 		var ADeltaCount: Integer);
 	var
 	b, i, n, tries, grown: Integer;
 	full: Boolean;
 	r, c, maxcells: Integer;
-
-	// True if (ARow, ACol) is too close to any live snake's head for
-	// lava to be allowed to appear there - see the call site.
-	function LavaBlockedNearHead(ARow, ACol: Integer): Boolean;
-		var
-		k: Integer;
-
-		begin
-		Result:= True;
-
-		for k:= 0 to High(DemoSnakes) do
-			with DemoSnakes[k].Body[0] do
-				if  (Abs(ARow - Row) <= DEMO_LAVA_HEAD_CLEAR)
-				and (Abs(ACol - Col) <= DEMO_LAVA_HEAD_CLEAR) then
-					Exit;
-
-		Result:= False;
-		end;
-
-	// Try once to grow pool b by one cell: pick a random cell already in
-	// it and a random orthogonal neighbour. Deliberately NOT a true
-	// Game-of-Life rule - a real one is unpredictable enough to either
-	// die out or run away across the whole board, and neither is what an
-	// attract screen wants. This gives the same organic creeping look
-	// with a hard bound.
-	function GrowOnce(APool: Integer): Boolean;
-		var
-		src: TDemoCell;
-		have, nr, nc: Integer;
-
-		begin
-		Result:= False;
-
-		have:= DemoLava[APool].Count;
-
-		if  have >= maxcells then
-			Exit;
-
-		// Source from the advancing FRONT, not the whole pool - see
-		// DEMO_LAVA_FRONTIER. Cells are in creation order, so the front
-		// is simply the tail of the array.
-		if  have > DEMO_LAVA_FRONTIER then
-			src:= DemoLava[APool].Cells[have - 1 - Random(DEMO_LAVA_FRONTIER)]
-		else
-			src:= DemoLava[APool].Cells[Random(have)];
-		nr:= src.Row;
-		nc:= src.Col;
-
-		case Random(4) of
-			0: Dec(nr);
-			1: Inc(nr);
-			2: Dec(nc);
-		else
-			Inc(nc);
-			end;
-
-		// Stay one clear cell INSIDE the demo circuit - see
-		// DEMO_LAVA_CELLS_BASE's comment for why lava must never be
-		// able to reach a snake.
-		if  (nr <= DEMO_TOP) or (nr >= DEMO_BOTTOM)
-		or (nc <= DEMO_LEFT) or (nc >= DEMO_RIGHT) then
-			Exit;
-
-		// Only ever claim empty floor. This one test is what stops lava
-		// spreading THROUGH walls, over snake bodies and tails, or onto
-		// food - anything that is not bare floor simply refuses it, with
-		// no per-hazard special cases. Cheaper and more robust than
-		// searching our own cell list too.
-		if  Board[nr][nc] <> TILE_FLOOR then
-			Exit;
-
-		// ...but a cell being empty right now is not enough on its own:
-		// lava appearing directly in front of a snake would be an
-		// unavoidable death nobody could have read. Keep clear of every
-		// live head, the way the original keeps bee spawns clear
-		// (checkPlaceBee).
-		//
-		// NOTE the original's rule is not the 5x5 box it looks like:
-		// isOutsideRect ANDs the two axis tests, so it actually blocks
-		// the whole 5-wide row band AND column band through the head, a
-		// cross spanning the board. Fine for a bee, which spawns once -
-		// far too much for lava, which would be locked out of most of
-		// the board by four snakes at once. So this is the box the
-		// original reads as intending.
-		if  LavaBlockedNearHead(nr, nc) then
-			Exit;
-
-		with DemoLava[APool] do
-			begin
-			Cells[Count].Row:= nr;
-			Cells[Count].Col:= nc;
-			EmitCell(nr, nc, LavaTile(Count, maxcells), ADeltas, ADeltaCount);
-			Inc(Count);
-			end;
-
-		Result:= True;
-		end;
+	heads: TLavaHeads;
 
 	begin
 	// Everything below moves on a STEP, not on every tick - the pool
@@ -4613,8 +5375,10 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 	// How far the pools spread on THIS board, at its current progress.
 	maxcells:= LavaMaxCells(LevelProgress);
 
+	DemoLavaHeads(heads);
+
 	case DemoLavaPhase of
-	dlpIdle:
+	lpIdle:
 		begin
 		// Seed the pools: DEMO_LAVA_SEEDS of them, evenly spaced across
 		// the middle of the circuit's interior. Two lands them left and
@@ -4622,26 +5386,18 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 		// spacing generalises if that count ever changes.
 		for b:= 0 to High(DemoLava) do
 			begin
-			DemoLava[b].Count:= 0;
-
 			r:= (DEMO_TOP + DEMO_BOTTOM) div 2;
 			c:= DEMO_LEFT
 					+ ((DEMO_RIGHT - DEMO_LEFT) * (2 * b + 1))
 						div (2 * DEMO_LAVA_SEEDS);
 
-			if  Board[r][c] = TILE_FLOOR then
-				begin
-				DemoLava[b].Cells[0].Row:= r;
-				DemoLava[b].Cells[0].Col:= c;
-				DemoLava[b].Count:= 1;
-				EmitCell(r, c, LavaTile(0, maxcells), ADeltas, ADeltaCount);
-				end;
+			LavaSeedPool(DemoLava[b], r, c, maxcells, ADeltas, ADeltaCount);
 			end;
 
-		DemoLavaPhase:= dlpGrow;
+		DemoLavaPhase:= lpGrow;
 		end;
 
-	dlpGrow:
+	lpGrow:
 		begin
 		full:= True;
 
@@ -4655,7 +5411,13 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 			while (grown < DEMO_LAVA_PER_STEP)
 			and (tries < DEMO_LAVA_PER_STEP * 8) do
 				begin
-				if  GrowOnce(b) then
+				// Stay one clear cell INSIDE the demo circuit - see
+				// DEMO_LAVA_CELLS_BASE's comment for why reel lava must
+				// never be able to reach a snake.
+				if  LavaGrowOnce(DemoLava[b], DEMO_TOP, DEMO_LEFT,
+						DEMO_BOTTOM, DEMO_RIGHT, maxcells,
+						DEMO_LAVA_HEAD_CLEAR, heads,
+						ADeltas, ADeltaCount) then
 					Inc(grown);
 
 				Inc(tries);
@@ -4667,49 +5429,31 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 
 		if  full then
 			begin
-			DemoLavaPhase:= dlpHold;
+			DemoLavaPhase:= lpHold;
 			DemoLavaHold:= DEMO_LAVA_HOLD_TICKS;
 			end;
 		end;
 
-	dlpHold:
+	lpHold:
 		begin
 		Dec(DemoLavaHold, DEMO_LAVA_STEP_TICKS);
 
 		if  DemoLavaHold <= 0 then
-			DemoLavaPhase:= dlpRecede;
+			DemoLavaPhase:= lpRecede;
 		end;
 
-	dlpRecede:
+	lpRecede:
 		begin
 		n:= 0;
 
-		// Newest-first, so the pool drains back toward its own bright
-		// centre rather than hollowing out from the middle.
 		for b:= 0 to High(DemoLava) do
 			for i:= 1 to DEMO_LAVA_PER_STEP do
-				if  DemoLava[b].Count > 0 then
-					begin
-					Dec(DemoLava[b].Count);
-
-					// Only clear a cell that is still OURS. Lava writes
-					// its own tiles, so anything else standing there now
-					// means something took the cell over since (a snake
-					// moving through it, once lava is allowed near the
-					// path at all) - and blanking it would erase that
-					// instead, which reads as corruption. Cheap
-					// insurance: the pool just gives the cell up.
-					with DemoLava[b].Cells[DemoLava[b].Count] do
-						if  (Board[Row][Col] >= TILE_LAVA_BASE)
-						and (Board[Row][Col] < TILE_LAVA_BASE + LAVA_TIER_COUNT) then
-							EmitCell(Row, Col, TILE_FLOOR, ADeltas, ADeltaCount);
-
+				if  LavaRecedeOnce(DemoLava[b], ADeltas, ADeltaCount) then
 					Inc(n);
-					end;
 
 		if  n = 0 then
 			begin
-			DemoLavaPhase:= dlpIdle;
+			DemoLavaPhase:= lpIdle;
 			DemoWave:= dwBees;			// next in the reel
 			DemoWaveWait:= DEMO_WAVE_GAP_TICKS;
 			end;
@@ -4743,6 +5487,36 @@ procedure TSnakeGame.TickDemoLava(var ADeltas: array of TTileDelta;
 // past expert reaches 0 - the original's turbo2, "DO NOT USE turbo
 // settings, especially turbo2!" (server.lua:46) - and then goes
 // negative, which would be a step every zero ticks.
+// InvunFlashOn - is a snake with ATicks of invulnerability left showing
+// its flash tile THIS tick?
+//
+// The phase is derived from the countdown itself rather than kept as
+// state, so it needs no per-snake bookkeeping and cannot drift.
+//
+// IT SLOWS DOWN NEAR THE END, which is the whole reason this is a
+// function and not an expression written out twice. Below
+// PLAY_INVUN_WARN_TICKS the flash runs at PLAY_INVUN_WARN_SLOW times
+// the period, so a shield about to expire looks visibly different from
+// one that has just been picked up - see the constants for why slower
+// rather than faster.
+function InvunFlashOn(ATicks: Integer): Boolean;
+	var
+	period: Integer;
+
+	begin
+	Result:= False;
+
+	if  ATicks <= 0 then
+		Exit;
+
+	period:= DEMO_INVUN_FLASH_TICKS;
+
+	if  ATicks <= PLAY_INVUN_WARN_TICKS then
+		period:= period * PLAY_INVUN_WARN_SLOW;
+
+	Result:= ((ATicks div period) and 1) = 0;
+	end;
+
 function SnakeStepTicks(AProgress: Integer): Integer;
 	begin
 	Result:= SNAKE_SPEED_NORMAL + 2 - AProgress;
@@ -4796,11 +5570,20 @@ procedure TSnakeGame.SpawnPlayerSnake(ASlot: Integer;
 		or  IsSnakeTile(Board[ARow][ACol]) then
 			Exit;
 
-		// Food and bees swept up this way have to be struck off their
-		// tables too, or the slot stays spoken for until the TTL runs out
-		// and the board quietly supports less of them.
+		// Food, bees and lava swept up this way have to be struck off
+		// their tables too, or the slot stays spoken for until the TTL
+		// runs out and the board quietly supports less of them.
+		//
+		// Lava joined the list when it gained real play stages
+		// (2026-08-26). Its pool would not have leaked a slot the way
+		// food and bees do - LavaRecedeOnce declines to clear a cell
+		// that is no longer lava, so nothing would have been corrupted -
+		// but the pool would have gone on believing it was that much
+		// bigger than it was, and grown that much less. See ClearLavaAt
+		// for why it parks the cell rather than removing it.
 		ClearFoodAt(ARow, ACol);
 		ClearBeeAt(ARow, ACol);
+		ClearLavaAt(ARow, ACol);
 
 		EmitCell(ARow, ACol, TILE_FLOOR, ADeltas, ADeltaCount);
 		end;
@@ -5015,8 +5798,31 @@ procedure TSnakeGame.SetPlayerLook(APlayer: TPlayer; ADir: TSnakeDir);
 					else     bad:= sdLeft;
 					end;
 
-				if  ADir <> bad then
+				if  (ADir <> bad) and (ADir <> PlaySnakes[i].Look) then
+					begin
 					PlaySnakes[i].Look:= ADir;
+
+					// SHOW IT NOW - before the step is attempted, and so
+					// before anything has decided whether it can even be
+					// made (dengland, 2026-08-26: "it should be showing
+					// the turn before its made so before its determined
+					// that it can't be done").
+					//
+					// That is what the telegraph is FOR. The head is
+					// shaped from Dir toward Look precisely so a turn
+					// shows the moment it is decided rather than when
+					// the body follows it, and the original repaints the
+					// head as soon as input arrives (playersTick) for
+					// exactly this reason.
+					//
+					// A FLAG rather than a direct paint, because this
+					// runs on the message thread and has no delta array
+					// to write into - Tick owns that. It is picked up at
+					// the top of the next TickPlaySnakes pass, which is
+					// one tick at worst and always before the step it
+					// belongs to.
+					PlayHeadDirty[i]:= True;
+					end;
 
 				Break;
 				end;
@@ -5268,6 +6074,66 @@ function TSnakeGame.PlayGearFor(ASlot: Integer): Integer;
 		Result:= SNAKE_SPEED_TOP;
 	end;
 
+// RandomFoodKind - which food to put down. Caller holds Lock.
+//
+// NOT FOOD_TYPE_COUNT anywhere in here: the key is SCHEDULED, never
+// rolled, so it can only ever arrive through TrySpawnKey. See
+// FOOD_RANDOM_KINDS.
+//
+// THE BOSS STAGE RE-WEIGHTS THE TABLE (dengland, 2026-08-26: "do we
+// change the food distribution so there are fewer slow and grows and
+// more invincibles and fasts? I think perhaps yes"), and the reason it
+// wants to is specific to that stage rather than general. On a boss
+// level the thing chasing you is FASTER than you are, so the two foods
+// that make you longer and slower are actively working against the
+// player, while the shield is the only thing that makes the boss's body
+// survivable to be near - and getting near it is the entire objective,
+// since the head-on is the only weapon.
+//
+// So the weights follow the stage's own logic rather than being a
+// difficulty knob: 4 shield, 3 pure speed, 2 no-grow, 1 extra-grow, out
+// of ten. The slow, growing food is still THERE - it is the cheapest
+// scoring food on the board and taking one is a real decision under
+// pressure - it is simply no longer as likely as everything else.
+//
+// Every other stage keeps the flat roll it has always had.
+function TSnakeGame.RandomFoodKind: Integer;
+	var
+	i, total, pick: Integer;
+
+	begin
+	if  not StageHasBoss then
+		begin
+		Result:= Random(FOOD_RANDOM_KINDS);
+
+		Exit;
+		end;
+
+	total:= 0;
+
+	for i:= 0 to FOOD_RANDOM_KINDS - 1 do
+		Inc(total, PLAY_FOOD_WEIGHT_BOSS[i]);
+
+	pick:= Random(total);
+
+	for i:= 0 to FOOD_RANDOM_KINDS - 1 do
+		begin
+		Dec(pick, PLAY_FOOD_WEIGHT_BOSS[i]);
+
+		if  pick < 0 then
+			begin
+			Result:= i;
+
+			Exit;
+			end;
+		end;
+
+	// Unreachable while the weights are positive, but a weight table
+	// edited down to all zeroes would otherwise fall out of here with
+	// Result undefined.
+	Result:= 0;
+	end;
+
 // TickPlayFood - age the food on the board and roll for one more.
 // Caller holds Lock.
 //
@@ -5331,9 +6197,7 @@ procedure TSnakeGame.TickPlayFood(var ADeltas: array of TTileDelta;
 	if  Board[r][c] <> TILE_FLOOR then
 		Exit;
 
-	// NOT FOOD_TYPE_COUNT - the key is scheduled, never rolled. See
-	// FOOD_RANDOM_KINDS.
-	kind:= Random(FOOD_RANDOM_KINDS);
+	kind:= RandomFoodKind;
 
 	PlayFood[free].Row:= r;
 	PlayFood[free].Col:= c;
@@ -5419,10 +6283,11 @@ procedure TSnakeGame.NextLevel;
 	LevelBeesEaten:= 0;
 	LevelSecsSent:= -1;			// force the clock out again
 
-	// AFTER LevelNumber has moved - ResetLevelKeys reads LevelStage,
-	// which is derived from it, so arming the schedule before the
-	// increment would give this level the PREVIOUS stage's key budget.
+	// AFTER LevelNumber has moved - both of these read LevelStage, which
+	// is derived from it, so arming them before the increment would give
+	// this level the PREVIOUS stage's key budget and lava tier.
 	ResetLevelKeys;
+	ResetPlayLava;
 
 	BuildLevel(LevelVariant, LevelProgress);
 
@@ -5435,16 +6300,25 @@ procedure TSnakeGame.NextLevel;
 	// Everyone still holding a corner starts again on it. A snake that
 	// was mid-board when the clock ran out would otherwise find itself
 	// inside whatever the new pattern put there.
-	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
-		begin
+	//
+	// SNAKE_RENDER_SLOTS for the same reason StartPlay uses it: the boss
+	// goes down with everybody else and is re-laid below only if this
+	// stage wants one. Note the boss is very often ALREADY dead here -
+	// killing it is what ended the level - and clearing it again is
+	// harmless.
+	for i:= 0 to SNAKE_RENDER_SLOTS - 1 do
 		PlaySnakes[i].Alive:= False;
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
 		PlayRespawn[i]:= 0;
-		end;
 
 	// As in StartPlay: the spawns write straight into Board and go out
 	// with the whole-board push below, so their deltas are thrown away.
 	SetLength(deltas, 64);
 	deltaCount:= 0;
+
+	if  StageHasBoss then
+		SpawnBoss(deltas, deltaCount);
 
 	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
 		if  Assigned(Slots[i].Player) then
@@ -5506,7 +6380,12 @@ function TSnakeGame.SolidSnakeAt(ARow, ACol: Byte; AExclude: Integer): Integer;
 	begin
 	Result:= -1;
 
-	for k:= 0 to SNAKE_PLAYER_COUNT - 1 do
+	// SNAKE_RENDER_SLOTS, so the BOSS is in the answer. This is what
+	// gives the boss collision without a line of collision code being
+	// written for it - see PlaySnakes' own note. It also means a caller
+	// can get SNAKE_SLOT_BOSS back from here, and TickPlaySnakes reads
+	// exactly that to tell a boss hit from an ordinary one.
+	for k:= 0 to SNAKE_RENDER_SLOTS - 1 do
 		if  (k <> AExclude) and PlaySnakes[k].Alive
 		and not PlaySnakes[k].Floating then
 			for j:= 0 to PlaySnakes[k].Len - 1 do
@@ -5847,7 +6726,25 @@ function TSnakeGame.PlayBeeMax: Integer;
 		Exit;
 		end;
 
-	Result:= PLAY_BEE_BASE + (LevelProgress * PLAY_BEE_PER_PROGRESS);
+	// HALVED AGAINST PROGRESS (dengland, 2026-08-26: "can we halve the
+	// progress bees effect somehow?"), the same session the swarm was
+	// given the ability to attack at all. The two go together: bees that
+	// could only be run into needed numbers to be a threat, and bees
+	// that strike do not - the same board is far more dangerous with
+	// fewer of them on it.
+	//
+	// Halving the SLOPE rather than the base, so a gentle board is
+	// barely touched and a hard one is where the difference lands:
+	//
+	//   training  4 -> 3     easy  6 -> 4     normal  8 -> 5
+	//   hard     11 -> 6     expert  16 -> 9
+	//
+	// Anger and the last-30-seconds ramp still add on top of this, so
+	// the swarm can still build well past these figures within a level;
+	// what has changed is where it STARTS.
+	Result:= PLAY_BEE_BASE
+			+ ((LevelProgress * PLAY_BEE_PER_PROGRESS)
+				div PLAY_BEE_PROGRESS_DIV);
 
 	// Angered: every PLAY_BEE_ANGER_PER eaten on this level buys the
 	// swarm one more. dengland's own mechanic - see the constant.
@@ -5879,6 +6776,7 @@ procedure TSnakeGame.TickPlayBees(var ADeltas: array of TTileDelta;
 	b, k, best, dist, bestdist: Integer;
 	toward, stall, pick, attempts, a: Integer;
 	dr, dc, nr, nc, r, c: Integer;
+	chasing: Boolean;
 
 	// Chebyshev, the same measure the spawn clearance uses - a diagonal
 	// counts as one step, which is what "5 cells away" means to somebody
@@ -5989,7 +6887,21 @@ procedure TSnakeGame.TickPlayBees(var ADeltas: array of TTileDelta;
 		dr:= 0;
 		dc:= 0;
 
-		if  (pick < toward) and (PlayBees[b].Target >= 0) then
+		// ONLY A DELIBERATE CHASE STEP CAN KILL - see the strike below.
+		// dengland, 2026-08-26: "it should only be on the 2:1:1 move
+		// toward the snake chance that they kill you I think, its a
+		// little too often".
+		//
+		// A bee that blunders into a head on its RANDOM step has not
+		// hunted anybody down, and dying to one reads as arbitrary
+		// rather than as having been caught. Gating on the chase also
+		// makes the threat scale with the same weights everything else
+		// about the swarm scales with - at training the chase is 2 in 6
+		// and at expert 4 in 6, so bees get more lethal on hard boards
+		// without a single new number.
+		chasing:= (pick < toward) and (PlayBees[b].Target >= 0);
+
+		if  chasing then
 			begin
 			// Close the LARGER axis first. No pathfinding, by design: a
 			// blocked move is simply a lost move for this bee this step,
@@ -6031,13 +6943,75 @@ procedure TSnakeGame.TickPlayBees(var ADeltas: array of TTileDelta;
 		nr:= Integer(PlayBees[b].Row) + dr;
 		nc:= Integer(PlayBees[b].Col) + dc;
 
-		// Floor only - which is the whole legality test. It already means
-		// "cannot move through walls, snakes, tails, lava, food or
-		// another bee", with no case analysis and nothing to forget when
-		// a tile type is added. The border ring means there is no bounds
-		// check to write either.
+		// Floor, or A PLAYER'S HEAD - which it strikes.
+		//
+		// THE BEES COULD NOT ATTACK AT ALL until 2026-08-26. This test
+		// was floor-only, and a snake is not floor, so a bee adjacent to
+		// a head simply could not enter it: the swarm drifted toward
+		// players and then waited to be run into. Every death by bee up
+		// to now was the PLAYER driving into a stationary one. dengland
+		// spotted the behaviour without seeing the cause - "bees don't
+		// attack you enough. If they have an opportunity to kill you
+		// they don't really take it."
+		//
+		// THE HEAD ONLY, deliberately. Letting a bee land anywhere on a
+		// body would make length itself lethal - a long snake would be
+		// a wall of targets it cannot see or protect - and would punish
+		// the player for the one thing the game rewards. The head is
+		// also the part the player is steering and can defend, so a
+		// strike is something to be read and dodged rather than
+		// something that arrives from behind.
+		//
+		// Everything else still refuses the bee exactly as before:
+		// walls, lava, food, another bee, a body, a tail, and the boss.
 		if  Board[nr][nc] <> TILE_FLOOR then
+			begin
+			// Not hunting - so this is a bee bumping into scenery, and
+			// the scenery might happen to be a player. Refuse the move
+			// and leave them alone. See the note on `chasing`.
+			if  not chasing then
+				Continue;
+
+			// The MODELS answer this, not Board - a floating snake is
+			// not really there and cannot be hurt, which the tile alone
+			// cannot tell us. See TSnake.Floating.
+			k:= SolidSnakeAt(nr, nc, -1);
+
+			// Nothing killable there - or it is the BOSS, which is
+			// immune to the swarm and is not a bee's business at all
+			// (agreed with dengland when the stage cycle was designed).
+			if  (k < 0) or (k >= SNAKE_PLAYER_COUNT) then
+				Continue;
+
+			if  SnakeSegAt(k, nr, nc) <> 0 then
+				Continue;
+
+			// CONTACT DESTROYS THE BEE EITHER WAY, shield or no shield -
+			// the same rule the player's own side of this collision
+			// already follows (see TickPlaySnakes), and the original's
+			// too: it clears the tile unconditionally and only the
+			// SCORING depends on being invulnerable.
+			if  Board[PlayBees[b].Row][PlayBees[b].Col] = TILE_BEE then
+				EmitCell(PlayBees[b].Row, PlayBees[b].Col, TILE_FLOOR,
+						ADeltas, ADeltaCount);
+
+			PlayBees[b].Active:= False;
+
+			if  PlaySnakes[k].InvunTicks > 0 then
+				begin
+				// Shielded, so the bee threw itself away on somebody it
+				// could not hurt. Scored as a kill for the same reason
+				// the player's own swat is - and it angers the swarm,
+				// which is what makes a heart food a hunting licence.
+				AddScore(k, PLAY_BEE_PTS);
+				SlotStatusToAll(k);
+				Inc(LevelBeesEaten);
+				end
+			else
+				KillPlayerSnake(k, ADeltas, ADeltaCount);
+
 			Continue;
+			end;
 
 		// Only clear the cell being LEFT if it is still ours - the same
 		// check this routine's own expiry makes a few dozen lines up, and
@@ -6176,6 +7150,1488 @@ procedure TSnakeGame.TrySpawnBee(var ADeltas: array of TTileDelta;
 	end;
 
 
+// --- LAVA IN REAL PLAY (stages 4 and 7) ---------------------------------
+
+// LavaTier - how bad the lava is on THIS stage: 1 for the cycle's first
+// lava level, 2 for its second, 0 for a level that has none. Caller
+// holds Lock.
+//
+// dengland asked for the first one to be less terrifying than the second
+// (2026-08-26). It already scaled with difficulty and progress - both
+// feed PlayLavaMaxCells - but progress rises by only three between
+// stages 4 and 7, and on a board that has reached its MaxProgress
+// ceiling it does not rise at all, so within one cycle the two lava
+// levels were near enough identical. The tier is the explicit
+// difference, on top of whatever the progress scaling is doing.
+function TSnakeGame.LavaTier: Integer;
+	begin
+	Result:= PLAY_STAGE_LAVA_TIER[LevelStage];
+	end;
+
+// LavaPools - how many pools this stage seeds. The FIRST lever on the
+// tier difference, and the more visible of the two: two pools leave
+// obvious safe ground, three start closing the routes between them.
+function TSnakeGame.LavaPools: Integer;
+	begin
+	Result:= LavaTier + 1;
+
+	if  Result > PLAY_LAVA_SEEDS then
+		Result:= PLAY_LAVA_SEEDS;
+	end;
+
+// PlayLavaMaxCells - how far ONE pool spreads on this board right now.
+// Caller holds Lock. The play-side counterpart to LavaMaxCells, on its
+// own numbers - see PLAY_LAVA_CELLS_BASE.
+//
+// The SECOND lever on the tier difference, and it pulls the OPPOSITE way
+// to the first: stage 7 gets more pools, and each of them is smaller for
+// it. See PLAY_LAVA_TIER_CELLS_LESS - the total still climbs, but the
+// danger is scattered rather than piled up.
+function TSnakeGame.PlayLavaMaxCells: Integer;
+	begin
+	Result:= PLAY_LAVA_CELLS_BASE
+			+ (LevelProgress * PLAY_LAVA_CELLS_PER_PROGRESS);
+
+	// BEFORE the cap, not after, and that ordering is doing real work:
+	// applied afterwards, every board that clips to LAVA_CELLS_CAP would
+	// come out at the same reduced figure and hard and expert would be
+	// indistinguishable at tier 2 again.
+	if  LavaTier > 1 then
+		Dec(Result, (LavaTier - 1) * PLAY_LAVA_TIER_CELLS_LESS);
+
+	if  Result > LAVA_CELLS_CAP then
+		Result:= LAVA_CELLS_CAP;
+
+	if  Result < PLAY_LAVA_CELLS_MIN then
+		Result:= PLAY_LAVA_CELLS_MIN;
+	end;
+
+// ClearLavaAt - something else has taken this cell off the board, so the
+// pool that owns it should stop believing it is still theirs. Caller
+// holds Lock.
+//
+// The lava counterpart to ClearFoodAt and ClearBeeAt, and it exists for
+// the same reason they do: the spawn sweep clears a box around an
+// arriving snake, and a hazard swept up that way has to be struck off
+// its table too or the model and the board quietly disagree.
+//
+// PARKED ON (0, 0) RATHER THAN REMOVED. Cell order in a pool is not
+// bookkeeping, it IS the colour tier and the recession order (see
+// TLavaPool), so shifting the array to close a gap would repaint nothing
+// but would change what recedes next and in what shade. (0, 0) is the
+// board's top-left BORDER WALL and can therefore never hold lava, so
+// LavaRecedeOnce's "is this cell still ours" test skips the parked entry
+// without needing to know parking exists.
+procedure TSnakeGame.ClearLavaAt(ARow, ACol: Byte);
+	var
+	b, i: Integer;
+
+	begin
+	for b:= 0 to PLAY_LAVA_SEEDS - 1 do
+		for i:= 0 to PlayLava[b].Count - 1 do
+			if  (PlayLava[b].Cells[i].Row = ARow)
+			and (PlayLava[b].Cells[i].Col = ACol) then
+				begin
+				PlayLava[b].Cells[i].Row:= 0;
+				PlayLava[b].Cells[i].Col:= 0;
+
+				Exit;
+				end;
+	end;
+
+// ResetPlayLava - forget every pool and arm the phase machine for a new
+// level. Caller holds Lock.
+//
+// Emits nothing, and deliberately so: every caller
+// (StartPlay/NextLevel/StopPlay) has just rebuilt the whole board and is
+// about to push it, so there are no stale lava tiles left to clear -
+// only stale MODEL state, which is all this touches.
+//
+// Armed into lpIdle with the opening gap already running, so a lava
+// level starts on clear board and the pools arrive as an event rather
+// than blooming under everyone at the whistle.
+procedure TSnakeGame.ResetPlayLava;
+	var
+	b: Integer;
+
+	begin
+	for b:= 0 to PLAY_LAVA_SEEDS - 1 do
+		PlayLava[b].Count:= 0;
+
+	PlayLavaPhase:= lpIdle;
+	PlayLavaStep:= 0;
+	PlayLavaHold:= PLAY_LAVA_GAP_TICKS;
+	PlayLavaShook:= False;
+	end;
+
+// TickPlayLava - grow, hold, recede. ONCE. Caller holds Lock, and only
+// calls this on a stage that has lava.
+//
+// dengland chose growing-and-receding over a board that steadily closes
+// in (2026-08-26). The difference matters more than it sounds: pools
+// that never recede mean a bad seed can wall a player into a shrinking
+// pocket with no counterplay at all, whereas a cycle makes the dangerous
+// ground MOVE - you are never safe standing still, but you are never
+// doomed by where the level happened to put you either.
+//
+// REPEATED BURSTS, ONE AT A TIME, WITH A PAUSE BETWEEN (dengland,
+// 2026-08-26: "there should be repeated bursts of lava but only one at a
+// time... there should be a pause between them"). The phase machine IS
+// that rule rather than something that implements it - a single set of
+// pools can only be in one phase at once, so "only one at a time" is
+// structural and nothing has to arbitrate between bursts, and lpIdle is
+// the pause. Each burst re-seeds somewhere new, so the safe ground moves
+// from one to the next.
+//
+// THE PACING CONSTANTS ARE THEREFORE THE WHOLE FEEL OF THE STAGE, and
+// they are set to make the burst an EVENT that occupies most of the
+// middle of the level rather than a fifteen-second squall in a
+// two-minute empty room - which is what a fast cycle would leave,
+// because a lava stage has no bees either. Roughly: ten seconds of clear
+// board, half a minute of creeping growth, twenty seconds at full
+// extent, half a minute draining. Every one of those is a named
+// constant and none of it is load-bearing on anything else.
+//
+// LAVA IS LETHAL WITHOUT A LINE OF CODE HERE SAYING SO. It is simply not
+// floor, and TickPlaySnakes' collision test is "anything that is not
+// bare floor or food stops the snake dead" - so an unshielded head that
+// enters it dies, and a shielded one is stopped where it stands rather
+// than passing through, exactly as with a wall. That is also why the
+// shield question needed no decision: the answer was already written.
+procedure TSnakeGame.TickPlayLava(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	b, i, n, tries, grown, seeded, pools: Integer;
+	r, c, maxcells: Integer;
+	full, ok: Boolean;
+	heads: TLavaHeads;
+	msg: AnsiString;
+
+	begin
+	// On a STEP, not on every tick - the pools would otherwise reach
+	// full extent in well under a second.
+	if  PlayLavaStep > 0 then
+		begin
+		Dec(PlayLavaStep);
+		Exit;
+		end;
+
+	PlayLavaStep:= PLAY_LAVA_STEP_TICKS - 1;
+
+	maxcells:= PlayLavaMaxCells;
+	pools:= LavaPools;
+
+	PlayLavaHeads(heads);
+
+	case PlayLavaPhase of
+	lpIdle:
+		begin
+		// The clear opening, and the pause between bursts. Counted down
+		// in STEPS, so it is decremented by the step interval rather
+		// than by one.
+		if  PlayLavaHold > 0 then
+			begin
+			Dec(PlayLavaHold, PLAY_LAVA_STEP_TICKS);
+
+			// THE WARNING SHAKE, cued just before the pools break
+			// through so the ground moves and THEN the lava arrives -
+			// see PLAY_LAVA_SHAKE_LEAD_MS. In play this is not
+			// decoration: it is the only notice a burst is coming.
+			if  (not PlayLavaShook)
+			and (PlayLavaHold <= PLAY_LAVA_SHAKE_LEAD_TICKS) then
+				begin
+				DemoShakePending:= PLAY_LAVA_SHAKE_FRAMES;
+				PlayLavaShook:= True;
+				end;
+
+			Exit;
+			end;
+
+		// SCATTERED, not placed. The reel puts its pools at fixed points
+		// inside its circuit because it is a display; here they land
+		// anywhere legal, so no two lava levels play the same and the
+		// stage cannot be learned by rote.
+		seeded:= 0;
+
+		for b:= 0 to pools - 1 do
+			begin
+			PlayLava[b].Count:= 0;
+
+			for tries:= 1 to PLAY_LAVA_SEED_TRIES do
+				begin
+				r:= PLAY_LAVA_SEED_INSET
+						+ Random(BOARD_ROWS - 2 * PLAY_LAVA_SEED_INSET);
+				c:= PLAY_LAVA_SEED_INSET
+						+ Random(BOARD_COLS - 2 * PLAY_LAVA_SEED_INSET);
+
+				// Clear of every live head, the same rule growth is held
+				// to - a pool that SEEDS on top of somebody is worse
+				// than one that grows into them, because there was no
+				// warning at all.
+				ok:= True;
+
+				for i:= 0 to heads.Count - 1 do
+					if  (Abs(r - heads.Row[i]) <= PLAY_LAVA_HEAD_CLEAR)
+					and (Abs(c - heads.Col[i]) <= PLAY_LAVA_HEAD_CLEAR) then
+						begin
+						ok:= False;
+						Break;
+						end;
+
+				if  not ok then
+					Continue;
+
+				// AND CLEAR OF THE POOLS ALREADY SEEDED THIS CYCLE.
+				//
+				// Purely random seeds land close together far more often
+				// than intuition says - with three pools scattered over
+				// a 14x24 usable area, two of them being neighbours is
+				// the common case, not the unlucky one, and two pools
+				// that merge are one big pool that happens to have cost
+				// twice the budget. dengland spotted it from the
+				// spectator seat inside a couple of minutes.
+				//
+				// THE SEPARATION IS RELAXED FOR THE LAST THIRD OF THE
+				// ATTEMPTS. A hard requirement would mean a crowded
+				// board simply loses pools, which is a worse failure
+				// than a close pair - so this is a strong preference,
+				// not a rule, and it degrades rather than failing.
+				if  tries <= (PLAY_LAVA_SEED_TRIES * 2) div 3 then
+					begin
+					for i:= 0 to b - 1 do
+						if  (PlayLava[i].Count > 0)
+						and (Abs(r - Integer(PlayLava[i].Cells[0].Row))
+								<= PLAY_LAVA_SEED_APART)
+						and (Abs(c - Integer(PlayLava[i].Cells[0].Col))
+								<= PLAY_LAVA_SEED_APART) then
+							begin
+							ok:= False;
+							Break;
+							end;
+
+					if  not ok then
+						Continue;
+					end;
+
+				LavaSeedPool(PlayLava[b], r, c, maxcells,
+						ADeltas, ADeltaCount);
+
+				// LavaSeedPool refuses anything but bare floor, so a
+				// count of zero means that spot was taken and this
+				// attempt simply did not land.
+				if  PlayLava[b].Count > 0 then
+					begin
+					Inc(seeded);
+
+					Break;
+					end;
+				end;
+			end;
+
+		// Not one pool found anywhere to start - a crowded board, and
+		// nothing worth logging. Wait out another gap and try again
+		// rather than spinning on it every step.
+		if  seeded = 0 then
+			begin
+			PlayLavaHold:= PLAY_LAVA_GAP_TICKS;
+			PlayLavaShook:= False;
+
+			Exit;
+			end;
+
+		// The POSITIONS are in the log, not just the count - a cycle's
+		// pools landing on top of one another is invisible in a count
+		// and obvious in a list of coordinates.
+		msg:= '';
+
+		for b:= 0 to pools - 1 do
+			if  PlayLava[b].Count > 0 then
+				msg:= msg + ' (' + IntToStr(PlayLava[b].Cells[0].Row)
+						+ ',' + IntToStr(PlayLava[b].Cells[0].Col) + ')';
+
+		AddLogMessage(slkDebug, 'Lava: seeded ' + IntToStr(seeded) + '/'
+				+ IntToStr(pools) + ' pools, tier ' + IntToStr(LavaTier)
+				+ ', max ' + IntToStr(maxcells) + ' cells each, at' + msg);
+
+		PlayLavaPhase:= lpGrow;
+		end;
+
+	lpGrow:
+		begin
+		full:= True;
+
+		for b:= 0 to pools - 1 do
+			begin
+			// A pool that never seeded has nothing to grow and must not
+			// hold the phase open waiting for it.
+			if  PlayLava[b].Count < 1 then
+				Continue;
+
+			grown:= 0;
+			tries:= 0;
+
+			// Bounded retries, not "keep going until it fits": a pool
+			// hemmed in on all sides would otherwise spin here forever.
+			while (grown < PLAY_LAVA_PER_STEP)
+			and (tries < PLAY_LAVA_PER_STEP * 8) do
+				begin
+				// The whole playable interior, not a fenced circuit -
+				// the border wall is the only edge real play's lava
+				// needs, and the head clearance is what keeps it fair
+				// rather than a pen.
+				if  LavaGrowOnce(PlayLava[b], 0, 0, BOARD_ROWS - 1,
+						BOARD_COLS - 1, maxcells, PLAY_LAVA_HEAD_CLEAR,
+						heads, ADeltas, ADeltaCount) then
+					Inc(grown);
+
+				Inc(tries);
+				end;
+
+			if  PlayLava[b].Count < maxcells then
+				full:= False;
+			end;
+
+		// Note this can also finish because every pool is WEDGED rather
+		// than full - the bounded retries above give up, nothing grows,
+		// and the pools sit at whatever extent they reached. The hold
+		// then runs normally and the cycle carries on, which is the
+		// behaviour wanted: a small pool is not a stuck level.
+		if  full then
+			begin
+			n:= 0;
+
+			for b:= 0 to PLAY_LAVA_SEEDS - 1 do
+				Inc(n, PlayLava[b].Count);
+
+			AddLogMessage(slkDebug, 'Lava: at full extent, '
+					+ IntToStr(n) + ' cells');
+
+			PlayLavaPhase:= lpHold;
+			PlayLavaHold:= PLAY_LAVA_HOLD_TICKS;
+			end;
+		end;
+
+	lpHold:
+		begin
+		Dec(PlayLavaHold, PLAY_LAVA_STEP_TICKS);
+
+		if  PlayLavaHold <= 0 then
+			PlayLavaPhase:= lpRecede;
+		end;
+
+	lpRecede:
+		begin
+		n:= 0;
+
+		// Every pool, not just the ones this stage seeded - the tier can
+		// have changed since (a level ended mid-burst and the next one
+		// seeds fewer), and a pool nobody drains would be left painted
+		// on the board with no model owning it.
+		for b:= 0 to PLAY_LAVA_SEEDS - 1 do
+			for i:= 1 to PLAY_LAVA_PER_STEP do
+				if  LavaRecedeOnce(PlayLava[b], ADeltas, ADeltaCount) then
+					Inc(n);
+
+		if  n = 0 then
+			begin
+			AddLogMessage(slkDebug, 'Lava: drained, pausing');
+
+			// ROUND AGAIN, after a pause. One burst on the board at a
+			// time, never two overlapping, and a clear gap between them
+			// (dengland, 2026-08-26: "there should be repeated bursts of
+			// lava but only one at a time... there should be a pause
+			// between them").
+			//
+			// The phase machine gives this for nothing - a single pool
+			// set that can only be in one phase at once IS "only one at
+			// a time", and lpIdle IS the pause. Nothing here has to
+			// arbitrate between bursts because there is only ever one.
+			PlayLavaPhase:= lpIdle;
+			PlayLavaHold:= PLAY_LAVA_GAP_TICKS;
+			PlayLavaShook:= False;
+			end;
+		end;
+		end;
+	end;
+
+// --- THE BOSS (stage 8) -------------------------------------------------
+
+// BossOnBoard - is the boss up and simulating? Caller holds Lock.
+//
+// NOT the same question as StageHasBoss, which only describes the LEVEL.
+// The gap between them is the whole victory beat: once the boss is dead
+// the stage still has a boss, but the board no longer does, and that is
+// precisely what releases the frozen clock. See KillBoss.
+function TSnakeGame.BossOnBoard: Boolean;
+	begin
+	Result:= StageHasBoss and PlaySnakes[SNAKE_SLOT_BOSS].Alive;
+	end;
+
+// SpawnBoss - lay the boss down at the centre with the level. Caller
+// holds Lock.
+//
+// dengland's own choice of timing (2026-08-26): "there from the start
+// for the time being but maybe idle for a while and unkillable - that
+// way we don't have spawn in issues and floating to account for". It is
+// built WITH the level, onto a board that has just been rebuilt and has
+// nothing on it yet, so there is no sweep to run, nothing to overlap and
+// no Floating state to reason about. The corner spawns that follow are
+// the length of the board away.
+//
+// THE DORMANCY IS SPENT AS INVULNERABILITY rather than as a separate
+// "cannot be hurt" flag, which gets three things for one: it cannot be
+// damaged, it visibly FLASHES while it sleeps so the tell costs nothing,
+// and waking needs no code at all because the flash simply stops.
+procedure TSnakeGame.SpawnBoss(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	const
+	// The body from the HEAD BACKWARDS, each entry the direction to step
+	// to reach the next segment back. A SERPENTINE rather than a line so
+	// all twelve segments fit the 4x4 patch BuildLevel guarantees clear
+	// at the centre - see PLAY_BOSS_LEN. Three rows of four, boustrophedon:
+	//
+	//     <- <- <- H      row r0
+	//     -> -> -> v      row r0 + 1
+	//     <- <- <- ^      row r0 + 2
+	//
+	// The fourth row of the box is left spare, so this can lengthen
+	// again by four before the layout has to be rethought.
+	BOSS_LAYOUT: array[0..PLAY_BOSS_LEN - 2] of TSnakeDir =
+			(sdLeft, sdLeft, sdLeft,
+			 sdDown,
+			 sdRight, sdRight, sdRight,
+			 sdDown,
+			 sdLeft, sdLeft, sdLeft);
+
+	var
+	i, r0, c0: Integer;
+	cr, cc: Byte;
+	dirIn, dirOut: TSnakeDir;
+
+	begin
+	// The top-left of the guaranteed-clear centre patch, which is what
+	// BuildLevel sweeps - see LEVEL_CENTRE_CLEAR. Derived rather than
+	// written out, so moving the guarantee moves the boss with it.
+	r0:= (BOARD_ROWS div 2) - LEVEL_CENTRE_CLEAR;
+	c0:= (BOARD_COLS div 2) - LEVEL_CENTRE_CLEAR;
+
+	with PlaySnakes[SNAKE_SLOT_BOSS] do
+		begin
+		Len:= PLAY_BOSS_LEN;
+		Player:= SNAKE_SLOT_BOSS;
+		Alive:= True;
+
+		// NEVER FLOATING. It is laid on an empty board and nothing can
+		// spawn under it afterwards - a player arriving on top of it
+		// floats instead, which is the arriving snake's problem to solve
+		// and is already handled (SpawnPlayerSnake).
+		Floating:= False;
+
+		// The boss eats nothing and grows never, so the food effects are
+		// dead weight on it - zeroed anyway, because the growth test and
+		// PlayStepTicks are shared code that must not read rubbish if
+		// either is ever pointed at this slot.
+		MoveFast:= 0;
+		Grow:= False;
+		GrowNone:= 0;
+		GrowEx:= 0;
+
+		// Dormant, unkillable, and flashing to say so.
+		BossWake:= PLAY_BOSS_WAKE_TICKS;
+		InvunTicks:= PLAY_BOSS_WAKE_TICKS;
+		FlashOn:= True;
+
+		MoveTick:= BoardStepTicks;
+
+		// Head at the patch's top right, body hooking back and down.
+		cr:= r0;
+		cc:= c0 + (2 * LEVEL_CENTRE_CLEAR) - 1;
+
+		for i:= 0 to Len - 1 do
+			begin
+			Body[i].Row:= cr;
+			Body[i].Col:= cc;
+
+			// dirIn is the way the snake ARRIVED at this cell, dirOut
+			// the way it left. BOSS_LAYOUT[i] points from segment i back
+			// to segment i+1, so both are its reverse - which is the
+			// whole reason the layout is written head-first.
+			if  i < Len - 1 then
+				dirIn:= OppositeDir(BOSS_LAYOUT[i])
+			else
+				// The tail has nothing behind it; carry the direction it
+				// leaves on, so it renders straight rather than bent.
+				dirIn:= OppositeDir(BOSS_LAYOUT[i - 1]);
+
+			if  i > 0 then
+				dirOut:= OppositeDir(BOSS_LAYOUT[i - 1])
+			else
+				dirOut:= dirIn;			// the head goes straight on
+
+			Body[i].Shape:= SegShape(dirIn, dirOut);
+
+			if  i = 0 then
+				begin
+				Dir:= dirIn;
+				Look:= dirOut;
+				end;
+
+			if  i < Len - 1 then
+				StepCell(cr, cc, BOSS_LAYOUT[i]);
+			end;
+
+		EmitCell(Body[0].Row, Body[0].Col,
+				SnakeTile(Player, SNAKE_ROLE_HEAD, Body[0].Shape),
+				ADeltas, ADeltaCount);
+
+		for i:= 1 to Len - 1 do
+			EmitCell(Body[i].Row, Body[i].Col,
+					SnakeBodyTile(Player, Body[i].Shape, FlashOn),
+					ADeltas, ADeltaCount);
+		end;
+
+	BossLives:= PLAY_START_LIVES;
+	BossGrow:= 0;
+
+	AddLogMessage(slkInfo, 'Boss stage: level ' + IntToStr(LevelNumber)
+			+ ', ' + IntToStr(BossLives) + ' lives, waking in '
+			+ IntToStr((PLAY_BOSS_WAKE_TICKS * TICK_MS) div 1000) + 's');
+	end;
+
+// ClearBoss - take the boss off the board without any of the ceremony.
+// Caller holds Lock.
+//
+// Deliberately NOT KillPlayerSnake: that spends a LIFE, queues a
+// respawn and can release a SLOT, and the boss has none of those things
+// - it is not a player and must never be handed one. The vacate loop is
+// the only part the two share, and it is shared for the reason
+// VacateCell exists at all: something may still be standing in these
+// cells.
+procedure TSnakeGame.ClearBoss(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	var
+	i: Integer;
+
+	begin
+	if  not PlaySnakes[SNAKE_SLOT_BOSS].Alive then
+		Exit;
+
+	// Down FIRST, so the vacates below do not find the boss still
+	// standing in its own cells and dutifully repaint the corpse they
+	// are trying to clear - the same ordering KillPlayerSnake needs.
+	PlaySnakes[SNAKE_SLOT_BOSS].Alive:= False;
+	PlaySnakes[SNAKE_SLOT_BOSS].Floating:= False;
+
+	for i:= 0 to PlaySnakes[SNAKE_SLOT_BOSS].Len - 1 do
+		with PlaySnakes[SNAKE_SLOT_BOSS].Body[i] do
+			VacateCell(Row, Col, SNAKE_SLOT_BOSS, ADeltas, ADeltaCount);
+	end;
+
+// KillBoss - the last life is gone. Caller holds Lock.
+procedure TSnakeGame.KillBoss(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	begin
+	ClearBoss(ADeltas, ADeltaCount);
+
+	DemoShakePending:= PLAY_BOSS_KILL_SHAKE;
+
+	// THE LEVEL IS CLEARED, and this one assignment is how it ends.
+	//
+	// A boss level's clock is FROZEN while the boss lives (see Tick), so
+	// nothing has been counting down. Killing it releases the freeze -
+	// BossOnBoard went false the moment Alive did - and starts a short
+	// victory beat, after which the ordinary "LevelTicks <= 0 ->
+	// NextLevel" path fires with no special case anywhere.
+	//
+	// Setting it to zero instead would work and would be worse: the
+	// rebuild would land in the SAME tick as the kill, throwing away the
+	// shake and the final score message along with every other delta
+	// gathered this tick, and the boss would blink out in the very frame
+	// the next level appeared.
+	LevelTicks:= PLAY_BOSS_CLEAR_TICKS;
+
+	AddLogMessage(slkInfo, 'Boss killed on level ' + IntToStr(LevelNumber));
+	end;
+
+// HitBoss - a player has met the boss HEAD ON. Caller holds Lock.
+//
+// The head-on itself - neither party moving, both coming away shielded -
+// is applied by the CALLER, because either side of the exchange can be
+// the one that detects it and each has its own idea of what "did not
+// move" means. All this does is the damage, which is the one thing the
+// ordinary head-on rule does not already cover.
+//
+// It is therefore correct, and important, that this can decline: a boss
+// that is dormant or already reeling takes nothing, but the draw still
+// happens and the player still comes away shielded. "Unkillable" during
+// the opening spell is exactly this returning early.
+procedure TSnakeGame.HitBoss(ASlot: Integer;
+		var ADeltas: array of TTileDelta; var ADeltaCount: Integer);
+	var
+	i: Integer;
+
+	begin
+	if  not PlaySnakes[SNAKE_SLOT_BOSS].Alive then
+		Exit;
+
+	// Dormant (BossWake) or reeling from the last hit - both are held as
+	// invulnerability, so one test covers them and there is no way for
+	// the two to disagree.
+	if  PlaySnakes[SNAKE_SLOT_BOSS].InvunTicks > 0 then
+		Exit;
+
+	if  BossLives > 0 then
+		Dec(BossLives);
+
+	AddScore(ASlot, PLAY_BOSS_HIT_PTS);
+
+	if  BossLives <= 0 then
+		begin
+		// The kill bonus goes to whoever landed the last hit, on top of
+		// that hit's own points.
+		AddScore(ASlot, PLAY_BOSS_KILL_PTS);
+		SlotStatusToAll(ASlot);
+
+		KillBoss(ADeltas, ADeltaCount);
+
+		// The status line reads its life pips off BossLives, and the
+		// level clock has just been released - both have changed.
+		GameStatusToAll;
+
+		Exit;
+		end;
+
+	SlotStatusToAll(ASlot);
+
+	PlaySnakes[SNAKE_SLOT_BOSS].InvunTicks:= PLAY_BOSS_HIT_INVUN_TICKS;
+
+	if  not PlaySnakes[SNAKE_SLOT_BOSS].FlashOn then
+		begin
+		PlaySnakes[SNAKE_SLOT_BOSS].FlashOn:= True;
+
+		for i:= 1 to PlaySnakes[SNAKE_SLOT_BOSS].Len - 1 do
+			with PlaySnakes[SNAKE_SLOT_BOSS].Body[i] do
+				EmitCell(Row, Col,
+						SnakeBodyTile(PlaySnakes[SNAKE_SLOT_BOSS].Player,
+							Shape, True),
+						ADeltas, ADeltaCount);
+		end;
+
+	DemoShakePending:= PLAY_BOSS_HIT_SHAKE;
+
+	// The boss's remaining lives ARE the status line on this stage -
+	// there is no clock ticking to carry the change out on its own.
+	GameStatusToAll;
+	end;
+
+// TickBoss - the boss's entire simulation. Caller holds Lock.
+//
+// Separate from TickPlaySnakes rather than folded into it, even though
+// the boss lives in the same array. That routine's shape is a PRE-PASS
+// that resolves head-ons between equals before anybody moves, and the
+// boss is not an equal: it has no player, no lives on a slot, no
+// respawn, no input and no food effects, and its collisions resolve
+// differently in every single case. Running after the players also means
+// it chases where they ARE rather than where they were.
+//
+// The chooser is TickPlayBees' weighted one - toward the nearest head,
+// or a random step, or a stall - on the boss's own weights. That is not
+// laziness: the behaviour is already play-tested, already tuned by
+// numbers that exist, and already familiar to anyone who has watched the
+// attract screen. What differs is that the boss has a BODY, so it must
+// move as a snake and cannot walk into itself, and that a blocked boss
+// takes the next legal direction where a blocked bee simply loses its
+// move.
+procedure TSnakeGame.TickBoss(var ADeltas: array of TTileDelta;
+		var ADeltaCount: Integer);
+	type
+	// What stepping onto a candidate cell would mean. There is no "and
+	// the player dies" case: the boss bounces off players rather than
+	// eating them, and you die by running into IT - see Verdict.
+	TBossStep = (bsBlocked, bsMove, bsDraw);
+
+	var
+	i, j, k, f, pick, best, dist, bestdist, steps: Integer;
+	dr, dc, nr, nc, r, c, pass: Integer;
+	grabbed, fed: Boolean;
+	head: TSnakeSeg;
+	prevDir, want, cand: TSnakeDir;
+	stepKind, chosen: TBossStep;
+	victim, chosenVictim: Integer;
+	wantFlash, repaint: Boolean;
+
+	// Chebyshev, as everywhere else here - a diagonal counts as one
+	// step, which is what "three cells away" means to somebody looking
+	// at the board.
+	function HeadDist(ARow, ACol, ASnake: Integer): Integer;
+		var
+		a, d: Integer;
+
+		begin
+		a:= Abs(ARow - Integer(PlaySnakes[ASnake].Body[0].Row));
+		d:= Abs(ACol - Integer(PlaySnakes[ASnake].Body[0].Col));
+
+		if  a > d then
+			Result:= a
+		else
+			Result:= d;
+		end;
+
+	procedure RepaintBoss;
+		var
+		n: Integer;
+
+		begin
+		for n:= 1 to PlaySnakes[SNAKE_SLOT_BOSS].Len - 1 do
+			with PlaySnakes[SNAKE_SLOT_BOSS].Body[n] do
+				EmitCell(Row, Col,
+						SnakeBodyTile(PlaySnakes[SNAKE_SLOT_BOSS].Player,
+							Shape, PlaySnakes[SNAKE_SLOT_BOSS].FlashOn),
+						ADeltas, ADeltaCount);
+		end;
+
+	// What would happen if the boss stepped to (ANr, ANc)? Sets AVictim
+	// to the player involved for bsDraw and bsKill, -1 otherwise.
+	//
+	// PURE - it decides, it does not act. Candidates that lose must
+	// leave no trace, so clearing the bee or the food that was in the
+	// winning cell is the caller's job once the cell is definitely being
+	// entered.
+	function Verdict(ANr, ANc: Integer; out AVictim: Integer): TBossStep;
+		var
+		s, seg: Integer;
+		tile: Byte;
+
+		begin
+		AVictim:= -1;
+		Result:= bsBlocked;
+
+		if  (ANr <= 0) or (ANr >= BOARD_ROWS - 1)
+		or  (ANc <= 0) or (ANc >= BOARD_COLS - 1) then
+			Exit;
+
+		// ITSELF, and this has to be settled COMPLETELY here - deciding
+		// it and then falling through to the board test below does not
+		// work, because the board reads "snake tile" for every one of
+		// these cells and would block them all over again.
+		//
+		// That was a real bug and dengland walked straight into it: the
+		// boss could never follow its own tail, so a long one boxed
+		// itself in with the tail it was chasing ("the boss is actually
+		// stuck again but with only the front covered in by the tail").
+		// The floating escape did not help either, for exactly the same
+		// reason - the board still said snake.
+		seg:= SnakeSegAt(SNAKE_SLOT_BOSS, ANr, ANc);
+
+		if  seg >= 0 then
+			begin
+			// FLOATING - its own body is not in its way at all. That is
+			// what floating means, and it is the escape from having
+			// coiled itself into a knot. See the resolve pass below.
+			if  PlaySnakes[SNAKE_SLOT_BOSS].Floating then
+				begin
+				Result:= bsMove;
+
+				Exit;
+				end;
+
+			// THE TAIL IS EXEMPT WHEN IT IS ABOUT TO VACATE, exactly as
+			// it is for a player: the cell is still painted but empties
+			// in this same step, so following itself round a tight
+			// corner is legal - and it takes more skill than a loose
+			// turn, so blocking it punishes the wrong thing.
+			//
+			// NOT exempt when the boss is about to grow, because then
+			// the tail stays where it is. Same rule the player step
+			// applies, and the same honest price.
+			//
+			// The "about to grow" test is spelled the same way the move
+			// code spells it, cap included - a boss owed segments it can
+			// never be paid still vacates its tail, and would otherwise
+			// refuse a turn that is perfectly legal.
+			if  (seg = PlaySnakes[SNAKE_SLOT_BOSS].Len - 1)
+			and not ((BossGrow > 0)
+				and (PlaySnakes[SNAKE_SLOT_BOSS].Len < PLAY_BOSS_LEN_MAX)) then
+				begin
+				Result:= bsMove;
+
+				Exit;
+				end;
+
+			Exit;					// blocked by its own body
+			end;
+
+		// ANOTHER SNAKE - and the MODELS answer this, not Board, for the
+		// same Z-order reason everything else here asks them. A FLOATING
+		// snake is not really there: it cannot be hurt and cannot block,
+		// so the boss walks through it and neither is any the wiser.
+		s:= SolidSnakeAt(ANr, ANc, SNAKE_SLOT_BOSS);
+
+		if  s >= 0 then
+			begin
+			AVictim:= s;
+
+			// THE BOSS RUNNING INTO A PLAYER IS ALWAYS A DRAW, and
+			// crucially it NEVER damages the boss - dengland's rule in
+			// as many words: "the boss should not die if it runs into a
+			// player but the same both players run into each other logic
+			// for snakes should apply (becomming invunerable in that
+			// case)".
+			//
+			// THE FIRST BUILD GOT THIS WRONG and the first test run
+			// caught it: counting "the boss stepped onto a head" as a
+			// mutual collision made the boss SUICIDAL, because homing on
+			// heads is the whole chase. It spent all three lives in
+			// nineteen seconds against a bot that never once tried to
+			// attack it. A hazard that kills itself by doing its job is
+			// not a boss.
+			//
+			// The damage therefore lives ENTIRELY on the player's side
+			// of the exchange (see TickPlaySnakes), and that division is
+			// exact rather than approximate: PLAYERS MOVE FIRST each
+			// tick, so a player driving into the boss is always resolved
+			// on the player's own pass, and by the time the boss moves,
+			// the only players it can still meet are ones that did not
+			// move into it. Nothing is lost by refusing damage here.
+			//
+			// ANY SEGMENT, not just the head. A player's body is a wall
+			// to the boss exactly as it is to another player, and
+			// bouncing off it costs the boss its step - which is most of
+			// what makes cutting the boss off with your own tail a real
+			// tactic instead of a suicidal one.
+			Result:= bsDraw;
+
+			Exit;
+			end;
+
+		tile:= Board[ANr][ANc];
+
+		if  tile = TILE_FLOOR then
+			begin
+			Result:= bsMove;
+
+			Exit;
+			end;
+
+		// BEES AND FOOD ARE SIMPLY DESTROYED. The boss is immune to the
+		// swarm and always kills it (agreed with dengland when the stage
+		// cycle was designed), and food it walks over is gone - it eats
+		// nothing, scores nothing and never grows.
+		if  tile = TILE_BEE then
+			begin
+			Result:= bsMove;
+
+			Exit;
+			end;
+
+		if  (tile >= TILE_FOOD_BASE)
+		and (tile < TILE_FOOD_BASE + FOOD_TYPE_COUNT) then
+			Result:= bsMove;
+
+		// Anything else - wall, lava, a snake tile the models disowned -
+		// stays bsBlocked. Lava should be unreachable here, since the
+		// stage table never puts the two on one level, and it is left to
+		// fall through rather than being named so that it stays blocked
+		// if that ever changes.
+		end;
+
+	begin
+	if  not PlaySnakes[SNAKE_SLOT_BOSS].Alive then
+		Exit;
+
+	// --- flash, dormancy and pacing ---
+	//
+	// All three run on the TICK, not the step, for the same reason a
+	// player's invulnerability does: they have to keep running on ticks
+	// where the boss is standing still between moves.
+	if  PlaySnakes[SNAKE_SLOT_BOSS].InvunTicks > 0 then
+		Dec(PlaySnakes[SNAKE_SLOT_BOSS].InvunTicks);
+
+	if  BossWake > 0 then
+		Dec(BossWake);
+
+	wantFlash:= InvunFlashOn(PlaySnakes[SNAKE_SLOT_BOSS].InvunTicks);
+
+	repaint:= wantFlash <> PlaySnakes[SNAKE_SLOT_BOSS].FlashOn;
+	PlaySnakes[SNAKE_SLOT_BOSS].FlashOn:= wantFlash;
+
+	// DORMANT. It sits still and flashes until BossWake runs out - which
+	// is also exactly how long it cannot be hurt for, the two having
+	// been set from the same constant.
+	if  BossWake > 0 then
+		begin
+		if  repaint then
+			RepaintBoss;
+
+		Exit;
+		end;
+
+	if  PlaySnakes[SNAKE_SLOT_BOSS].MoveTick > 0 then
+		begin
+		Dec(PlaySnakes[SNAKE_SLOT_BOSS].MoveTick);
+
+		if  repaint then
+			RepaintBoss;
+
+		Exit;
+		end;
+
+	// ONE GEAR QUICKER THAN THE BOARD - see PLAY_BOSS_GEAR_BONUS. The
+	// clamp is the same floor SnakeStepTicks holds every other mover to:
+	// a step every zero ticks is not a speed.
+	steps:= BoardStepTicks - PLAY_BOSS_GEAR_BONUS;
+
+	if  steps < SNAKE_SPEED_TOP then
+		steps:= SNAKE_SPEED_TOP;
+
+	PlaySnakes[SNAKE_SLOT_BOSS].MoveTick:= steps - 1;
+
+	// --- pick a direction ---
+	//
+	// Nearest live PLAYER, never a bee. Re-picked every step rather than
+	// kept for life the way a bee's target is: there is only one boss,
+	// so the clumping that rule exists to prevent cannot happen, and a
+	// boss still chasing a corner somebody had long since left would
+	// simply look broken.
+	bestdist:= BOARD_COLS + BOARD_ROWS;
+	best:= -1;
+
+	for k:= 0 to SNAKE_PLAYER_COUNT - 1 do
+		if  PlaySnakes[k].Alive then
+			begin
+			dist:= HeadDist(PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row,
+					PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col, k);
+
+			if  dist < bestdist then
+				begin
+				bestdist:= dist;
+				best:= k;
+				end;
+			end;
+
+	// OPPORTUNISTIC FEEDING, resolved before the chase and overriding it.
+	//
+	// The rate at which the boss grows was never really about the rate:
+	// with 3 per food it managed 12 segments to 13 in a hundred seconds,
+	// because it homes on HEADS and so only ever meets food by accident.
+	// Raising the numbers alone would have made those accidents bigger
+	// without making them any less rare, which is a lottery, not a
+	// mechanic.
+	//
+	// So it takes anything edible it is ALREADY STANDING NEXT TO. One
+	// cell of greed, no searching and no pathfinding - it will never
+	// cross the board for a meal, and a player is still what it wants -
+	// but food it walks past now feeds it instead of being stepped
+	// around. On a boss stage the swarm is on, which makes bees the
+	// steadier of the two supplies.
+	grabbed:= False;
+
+	for i:= 0 to 3 do
+		begin
+		cand:= TSnakeDir(i);
+
+		if  cand = OppositeDir(PlaySnakes[SNAKE_SLOT_BOSS].Dir) then
+			Continue;
+
+		nr:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row;
+		nc:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col;
+
+		case cand of
+			sdUp:    Dec(nr);
+			sdDown:  Inc(nr);
+			sdLeft:  Dec(nc);
+		else
+			Inc(nc);
+			end;
+
+		if  (nr <= 0) or (nr >= BOARD_ROWS - 1)
+		or  (nc <= 0) or (nc >= BOARD_COLS - 1) then
+			Continue;
+
+		// IT IS FUSSY ABOUT FOOD (dengland: "it just wants the grow ones
+		// really maybe the invincibility ones"). Only the extra-growth
+		// food and the heart are worth a step out of its way - see
+		// PLAY_BOSS_WANTS - which keeps its appetite legible: the boss
+		// goes for the things that make it BIGGER, not for speed or for
+		// a food whose whole purpose is to stop growth.
+		//
+		// It still DESTROYS anything it happens to cross, and still
+		// grows from that; this is only about what it will turn aside
+		// for. Bees always qualify - they are the steadier supply on a
+		// stage that keeps its swarm.
+		if  Board[nr][nc] <> TILE_BEE then
+			begin
+			if  (Board[nr][nc] < TILE_FOOD_BASE)
+			or  (Board[nr][nc] >= TILE_FOOD_BASE + FOOD_RANDOM_KINDS) then
+				Continue;
+
+			if  not PLAY_BOSS_WANTS[Board[nr][nc] - TILE_FOOD_BASE] then
+				Continue;
+			end;
+
+		// Legality is still Verdict's to decide - a bee sitting on a
+		// cell the boss cannot enter for some other reason is not a
+		// meal.
+		if  Verdict(nr, nc, victim) <> bsMove then
+			Continue;
+
+		want:= cand;
+		grabbed:= True;
+
+		Break;
+		end;
+
+	// When something was grabbed, `want` is already decided and the
+	// whole chase below is skipped - straight to the resolve pass, which
+	// still runs its full search from that direction, so if anything has
+	// changed its mind about the cell the boss simply picks another.
+	if  not grabbed then
+		begin
+	pick:= Random(PLAY_BOSS_WEIGHT_TOWARD + PLAY_BOSS_WEIGHT_RANDOM
+			+ PLAY_BOSS_WEIGHT_STALL);
+
+	dr:= 0;
+	dc:= 0;
+
+	if  (pick < PLAY_BOSS_WEIGHT_TOWARD) and (best >= 0) then
+		begin
+		// Close the LARGER axis first - TickPlayBees' rule exactly. No
+		// pathfinding, deliberately: it is what makes walls genuine
+		// shelter rather than a brief detour, and it is the difference
+		// between a hazard and an opponent.
+		r:= PlaySnakes[best].Body[0].Row;
+		c:= PlaySnakes[best].Body[0].Col;
+
+		if  Abs(r - Integer(PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row))
+				> Abs(c - Integer(PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col)) then
+			begin
+			if  r < PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row then
+				dr:= -1
+			else if r > PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row then
+				dr:= 1;
+			end
+		else
+			begin
+			if  c < PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col then
+				dc:= -1
+			else if c > PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col then
+				dc:= 1;
+			end;
+
+		// REELING - RUN AWAY. The same vector, turned round.
+		//
+		// THIS IS WHAT MAKES THE FIGHT A FIGHT, and it was the second
+		// thing the test run forced. With the boss's own move no longer
+		// able to hurt it, the damage all came from the player's side -
+		// and a player jammed nose to nose with the boss simply RE-RAMS
+		// it every single step, so all three lives went in three
+		// consecutive gate-openings, 2.5 seconds apart, seventeen
+		// seconds into the level. The hit gate alone cannot fix that: it
+		// only sets the metronome the lives are spent on.
+		//
+		// Breaking contact is what fixes it, and having the boss recoil
+		// is the version of that which reads as something rather than as
+		// a rule. Land a hit and it flinches away across the board; you
+		// have to hunt it down and set the next one up, which is three
+		// separate encounters instead of one long shove. It also means
+		// the reeling spell is doing visible work rather than being an
+		// invisible cooldown.
+		//
+		// Not while DORMANT, though - the opening spell is invulnerable
+		// too, and a boss that fled before it had even woken up would
+		// never be where the level put it.
+		if  (PlaySnakes[SNAKE_SLOT_BOSS].InvunTicks > 0)
+		and (BossWake = 0) then
+			begin
+			dr:= -dr;
+			dc:= -dc;
+			end;
+		end
+	else if pick < (PLAY_BOSS_WEIGHT_TOWARD + PLAY_BOSS_WEIGHT_RANDOM) then
+		begin
+		case Random(4) of
+			0: dr:= -1;
+			1: dr:= 1;
+			2: dc:= -1;
+		else
+			dc:= 1;
+			end;
+		end
+	else
+		begin
+		// STALLED. Not a lost move to be recovered from by trying
+		// elsewhere - it IS the deliberate uncertainty in the boss's
+		// arrival time, and rerouting round it would quietly delete the
+		// one thing keeping the chase from being solvable by arithmetic.
+		if  repaint then
+			RepaintBoss;
+
+		Exit;
+		end;
+
+	if  dr < 0 then
+		want:= sdUp
+	else if dr > 0 then
+		want:= sdDown
+	else if dc < 0 then
+		want:= sdLeft
+	else if dc > 0 then
+		want:= sdRight
+	else
+		begin
+		// Already level with the target on the axis it chose, which is
+		// only reachable when it is standing on it. Nothing to do.
+		if  repaint then
+			RepaintBoss;
+
+		Exit;
+		end;
+
+		end;			// not grabbed - the whole chase above is skipped
+
+	// --- resolve the step ---
+	//
+	// The preferred direction first, then the others in order. A player
+	// whose move is blocked DIES; the boss instead takes the next legal
+	// thing it can find, because a boss that killed itself on a wall
+	// would end the level by accident and a boss that simply stopped
+	// would wedge in a dead end for the rest of it.
+	// Run TWICE if the first pass finds nothing, with the boss FLOATING
+	// on the second - see below.
+	for pass:= 0 to 1 do
+		begin
+		chosen:= bsBlocked;
+		chosenVictim:= -1;
+
+		for i:= 0 to 4 do
+			begin
+			if  i = 0 then
+				cand:= want
+			else
+				begin
+				cand:= TSnakeDir(i - 1);
+
+				if  cand = want then
+					Continue;			// already tried
+				end;
+
+			// Never reverse onto its own neck. Verdict's tail exemption
+			// would otherwise make this legal on a short body and the
+			// boss would turn itself inside out.
+			if  cand = OppositeDir(PlaySnakes[SNAKE_SLOT_BOSS].Dir) then
+				Continue;
+
+			nr:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row;
+			nc:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col;
+
+			case cand of
+				sdUp:    Dec(nr);
+				sdDown:  Inc(nr);
+				sdLeft:  Dec(nc);
+			else
+				Inc(nc);
+				end;
+
+			stepKind:= Verdict(nr, nc, victim);
+
+			if  stepKind = bsBlocked then
+				Continue;
+
+			chosen:= stepKind;
+			chosenVictim:= victim;
+			PlaySnakes[SNAKE_SLOT_BOSS].Look:= cand;
+
+			Break;
+			end;
+
+		if  chosen <> bsBlocked then
+			Break;
+
+		// BOXED IN - AND FOR THE BOSS THAT IS A DEADLOCK, not a bad
+		// moment. dengland hit it in play: "the boss is stuck. I think
+		// if that happens it has to go floating somehow over its own
+		// tail".
+		//
+		// It is worse than it would be for anybody else, and the reason
+		// is the clock. A stuck PLAYER is only stuck until the level
+		// runs out; a stuck BOSS stops the level running out at all,
+		// because a boss stage's clock is frozen until the boss dies
+		// (see Tick). A boss coiled into its own body would therefore
+		// hold the board open indefinitely.
+		//
+		// It became reachable the moment the boss was allowed to grow -
+		// at twelve segments it can barely trap itself, at forty it
+		// coils easily.
+		//
+		// FLOATING IS ALREADY THE ANSWER TO THIS EXACT PROBLEM. It was
+		// built so a snake spawning on top of another could always move
+		// clear rather than being stuck inside it (see TSnake.Floating),
+		// and "cannot move because a snake is in the way" is the same
+		// predicament arriving from the other direction. So the boss
+		// takes the same escape: it passes through its own body until
+		// its head is somewhere clear, then goes solid again.
+		//
+		// Walls are NOT included in that - floating never made anybody
+		// pass through level geometry, and a boss walled into a pocket
+		// with no exit is the level's own doing rather than a knot it
+		// tied in itself.
+		if  PlaySnakes[SNAKE_SLOT_BOSS].Floating then
+			Break;						// already floating and still stuck
+
+		PlaySnakes[SNAKE_SLOT_BOSS].Floating:= True;
+
+		AddLogMessage(slkDebug, 'Boss boxed in at ' + IntToStr(PlaySnakes[SNAKE_SLOT_BOSS].Len)
+				+ ' segments - floating clear');
+		end;
+
+	// Genuinely nowhere to go, even floating - walled in. Stall and try
+	// again next step; the board moves around it, so this resolves
+	// itself.
+	if  chosen = bsBlocked then
+		begin
+		if  repaint then
+			RepaintBoss;
+
+		Exit;
+		end;
+
+	// RAN INTO SOMEBODY. Nobody moves, nobody is hurt, and NOBODY IS
+	// SHIELDED - see Verdict for why the boss's own move can never hurt
+	// it, and read on for why it must not help the player either.
+	//
+	// It DID hand the player a shield at first, on the strength of "the
+	// same both players run into each other logic". That was the wrong
+	// reading of it, and dengland caught it in play: "does the player go
+	// shielded when the boss hits them? That's not right."
+	//
+	// He is right, and the reason is that THIS IS NOT THE SYMMETRIC
+	// EXCHANGE the player-versus-player rule describes. The boss
+	// initiates nearly all of these, because chasing is the whole of
+	// what it does - so a shield here is not a fair draw between equals,
+	// it is a free power-up handed out several times a minute by the one
+	// thing on the board you are meant to be afraid of. It left players
+	// near-immortal while near the boss, which is precisely backwards.
+	//
+	// It also polluted things well away from the boss, which is worth
+	// keeping in mind: a shield acquired this way silently turns the
+	// NEXT bee contact from a death into a kill. That is very probably
+	// what he was seeing when he added "when I hit a bee, I thought I
+	// went shielded".
+	//
+	// A genuine mutual collision - the player driving into the boss's
+	// HEAD - still pays out exactly as it always did, in TickPlaySnakes.
+	// That one the player chose.
+	if  chosen = bsDraw then
+		begin
+		if  repaint then
+			RepaintBoss;
+
+		Exit;
+		end;
+
+	nr:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Row;
+	nc:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0].Col;
+
+	case PlaySnakes[SNAKE_SLOT_BOSS].Look of
+		sdUp:    Dec(nr);
+		sdDown:  Inc(nr);
+		sdLeft:  Dec(nc);
+	else
+		Inc(nc);
+		end;
+
+	// Whatever else was in the cell is destroyed on the way in - NOW,
+	// once the cell is definitely being entered, so a candidate that
+	// lost the search cannot have quietly eaten anything. A bee taken
+	// this way is not a player's kill and must not anger the swarm
+	// (LevelBeesEaten is only ever moved by a player); food is simply
+	// gone, unscored.
+	// Logged because growth has been the hardest thing here to get right,
+	// and it is almost impossible to measure from outside: a board dump
+	// only says how long the boss was at the instant you happened to
+	// look, and only if the board was still in play then. Two attempts
+	// at measuring it that way told me nothing at all.
+	//
+	// ON THE FEED ITSELF, not on "still owed segments" - the first
+	// version tested BossGrow and so fired every step of the growth,
+	// which read as the boss eating eight times in a row when it had
+	// eaten once. A diagnostic that overstates the thing it is measuring
+	// is worse than none.
+	fed:= False;
+
+	f:= BeeAt(nr, nc);
+
+	if  f >= 0 then
+		begin
+		PlayBees[f].Active:= False;
+		Inc(BossGrow, PLAY_BOSS_GROW_BEE);
+		fed:= True;
+		end;
+
+	if  FoodAt(nr, nc) >= 0 then
+		begin
+		ClearFoodAt(nr, nc);
+		Inc(BossGrow, PLAY_BOSS_GROW_FOOD);
+		fed:= True;
+		end;
+
+	if  fed then
+		AddLogMessage(slkDebug, 'Boss fed at ' + IntToStr(nr) + ','
+				+ IntToStr(nc) + ' - len '
+				+ IntToStr(PlaySnakes[SNAKE_SLOT_BOSS].Len)
+				+ ', ' + IntToStr(BossGrow) + ' owed');
+
+	// --- move, exactly as a player snake moves ---
+	prevDir:= PlaySnakes[SNAKE_SLOT_BOSS].Dir;
+	PlaySnakes[SNAKE_SLOT_BOSS].Dir:= PlaySnakes[SNAKE_SLOT_BOSS].Look;
+
+	head:= PlaySnakes[SNAKE_SLOT_BOSS].Body[0];
+	head.Row:= nr;
+	head.Col:= nc;
+
+	// GROWING IS SIMPLY NOT VACATING THE TAIL, the same trick the player
+	// step uses: make room and let the shift below duplicate the last
+	// segment into it, which leaves the new tail on a cell that is
+	// already painted and so costs no delta either.
+	if  (BossGrow > 0)
+	and (PlaySnakes[SNAKE_SLOT_BOSS].Len < PLAY_BOSS_LEN_MAX) then
+		begin
+		Dec(BossGrow);
+		Inc(PlaySnakes[SNAKE_SLOT_BOSS].Len);
+		end
+	else
+		begin
+		// THE TAIL MAY BE LEAVING A CELL THE BOSS IS STILL IN.
+		//
+		// VacateCell takes AExclude to mean "ignore this whole snake",
+		// which is right for everybody else, because no ordinary snake
+		// can occupy one cell twice - it would have died on itself. A
+		// FLOATING BOSS CAN: passing through its own body is the entire
+		// point of the escape, and while it is doing so two of its
+		// segments share a cell.
+		//
+		// So the tail leaving such a cell had VacateCell find nothing
+		// there worth keeping and emit bare floor - straight through the
+		// middle of the boss's own body. That is dengland's report,
+		// exactly: "the boss tail is breaking up on occasion... I wonder
+		// if its to do with floating".
+		//
+		// Look for one of our OWN remaining segments first, and repaint
+		// that instead. Only then is it really empty and VacateCell's
+		// question - is somebody ELSE still standing here - the right
+		// one to ask.
+		j:= -1;
+
+		for i:= 0 to PlaySnakes[SNAKE_SLOT_BOSS].Len - 2 do
+			if  (PlaySnakes[SNAKE_SLOT_BOSS].Body[i].Row
+					= PlaySnakes[SNAKE_SLOT_BOSS].Body[PlaySnakes[SNAKE_SLOT_BOSS].Len - 1].Row)
+			and (PlaySnakes[SNAKE_SLOT_BOSS].Body[i].Col
+					= PlaySnakes[SNAKE_SLOT_BOSS].Body[PlaySnakes[SNAKE_SLOT_BOSS].Len - 1].Col) then
+				begin
+				j:= i;
+
+				Break;
+				end;
+
+		if  j >= 0 then
+			with PlaySnakes[SNAKE_SLOT_BOSS].Body[j] do
+				begin
+				if  j = 0 then
+					EmitCell(Row, Col,
+							SnakeTile(PlaySnakes[SNAKE_SLOT_BOSS].Player,
+								SNAKE_ROLE_HEAD, Shape),
+							ADeltas, ADeltaCount)
+				else
+					EmitCell(Row, Col,
+							SnakeBodyTile(PlaySnakes[SNAKE_SLOT_BOSS].Player,
+								Shape, PlaySnakes[SNAKE_SLOT_BOSS].FlashOn),
+							ADeltas, ADeltaCount);
+				end
+		else
+			// Nobody of ours left here - so now ask whether anybody
+			// ELSE is, which is what VacateCell is for. A floating
+			// player may still be lying in it.
+			with PlaySnakes[SNAKE_SLOT_BOSS].Body[PlaySnakes[SNAKE_SLOT_BOSS].Len - 1] do
+				VacateCell(Row, Col, SNAKE_SLOT_BOSS, ADeltas, ADeltaCount);
+
+		// Owed segments the length cap will never pay are dropped rather
+		// than banked, or a boss that fed early would keep growing for
+		// the rest of the level the moment anything shortened it.
+		if  BossGrow > 0 then
+			BossGrow:= 0;
+		end;
+
+	for i:= PlaySnakes[SNAKE_SLOT_BOSS].Len - 1 downto 1 do
+		PlaySnakes[SNAKE_SLOT_BOSS].Body[i]:=
+				PlaySnakes[SNAKE_SLOT_BOSS].Body[i - 1];
+
+	PlaySnakes[SNAKE_SLOT_BOSS].Body[1].Shape:=
+			SegShape(prevDir, PlaySnakes[SNAKE_SLOT_BOSS].Dir);
+
+	with PlaySnakes[SNAKE_SLOT_BOSS].Body[1] do
+		EmitCell(Row, Col,
+				SnakeBodyTile(PlaySnakes[SNAKE_SLOT_BOSS].Player, Shape,
+					PlaySnakes[SNAKE_SLOT_BOSS].FlashOn),
+				ADeltas, ADeltaCount);
+
+	// NO TURN TELEGRAPH, unlike a player's head. The boss chooses its
+	// direction fresh at the start of each step, so at this moment there
+	// is nothing yet decided to telegraph - and a tell that only
+	// appeared one step ahead would be worse than none at all, since
+	// players would learn to read it and it would be lying half the
+	// time.
+	head.Shape:= SegShape(PlaySnakes[SNAKE_SLOT_BOSS].Dir,
+			PlaySnakes[SNAKE_SLOT_BOSS].Dir);
+	PlaySnakes[SNAKE_SLOT_BOSS].Body[0]:= head;
+
+	EmitCell(head.Row, head.Col,
+			SnakeTile(PlaySnakes[SNAKE_SLOT_BOSS].Player, SNAKE_ROLE_HEAD,
+				head.Shape),
+			ADeltas, ADeltaCount);
+
+	// STOP FLOATING once the head is somewhere nobody is - its own body
+	// included. The player rule is the same one and for the same reason:
+	// the head is what has to be able to collide again, and a tail still
+	// trailing through something is harmless because VacateCell keeps it
+	// from erasing whatever it leaves behind.
+	//
+	// Testing from segment 1 rather than 0, since the head is obviously
+	// standing on its own head.
+	if  PlaySnakes[SNAKE_SLOT_BOSS].Floating then
+		begin
+		grabbed:= False;			// reused: "still inside something"
+
+		for i:= 1 to PlaySnakes[SNAKE_SLOT_BOSS].Len - 1 do
+			if  (PlaySnakes[SNAKE_SLOT_BOSS].Body[i].Row = head.Row)
+			and (PlaySnakes[SNAKE_SLOT_BOSS].Body[i].Col = head.Col) then
+				begin
+				grabbed:= True;
+
+				Break;
+				end;
+
+		if  (not grabbed)
+		and (SolidSnakeAt(head.Row, head.Col, SNAKE_SLOT_BOSS) < 0) then
+			PlaySnakes[SNAKE_SLOT_BOSS].Floating:= False;
+		end;
+
+	// A FLOATING BOSS PAINTS LAST, so it is on top of anything that
+	// moved through or under it - head included, which RepaintBoss does
+	// not cover. The players' own floaters get this at the end of
+	// TickPlaySnakes; the boss cannot use that pass because it moves
+	// after it.
+	if  repaint or PlaySnakes[SNAKE_SLOT_BOSS].Floating then
+		begin
+		RepaintBoss;
+
+		with PlaySnakes[SNAKE_SLOT_BOSS].Body[0] do
+			EmitCell(Row, Col,
+					SnakeTile(PlaySnakes[SNAKE_SLOT_BOSS].Player,
+						SNAKE_ROLE_HEAD, Shape),
+					ADeltas, ADeltaCount);
+		end;
+	end;
+
 // TickPlaySnakes - advance every live player snake one tick. Caller
 // holds Lock.
 //
@@ -6187,7 +8643,7 @@ procedure TSnakeGame.TrySpawnBee(var ADeltas: array of TTileDelta;
 procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		var ADeltaCount: Integer);
 	var
-	i, s, t, f: Integer;
+	i, s, t, f, blocker: Integer;
 	head: TSnakeSeg;
 	prevDir: TSnakeDir;
 	tile: Byte;
@@ -6235,6 +8691,35 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 			with PlaySnakes[ASnake].Body[j] do
 				Emit(Row, Col, SnakeBodyTile(PlaySnakes[ASnake].Player,
 						Shape, PlaySnakes[ASnake].FlashOn));
+		end;
+
+	// Re-shape and re-emit the head from the CURRENT Dir/Look, moving
+	// nothing.
+	//
+	// THE TURN TELEGRAPH ONLY EVER EXISTED FOR SNAKES THAT WERE MOVING.
+	// The head is shaped SegShape(Dir, Look) and drawn as part of the
+	// step, so a snake that did not step never repainted it, and a turn
+	// pressed meanwhile was invisible until it moved again.
+	//
+	// In open board that is one tick and nobody could see it. For a
+	// snake held STILL it is indefinite, and dengland hit exactly that
+	// (2026-08-26): "I turned from going left to right upwards into a
+	// wall while shielded. It should show the turn on the head but it
+	// doesn't." A shielded snake against a wall never moves, so the head
+	// went on pointing the old way while the player waited for any
+	// evidence the input had registered at all.
+	//
+	// Called from all three did-not-move paths below. The head is the
+	// ONLY feedback that a turn has been accepted, and it matters most
+	// precisely when nothing else is happening.
+	procedure ShowHead(ASnake: Integer);
+		begin
+		PlaySnakes[ASnake].Body[0].Shape:=
+				SegShape(PlaySnakes[ASnake].Dir, PlaySnakes[ASnake].Look);
+
+		with PlaySnakes[ASnake].Body[0] do
+			Emit(Row, Col, SnakeTile(PlaySnakes[ASnake].Player,
+					SNAKE_ROLE_HEAD, Shape));
 		end;
 
 	begin
@@ -6304,13 +8789,21 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 				PlaySnakes[s].Grow:= False;
 			end;
 
-		wantFlash:= (PlaySnakes[s].InvunTicks > 0)
-				and (((PlaySnakes[s].InvunTicks div DEMO_INVUN_FLASH_TICKS)
-					and 1) = 0);
+		wantFlash:= InvunFlashOn(PlaySnakes[s].InvunTicks);
 
 		repaint:= wantFlash <> PlaySnakes[s].FlashOn;
 		PlaySnakes[s].FlashOn:= wantFlash;
 		NeedRepaint[s]:= repaint;
+
+		// THE TURN TELEGRAPH, drained BEFORE the step is even considered
+		// - see SetPlayerLook. This is the whole point: the head shows
+		// the new heading whether or not the snake is due to move, and
+		// whether or not the move will turn out to be legal.
+		if  PlayHeadDirty[s] then
+			begin
+			PlayHeadDirty[s]:= False;
+			ShowHead(s);
+			end;
 
 		if  PlaySnakes[s].MoveTick > 0 then
 			begin
@@ -6402,6 +8895,8 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 				RepaintBody(s);
 				end;
 
+			ShowHead(s);
+
 			Continue;
 			end;
 
@@ -6466,11 +8961,93 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 		//   - nobody is blocked BY a floating snake, which is the same
 		//     thing said from the other side and is what stops the
 		//     newcomer killing the snake it materialised in
+		blocker:= -1;
+
 		if  blocked and IsSnakeTile(tile) then
 			if  PlaySnakes[s].Floating then
 				blocked:= False
 			else
-				blocked:= SolidSnakeAt(head.Row, head.Col, -1) >= 0;
+				begin
+				blocker:= SolidSnakeAt(head.Row, head.Col, -1);
+				blocked:= blocker >= 0;
+				end;
+
+		// THE BOSS, MET HEAD ON. Since 2026-08-26 this is the only thing
+		// that hurts it, and the rule it runs on is the one two players
+		// already get: nobody moves, nobody loses a life, both come away
+		// shielded (dengland: "the same both players run into each other
+		// logic for snakes should apply... let's use the both collide to
+		// kill the boss").
+		//
+		// THE HEAD, SPECIFICALLY. Reaching any other part of the boss is
+		// an ordinary collision and kills you, exactly as running into
+		// any other snake does - so the weapon is the one manoeuvre
+		// every instinct says not to attempt.
+		//
+		// THIS IS THE ONLY PLACE THE BOSS CAN BE DAMAGED. TickBoss
+		// deliberately has no mirror of it: the boss homing on heads is
+		// its entire chase, so letting its own move count as a mutual
+		// collision made it suicidal - see Verdict, where the first test
+		// run is written up.
+		//
+		// Nothing is lost by putting it all here, and that is exact
+		// rather than lucky: PLAYERS MOVE FIRST each tick, so a player
+		// driving into the boss is always resolved on this pass. By the
+		// time the boss moves, the only players left for it to meet are
+		// ones that did not move into it.
+		// NO SIMULTANEITY GATE HERE, and the reason is worth keeping.
+		//
+		// dengland raised the right principle - "snakes only both
+		// collide when they are going the same speed otherwise one
+		// reaches the other first and should win" - and it was briefly
+		// implemented as "only if the boss is also due a step this
+		// tick" (MoveTick = 0). Then he reported the consequence from
+		// the other side: "I was shielded and didn't hit the boss."
+		//
+		// THAT TEST CANNOT SURVIVE THE BOSS RUNNING AT PLAYER SPEED,
+		// which is the change he asked for in the same breath. Both
+		// counters then have the SAME PERIOD, so their phase relative
+		// to one another is fixed until something resets it - a death,
+		// a respawn, a speed food. Two snakes one tick out of step
+		// would never once hit zero together, and the head-on would be
+		// silently impossible for that pairing for minutes at a time.
+		// A mechanic that works or does not work on invisible phase is
+		// worse than one that is merely generous.
+		//
+		// With the boss at player speed the principle is satisfied
+		// anyway: neither party is quicker, so nobody "gets there
+		// first", and driving head-first into it IS the mutual
+		// collision. Body contact still kills you exactly as it always
+		// did - the head is the only part of it that is a weapon rather
+		// than a wall.
+		//
+		// If this ever needs to be genuinely simultaneous, the way to
+		// do it is to have the boss choose and PUBLISH its target cell
+		// before the player pass runs, not to guess from a counter.
+		if  blocked and (blocker = SNAKE_SLOT_BOSS)
+		and (SnakeSegAt(SNAKE_SLOT_BOSS, head.Row, head.Col) = 0) then
+			begin
+			// Did not move - so put Dir back to the heading actually
+			// travelled, for the reason set out on the shielded branch
+			// below.
+			PlaySnakes[s].Dir:= ArrivedDir[s];
+
+			PlaySnakes[s].InvunTicks:= PLAY_SPAWN_INVUN_TICKS;
+
+			if  not PlaySnakes[s].FlashOn then
+				begin
+				PlaySnakes[s].FlashOn:= True;
+				RepaintBody(s);
+				end;
+
+			// Declines while the boss is dormant or already reeling, and
+			// the draw above still stands in that case - see HitBoss.
+			HitBoss(s, ADeltas, ADeltaCount);
+
+			ShowHead(s);
+
+			Continue;
+			end;
 
 		if  blocked
 		and (growing
@@ -6537,6 +9114,8 @@ procedure TSnakeGame.TickPlaySnakes(var ADeltas: array of TTileDelta;
 
 				if  repaint then
 					RepaintBody(s);
+
+				ShowHead(s);
 
 				Continue;
 				end;
@@ -6747,16 +9326,22 @@ procedure TSnakeGame.StartPlay;
 	LevelSecsSent:= -1;
 
 	// Same ordering rule as NextLevel: after LevelNumber is final, since
-	// the debug start level above may just have moved it.
+	// the debug start level above may just have moved it. Both of these
+	// read LevelStage, which is derived from it.
 	ResetLevelKeys;
+	ResetPlayLava;
 
 	BuildLevel(LevelVariant, LevelProgress);
 
-	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
-		begin
+	// SNAKE_RENDER_SLOTS, so the boss goes down with everybody else. It
+	// is re-laid below if this stage wants one, and a stale Alive on
+	// that slot would otherwise leave an invisible boss in the models
+	// for every collision test to find.
+	for i:= 0 to SNAKE_RENDER_SLOTS - 1 do
 		PlaySnakes[i].Alive:= False;
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
 		PlayRespawn[i]:= 0;
-		end;
 
 	for i:= 0 to PLAY_BEE_CAP - 1 do
 		PlayBees[i].Active:= False;
@@ -6775,6 +9360,13 @@ procedure TSnakeGame.StartPlay;
 	// result.
 	SetLength(deltas, 64);
 	deltaCount:= 0;
+
+	// THE BOSS FIRST, onto the empty centre, before anybody's corner is
+	// occupied - see SpawnBoss for why being laid with the level rather
+	// than arriving later is the whole reason it needs no sweep and no
+	// Floating state.
+	if  StageHasBoss then
+		SpawnBoss(deltas, deltaCount);
 
 	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
 		if  Assigned(Slots[i].Player) then
@@ -6807,17 +9399,25 @@ procedure TSnakeGame.StopPlay;
 	LevelProgress:= Ord(Difficulty);
 	LevelNumber:= 1;
 
-	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
-		begin
+	// SNAKE_RENDER_SLOTS - the boss must not survive into attract mode.
+	// Nothing there would move it or draw it, but it would still be in
+	// the models, and BuildLevelBase below is about to paint over the
+	// cells it thinks it holds.
+	for i:= 0 to SNAKE_RENDER_SLOTS - 1 do
 		PlaySnakes[i].Alive:= False;
+
+	for i:= 0 to SNAKE_PLAYER_COUNT - 1 do
 		PlayRespawn[i]:= 0;
-		end;
 
 	for i:= 0 to PLAY_FOOD_MAX - 1 do
 		PlayFood[i].Active:= False;
 
 	for i:= 0 to PLAY_BEE_CAP - 1 do
 		PlayBees[i].Active:= False;
+
+	// The play-side pools, not the reel's - the attract lava that runs
+	// after this has its own state and its own wave machine.
+	ResetPlayLava;
 
 	// Back to the demo's own board - its bar, and its snakes laid out
 	// on the circuit. InitDemoSnakes writes them into Board, so the
@@ -7335,15 +9935,28 @@ procedure TSnakeGame.Tick;
 	// snake also sweeps its start area, a (2 * PLAY_SPAWN_CLEAR + 1)
 	// square, though only the non-floor cells there emit.
 	//
-	// 78 IS A HARD CEILING, not a comfortable round number: the stack
-	// caps a payload at 235 bytes and a delta is 3, so 1 + 78 x 3 = 235
-	// is exactly one message. Going above it would silently truncate on
-	// the wire rather than overflow here.
+	// 78 USED TO BE A HARD CEILING, because that is exactly one message:
+	// the stack caps a payload at 235 bytes and a delta is 3, so
+	// 1 + 78 x 3 = 235. Everything past it was silently dropped.
 	//
-	// EmitCell drops anything past the end rather than overrunning, and
-	// Board stays authoritative either way, so the worst case is a cell
-	// that looks stale until the next full sync - not a desync.
-	SetLength(deltas, 78);
+	// IT IS NO LONGER A CEILING, only a chunk size - SendTileDeltas
+	// splits across as many messages as the tick needs (2026-08-26). The
+	// gather buffer is sized for the genuine worst case instead, which
+	// is what it should always have been:
+	//
+	//   four players repainting a full-length flashing body   4 x 63
+	//   the boss doing the same                                     27
+	//   a full swarm moving, two cells each                         32
+	//   food expiring and spawning                                   6
+	//
+	// That is comfortably over 300, and it is not a hypothetical: the
+	// flash phase flips EVERY tick, so any long snake with a shield is
+	// already paying its whole length per tick.
+	//
+	// EmitCell still drops anything past the end rather than overrunning,
+	// and Board stays authoritative either way, so even exceeding this
+	// costs a stale cell until the next sync rather than a desync.
+	SetLength(deltas, PLAY_DELTAS_MAX);
 	Lock.Acquire;
 		try
 		claimed:= False;
@@ -7370,23 +9983,76 @@ procedure TSnakeGame.Tick;
 
 			TickPlaySnakes(deltas, deltaCount);
 
+			// AFTER THE PLAYERS, so the boss chases where they ARE
+			// rather than where they were - which is also what makes its
+			// head-on test meaningful. See TickBoss for why it is not
+			// folded into the routine above despite sharing its array.
+			TickBoss(deltas, deltaCount);
+
 			// AFTER the snakes, so a piece of food that rots on the same
 			// tick as a head arrives on it has already been eaten - the
 			// snake gets it, rather than losing it by a tick.
 			TickPlayFood(deltas, deltaCount);
 			TickPlayBees(deltas, deltaCount);
 
+			// Gated here rather than inside, so a level with no lava
+			// costs one boolean rather than a call and a phase machine.
+			// Bees and lava never share a level (PlayBeeMax returns 0 on
+			// a lava stage), so the two above and this one are never
+			// both doing anything.
+			if  StageHasLava then
+				TickPlayLava(deltas, deltaCount);
+
 			// After the ordinary food, so a key and a food cannot both
 			// try to claim the last free table slot in the same tick with
 			// the key winning by running first.
 			TickLevelKey(deltas, deltaCount);
+
+			// A CUED SHAKE, drained here rather than at the bottom.
+			//
+			// Real play only cues one from the boss - a hit, and the
+			// kill - and both arrive on a tick that is very likely to be
+			// the level's LAST, because the kill is what ends it. The
+			// NextLevel branch below exits early and would swallow the
+			// message entirely, which is exactly what the attract reel's
+			// own drain had to be moved above its empty-broadcast check
+			// to avoid.
+			if  DemoShakePending > 0 then
+				begin
+				for i:= 0 to Watchers.Count - 1 do
+					try
+					SendShake(Watchers[i], DemoShakePending);
+
+					except
+					on E: Exception do
+						AddLogMessage(slkError,
+								'Tick: SendShake failed for watcher - ' + E.Message);
+					end;
+
+				DemoShakePending:= 0;
+				end;
 
 			// --- the level clock ---
 			//
 			// Run AFTER everything that moves, so a level that ends this
 			// tick rebuilds on top of a finished board rather than
 			// halfway through one.
-			if  LevelTicks > 0 then
+			// A BOSS LEVEL'S CLOCK DOES NOT RUN (dengland, 2026-08-26:
+			// "instead of time going down normally on this level, you
+			// have to clear it with killing the boss"). The level ends
+			// when the boss dies and by no other route - KillBoss
+			// releases the freeze by setting a short victory beat, and
+			// the ordinary path below then fires with no special case.
+			//
+			// BossOnBoard, not StageHasBoss, is what holds the freeze:
+			// the difference between them is precisely the beat after
+			// the kill.
+			//
+			// If NOBODY can kill it, the level does not end - and that
+			// is the intended consequence, not an oversight. The board
+			// still empties the usual way as players run out of lives,
+			// and the last one leaving drops it back to attract mode.
+			if  (LevelTicks > 0) and not BossOnBoard then
 				begin
 				Dec(LevelTicks);
 
@@ -7394,7 +10060,13 @@ procedure TSnakeGame.Tick;
 				// quicker. Fires ONCE - LevelRamped is what both
 				// PlayBeeMax and BoardStepTicks read, so it has to latch
 				// rather than be re-tested.
-				if  (not LevelRamped)
+				//
+				// NOT ON A BOSS STAGE. There is no thirty-seconds-left
+				// to be in: the only time that clock moves there is the
+				// couple of seconds after the boss is already dead, and
+				// taking a gear off the board for the victory lap would
+				// be a speed jump out of nowhere.
+				if  (not LevelRamped) and not StageHasBoss
 				and (LevelTicks <= PLAY_LEVEL_RAMP_TICKS) then
 					LevelRamped:= True;
 				end;
@@ -7837,9 +10509,30 @@ procedure TSnakeGame.SendGameStatus(APlayer: TPlayer);
 	// redundant with it - the client needs a number to test against
 	// PLAY_STATUS_WARN_SECS, and parsing digits back out of its own
 	// display string to get one would be daft.
-	t:= 'LEVEL ' + Format('%2d', [LevelNumber])
-			+ '   TIME ' + IntToStr(secs div 60)
-			+ ':' + Format('%.2d', [secs mod 60]);
+	//
+	// BOSS MODE. On a boss stage the clock is frozen and means nothing,
+	// so the line carries the boss's remaining lives instead - dengland
+	// asked for exactly this ("go into 'boss mode' on the level display
+	// above the board").
+	//
+	// It needs NO PROTOCOL CHANGE and no client work, which is worth
+	// saying out loud because the alternative he floated was to add more
+	// data to the message. This text is formatted server-side and the
+	// client just prints it, so a new display mode costs one branch
+	// here. The seconds field goes out unchanged and simply sits at the
+	// frozen value, which is also what keeps the client's low-time warn
+	// from firing on a level that has no low time.
+	//
+	// The pips are '*', deliberately: the framework's label text cannot
+	// reach screen codes above $3F, so anything prettier would need the
+	// tile path rather than the status line.
+	if  BossOnBoard then
+		t:= 'LEVEL ' + Format('%2d', [LevelNumber])
+				+ '   BOSS ' + StringOfChar('*', BossLives)
+	else
+		t:= 'LEVEL ' + Format('%2d', [LevelNumber])
+				+ '   TIME ' + IntToStr(secs div 60)
+				+ ':' + Format('%.2d', [secs mod 60]);
 
 	while Length(t) < PLAY_STATUS_LEN do
 		t:= t + ' ';
