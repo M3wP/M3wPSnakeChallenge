@@ -25,6 +25,10 @@ GAME_INET_PORT	= 19763				;Chess is 19762, Yahtzee 7632
 
 	.define	GAME_TITLE_TEXT	"SNAKE CHALLENGE QUADRO!"
 
+;	Not debug-only despite the name: gates the JSR fontLoadXirod in
+;	fw_startup.s. Snake loads its charset another way; Chess sets this 1.
+	.define	DEBUG_LOADFONT	0
+
 
 .include "framework/fw_core.s"
 .include "framework/fw_startup.s"

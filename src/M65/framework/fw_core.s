@@ -16,14 +16,6 @@
 
 ;	TODO:
 ;   - Add a pointer state for text entry mode?
-;   - clientDetailBoardPresent's screenHiBytesUsed check (see
-;     screenClearHiBytes) sweeps all 1000 screen cells' high bytes on
-;     every chess board redraw, even though a move only ever touches
-;     a couple of squares. Since MakeMove/MoveMade already know
-;     exactly which cells changed (chessMoveFromX/Y, the delta list),
-;     a targeted clear of just those squares' high bytes would avoid
-;     the whole-screen sweep - noted after seeing a brief flicker on
-;     real hardware from the full sweep.
 ;
 ;
 ;	LIMITATIONS:
@@ -222,7 +214,11 @@ IP65_ERROR_CONNECTION_CLOSED  = $8A
 ;	Loads the custom font via bigglesLoadFontHack at boot. Off for Snake
 ;	QUADRO - PETSCII/ROM font stays active until the custom Xirod font
 ;	is adapted for this game's tile needs (explicit user call, 2026-08-24).
-	.define	DEBUG_LOADFONT	0
+;	DEBUG_LOADFONT - PER-GAME, defined in the top-level game file
+;	(snake.s / chess.s) before this include, alongside GAME_INET_PORT and
+;	GAME_TITLE_TEXT. Despite the name it is not debug-only: it gates the
+;	JSR fontLoadXirod in fw_startup.s, which is how Chess loads its font
+;	at all. Snake sets it 0 and gets its charset another way.
 
 
 VAL_CPU_IRQ		=	$FFFE
