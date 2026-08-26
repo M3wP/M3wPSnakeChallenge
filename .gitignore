@@ -73,3 +73,12 @@ modules/
 
 # MEGA65 build intermediates (obj/ is the Makefiles' OBJDIR)
 obj/
+
+# Free Pascal / Lazarus compiler output (the vendored synalist-code
+# builds these in place if its units are ever compiled outside obj/)
+*.ppu
+*.rsj
+*.compiled
+
+# Lazarus session file - window positions, breakpoints, per-user
+*.lps
