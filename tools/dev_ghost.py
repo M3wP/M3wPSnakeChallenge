@@ -40,6 +40,9 @@ def main():
 	ap.add_argument("--game", help="play/chess game name to join (TChessGame)")
 	ap.add_argument("--room", help="lobby/chat room name to join (TLobbyRoom) "
 			"instead of a play game - mutually exclusive with --game")
+	ap.add_argument("--otp", default=None,
+			help="send the two-param RetroGameGate username form, "
+			"$31 '<name> <otp>' - needs a server started with --sidecar")
 	ap.add_argument("--password", default=None)
 	ap.add_argument("--echo-room-chat", action="store_true",
 			help="with --room, echo back any room chat (mcLobby/0x4) text "
@@ -86,7 +89,7 @@ def main():
 	c.connect()
 
 	c.send_ident()
-	c.send_username()
+	c.send_username(args.otp)
 	time.sleep(0.3)
 
 	if args.room:

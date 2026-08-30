@@ -2934,6 +2934,14 @@ clientProcRoomPeerMsg:
 		INY
 		INX
 		
+;	BOUNDED - without this the loop ran until it found a space, which
+;	was safe only because the server cuts every chat sender name to 8.
+;	That is not a defence to rely on - a message with no space in it runs
+;	off the end whatever the name length - and the portal work raises
+;	names to 16 (dengland/Savrok, 2026-08-31).
+		CPX	#CHAT_NAME_MAX
+		BEQ	@done1
+		
 		JMP	@loop1
 		
 @done1:
@@ -3335,6 +3343,12 @@ clientProcPlayGameChatMsg:
 		INY
 		INX
 
+;	BOUNDED - same reasoning as the room-chat copy above. This is the
+;	worse of the two if it runs away: play_lastuser is followed directly
+;	by msgs_change_idx, which is framework control-message state.
+		CPX	#CHAT_NAME_MAX
+		BEQ	@done1
+		
 		JMP	@loop1
 
 @done1:
@@ -9577,10 +9591,19 @@ current_clrs:
 			.res	10
 
 
+;	Longest chat sender name these hold, and the bound on both copy loops
+;	that fill them. 16 matches the server's NAME_MAX_CHARS after the
+;	RetroGameGate change - see doc/portal/quadro.md S9.2.
+;
+;	The server still cuts CHAT sender names to 8 on the way out, so 16 is
+;	not reachable yet - THIS is what has to be deployed before that
+;	truncation can be raised. 17 bytes for the terminating null.
+CHAT_NAME_MAX	= 16
+
 room_haveblank:
 			.res 	1
 room_lastuser:
-			.res	11
+			.res	17
 
 ;	Same dedup-state shape as room_haveblank/room_lastuser above, for
 ;	page_play's in-game chat log (lpanel_play_log) - see
@@ -9588,7 +9611,7 @@ room_lastuser:
 play_haveblank:
 			.res	1
 play_lastuser:
-			.res	11
+			.res	17
 
 
 msgs_change_idx:

@@ -7,7 +7,8 @@ unit SnakeServer;
 interface
 
 uses
-	SyncObjs, Generics.Collections, Classes, TCPServer, SnakeClasses;
+	SyncObjs, Generics.Collections, Classes, TCPServer, SnakeClasses,
+	SidecarClient;
 
 const
 	// 30x20 - the original Lua game's 30x18 grown vertically to fill the
@@ -113,6 +114,26 @@ type
 	TPlayer = class;
 	TPlayersList = TThreadList<TPlayer>;
 
+	{ TSidecarRequest }
+//	A $31 waiting on the sidecar. The player is held by IDENT, never by
+//	reference: the answer arrives on a later main-loop pass and the player
+//	may well have gone (hang-up, limbo expiry) in between, so the ident is
+//	looked up again when it lands and a miss simply drops the request.
+//
+//	AgeMs is bumped by SidecarPump on the 100 ms tick; past
+//	SIDECAR_DEADLINE_MS the request is failed exactly as a NO would be
+//	(sidecar-local.md S6).
+	TSidecarRequest = class(TObject)
+		ReqId: Cardinal;
+		Ident: TGUID;
+		Name: AnsiString;
+		AgeMs: Integer;
+
+		constructor Create;
+	end;
+
+	TSidecarRequests = TThreadList<TSidecarRequest>;
+
 	TMessageTemplate = record
 		Category: TMsgCategory;
 		Method: Byte;
@@ -179,6 +200,16 @@ type
 
 		procedure PlayersKeepAliveDecrement(Ams: Integer);
 		procedure PlayersKeepAliveExpire;
+
+//	The tail of a successful $31, shared by the legacy synchronous path and
+//	the sidecar's asynchronous one so there is exactly one place that
+//	decides what "username accepted" means.
+		procedure CompleteUsername(APlayer: TPlayer; const AName: AnsiString);
+
+//	Drains the sidecar's reply queue and ages the parked requests. Called
+//	once per 100 ms main-loop pass, BEFORE LimboZone.ExpirePlayers so a
+//	name that lands this pass is promoted in the same one.
+		procedure SidecarPump;
 	end;
 
 	TLimboZone = class(TZone)
@@ -1104,6 +1135,13 @@ type
 		Ticket: string;
 //		Connection: TTCPConnection;
 
+//	The peer's dotted-decimal IPv4 address, copied from TTCPConnection at
+//	accept time (see DoConnect in the .lpr). TTCPConnection is not reachable
+//	from here - the field above has been commented out since long before
+//	this - and every sidecar message carries <remote_ip>, so it is kept
+//	here rather than looked up.
+		RemoteAddress: string;
+
 		Zones: TZones;
 
         Lock: TCriticalSection;
@@ -1159,8 +1197,25 @@ var
 	ExpireZones: TExpireZones;
     ExpirePlayers: TExpirePlayers;
 
+//	$31s waiting on a sidecar answer - see TSidecarRequest.
+	SidecarRequests: TSidecarRequests;
+
 
 const
+//	Username length cap. This was 8 everywhere; raised for RetroGameGate so
+//	a portal identity survives the handover (quadro.md S9.2). The wire
+//	always carried any length - a param is just bytes up to the next space -
+//	so this constant is purely the Copy() clamp.
+//
+//	DELIBERATELY NOT APPLIED to the two chat sender re-truncations (lobby
+//	$24 and play $64), which still say 8. The MEGA65 client copies a chat
+//	sender's name into an 11-byte buffer with a loop bounded only by the
+//	space character, so a 16-char name there runs off the end of
+//	play_lastuser into msgs_change_idx. Those two go to 16 only once a
+//	client with a bounded loop is deployed - see
+//	doc/portal/implementation.md.
+	NAME_MAX_CHARS = 16;
+
 	LIT_SYS_VERNAME: AnsiString = 'alpha';
 {$IFDEF ANDROID}
 	LIT_SYS_PLATFRM: AnsiString = 'android';
@@ -2757,6 +2812,148 @@ function TZone.GetPlayers(AIndex: Integer): TPlayer;
 		end;
 	end;
 
+{ TSidecarRequest }
+
+constructor TSidecarRequest.Create;
+	begin
+	inherited;
+
+	ReqId:= 0;
+	AgeMs:= 0;
+	end;
+
+//	Is a $31 from this connection already waiting on the sidecar? Guards
+//	against a client firing a second one while the first is in flight
+//	(quadro.md S9.3).
+function  SidecarRequestPending(const AIdent: TGUID): Boolean;
+	var
+	i: Integer;
+
+	begin
+	Result:= False;
+
+	if  not SidecarEnabled then
+		Exit;
+
+	with SidecarRequests.LockList do
+		try
+		for i:= 0 to Count - 1 do
+			if  CompareMem(@Items[i].Ident, @AIdent, SizeOf(TGUID)) then
+				begin
+				Result:= True;
+				Exit;
+				end;
+
+		finally
+		SidecarRequests.UnlockList;
+		end;
+	end;
+
+//	Park a $31 and ask the sidecar about it. AOtp empty means the one-param
+//	form, which becomes NAME (the portal reserves usernames, so even a
+//	walk-in name has to be checked); otherwise VERIFY.
+//
+//	Returns immediately - this runs on TServerDispatcher's thread, which
+//	serves EVERY player's inbound messages, so it must never wait on
+//	anything (sidecar-local.md S6: "Do not block the main loop").
+procedure SidecarAsk(APlayer: TPlayer; const AName, AOtp: AnsiString);
+	var
+	r: TSidecarRequest;
+
+	begin
+	r:= TSidecarRequest.Create;
+	r.ReqId:= SidecarNextReqId;
+	r.Ident:= APlayer.Ident;
+	r.Name:= AName;
+
+	SidecarRequests.Add(r);
+
+	if  Length(AOtp) > 0 then
+		SidecarSend('VERIFY ' + AName + ' ' + AOtp + ' ' +
+				AnsiString(APlayer.RemoteAddress) + ' ' +
+				AnsiString(IntToStr(r.ReqId)))
+	else
+		SidecarSend('NAME ' + AName + ' ' +
+				AnsiString(APlayer.RemoteAddress) + ' ' +
+				AnsiString(IntToStr(r.ReqId)));
+	end;
+
+//	Find a parked request by req_id and REMOVE it from the list; the caller
+//	owns it from then on. nil means there is no such request - a late reply
+//	after we already gave up on it, which S6 says to ignore.
+function  SidecarTakeRequest(AReqId: Cardinal): TSidecarRequest;
+	var
+	i: Integer;
+
+	begin
+	Result:= nil;
+
+	with SidecarRequests.LockList do
+		try
+		for i:= 0 to Count - 1 do
+			if  Items[i].ReqId = AReqId then
+				begin
+				Result:= Items[i];
+				Delete(i);
+				Exit;
+				end;
+
+		finally
+		SidecarRequests.UnlockList;
+		end;
+	end;
+
+//	Age every parked request by one main-loop pass and fail the ones that
+//	have run out of time. "No reply within 5 s = same as NO"
+//	(sidecar-local.md S6) - the client gets the same error a bad name gives
+//	and stays in limbo, where its own 60 s timer is still running.
+procedure SidecarExpireRequests;
+	var
+	i: Integer;
+	dead: TList<TSidecarRequest>;
+	p: TPlayer;
+
+	begin
+	dead:= TList<TSidecarRequest>.Create;
+	try
+		with SidecarRequests.LockList do
+			try
+			for i:= Count - 1 downto 0 do
+				begin
+				Inc(Items[i].AgeMs, 100);
+
+				if  Items[i].AgeMs >= SIDECAR_DEADLINE_MS then
+					begin
+					dead.Add(Items[i]);
+					Delete(i);
+					end;
+				end;
+
+			finally
+			SidecarRequests.UnlockList;
+			end;
+
+		for i:= 0 to dead.Count - 1 do
+			begin
+			p:= SystemZone.PlayerByIdent(dead[i].Ident);
+
+			if  Assigned(p) then
+				begin
+				AddLogMessage(slkWarning, '"' + p.Ticket +
+						'" sidecar did not answer within ' +
+						IntToStr(SIDECAR_DEADLINE_MS) + 'ms - refusing username.');
+
+				p.SendServerError(LIT_ERR_CONNCTID);
+				end;
+
+			dead[i].Free;
+			end;
+
+		finally
+		dead.Free;
+		end;
+	end;
+
 function TZone.PlayerByIdent(const AIdent: TGUID): TPlayer;
 	var
 	i: Integer;
@@ -2964,7 +3161,7 @@ procedure TSystemZone.ProcessPlayerMessage(APlayer: TPlayer;
 
 		if  AMessage.Params.Count > 0 then
 			begin
-			n:= Copy(AMessage.Params[0], 1, 8);
+			n:= Copy(AMessage.Params[0], 1, NAME_MAX_CHARS);
 
 			with ListMessages.LockList do
 				try
@@ -2993,7 +3190,7 @@ procedure TSystemZone.ProcessPlayerMessage(APlayer: TPlayer;
 
 		if  AMessage.Params.Count > 0 then
 			begin
-			n:= Copy(AMessage.Params[0], 1, 8);
+			n:= Copy(AMessage.Params[0], 1, NAME_MAX_CHARS);
 			a:= PlayerByName(n);
 
 			if  Assigned(a) then
@@ -3015,42 +3212,52 @@ procedure TSystemZone.ProcessPlayerMessage(APlayer: TPlayer;
 	and (AMessage.Method = 1) then
 		begin
 		AMessage.ExtractParams;
-		if  (AMessage.Params.Count = 1)
-		and (Length(AMessage.Params[0]) > 1) then
-			begin
-			n:= Copy(AMessage.Params[0], 1, 8);
 
-			with FPlayers.LockList do
-				try
-					if  Length(APlayer.Name) > 0 then
-						APlayer.SendServerError(LIT_ERR_CONNCTID)
-					else
-						begin
-						a:= PlayerByName(n);
+//	One param is the username on its own, as it always has been. TWO is a
+//	RetroGameGate handover, "<name> <otp>", and is a legal shape only when
+//	there is a sidecar to ask - without one it stays what it was before this
+//	change, an error (quadro.md S9.3).
+		if  (AMessage.Params.Count < 1)
+		or  (AMessage.Params.Count > 2)
+		or  (Length(AMessage.Params[0]) <= 1)
+		or  ((AMessage.Params.Count = 2) and (not SidecarEnabled)) then
+			APlayer.SendServerError(LIT_ERR_CONNCTID)
 
-						if  not Assigned(a) then
-							begin
-							m:= TBaseMessage.Create;
-							m.Assign(AMessage);
-							m.Params.Add(APlayer.Name);
-							m.DataFromParams;
+//	Settable once per connection, as before.
+		else if  Length(APlayer.Name) > 0 then
+			APlayer.SendServerError(LIT_ERR_CONNCTID)
 
-							APlayer.AddSendMessage(m);
+//	"A player with a $31 in flight who sends a second $31 gets $50 for the
+//	second one" - S9.3.
+		else if  SidecarRequestPending(APlayer.Ident) then
+			APlayer.SendServerError(LIT_ERR_CONNCTID)
 
-							APlayer.Name:= n;
-
-							AddLogMessage(slkInfo, '"' + APlayer.Ticket +
-									'" set username to "' + string(n) + '".');
-							end
-						else
-							APlayer.SendServerError(LIT_ERR_CONNCTID);
-						end;
-				finally
-                FPlayers.UnlockList;
-				end;
-			end
 		else
-			APlayer.SendServerError(LIT_ERR_CONNCTID);
+			begin
+			n:= Copy(AMessage.Params[0], 1, NAME_MAX_CHARS);
+
+//	No sidecar configured at all, or one configured but down while running
+//	fail_open: the legacy path, which is the plain uniqueness check this
+//	handler has always done. In fail_open a second param is simply ignored
+//	(sidecar-local.md S6).
+			if  (not SidecarEnabled)
+			or  ((not Sidecar.Live) and SidecarFailOpen) then
+				CompleteUsername(APlayer, n)
+
+//	Configured, down, fail_closed: nobody gets a name while the check is
+//	unavailable, because nobody can be told apart from a portal user.
+			else if  not Sidecar.Live then
+				APlayer.SendServerError(LIT_ERR_CONNCTID)
+
+//	Otherwise ask, and answer the client when the reply lands. NOTHING is
+//	set on the player here - APlayer.Name stays empty, so the limbo gate in
+//	TLimboZone.ExpirePlayers holds them exactly as it does an unnamed
+//	connection, and its 60 s timer keeps running.
+			else if  AMessage.Params.Count = 2 then
+				SidecarAsk(APlayer, n, AMessage.Params[1])
+			else
+				SidecarAsk(APlayer, n, '');
+			end;
 
 		AHandled:= True;
 		end
@@ -3073,9 +3280,166 @@ procedure TSystemZone.ProcessPlayerMessage(APlayer: TPlayer;
 		end;
 	end;
 
+//	The tail of an accepted $31, shared by the legacy synchronous path and
+//	the sidecar's asynchronous one. Behaviour is exactly what the handler
+//	did before this change: reject if the name is already live, otherwise
+//	echo it back and set it.
+//
+//	The echo is BUILT here rather than copied from the inbound message,
+//	which the old code did with m.Assign. On the two-param form that would
+//	have echoed the player's OTP straight back down the wire. The shape is
+//	unchanged: name plus an empty second param, so the payload still ends
+//	in the trailing space every existing client expects
+//	("<name16> " - quadro.md S9.3).
+procedure TSystemZone.CompleteUsername(APlayer: TPlayer; const AName: AnsiString);
+	var
+	a: TPlayer;
+	m: TBaseMessage;
+
+	begin
+	with FPlayers.LockList do
+		try
+		a:= PlayerByName(AName);
+
+		if  Assigned(a) then
+			begin
+			APlayer.SendServerError(LIT_ERR_CONNCTID);
+			Exit;
+			end;
+
+		m:= TBaseMessage.Create;
+		m.Category:= mcConnect;
+		m.Method:= 1;
+		m.Params.Add(AName);
+		m.Params.Add('');
+		m.DataFromParams;
+
+		APlayer.AddSendMessage(m);
+
+		APlayer.Name:= AName;
+
+		AddLogMessage(slkInfo, '"' + APlayer.Ticket +
+				'" set username to "' + string(AName) + '".');
+
+		finally
+		FPlayers.UnlockList;
+		end;
+	end;
+
+//	One pass of the sidecar's reply queue plus the deadline sweep, driven
+//	from the 100 ms main loop. Runs BEFORE LimboZone.ExpirePlayers so a name
+//	accepted this pass is promoted in the same one.
+//
+//	Deliberately all on the main-loop thread: the sidecar thread only ever
+//	moves lines, and every piece of player state is touched from here, so
+//	there is no new cross-thread contact anywhere in this feature.
+procedure TSystemZone.SidecarPump;
+	var
+	i: Integer;
+	rep: TSidecarReply;
+	req: TSidecarRequest;
+	p: TPlayer;
+	reps: TList<TSidecarReply>;
+
+	begin
+	if  not SidecarEnabled
+	or  not Assigned(Sidecar) then
+		Exit;
+
+//	Take the whole batch under the lock, then act on it outside - acting on
+//	it means calling into zones that take their own locks.
+	reps:= TList<TSidecarReply>.Create;
+	try
+		with Sidecar.Replies.LockList do
+			try
+			for i:= 0 to Count - 1 do
+				reps.Add(Items[i]);
+
+			Clear;
+
+			finally
+			Sidecar.Replies.UnlockList;
+			end;
+
+		for i:= 0 to reps.Count - 1 do
+			begin
+			rep:= reps[i];
+			try
+				if  rep.Kind = srkKick then
+					begin
+					p:= PlayerByName(rep.Name);
+
+					if  Assigned(p) then
+						begin
+						AddLogMessage(slkInfo, 'Sidecar KICK "' +
+								string(rep.Name) + '" (' + string(rep.Reason) + ')');
+
+//	"as if the connection had dropped" - which routes through
+//	TSystemZone.Remove and so raises the usual EVENT PART for us.
+						TCPServer.TCPServer.DisconnectByIdent(p.Ident);
+						end;
+
+					Continue;
+					end;
+
+				req:= SidecarTakeRequest(rep.ReqId);
+
+//	A reply for a request we have already timed out and discarded. S6 says
+//	ignore it.
+				if  not Assigned(req) then
+					Continue;
+
+				try
+					p:= PlayerByIdent(req.Ident);
+
+//	The connection went away while we were asking.
+					if  not Assigned(p) then
+						Continue;
+
+					if  rep.Kind = srkOK then
+//	The portal's canonical spelling wins over whatever the client typed.
+						CompleteUsername(p, rep.Name)
+					else
+						begin
+						AddLogMessage(slkInfo, '"' + p.Ticket +
+								'" username refused by sidecar (' +
+								string(rep.Reason) + ')');
+
+//	The reason word is for this log line only - the client gets the same
+//	error a bad name has always produced, and stays in limbo.
+						p.SendServerError(LIT_ERR_CONNCTID);
+						end;
+
+					finally
+					req.Free;
+					end;
+
+				finally
+				rep.Free;
+				end;
+			end;
+
+		finally
+		reps.Free;
+		end;
+
+	SidecarExpireRequests;
+	end;
+
 procedure TSystemZone.Remove(APlayer: TPlayer);
 	begin
 	inherited;
+
+//	The ONE funnel every departure goes through - graceful hang-up (the
+//	.lpr's DoDisconnect), keepalive expiry (PlayersKeepAliveExpire) and the
+//	60 s limbo timeout (TLimboZone.ExpirePlayers) all arrive here - so this
+//	is the only place EVENT PART has to be raised (quadro.md S9.4).
+//
+//	A player who never got a name produces no event, which is what the
+//	sidecar expects: it never saw a JOIN for them either.
+	if  Length(APlayer.Name) > 0 then
+		SidecarSend('EVENT PART ' + APlayer.Name + ' ' +
+				AnsiString(APlayer.RemoteAddress));
 
 	APlayer.ClearZones;
 
@@ -3139,6 +3503,13 @@ procedure TLimboZone.ExpirePlayers;
 				    begin
 				    AddLogMessage(slkInfo, '"' + p.Ticket +
 							'" authenticated, move to lobby/play.');
+
+//	The moment the portal counts as "in the game" - S9.4. Raised here rather
+//	than when the name was accepted, because a named player still in limbo
+//	has not finished the handshake (the client ident may not have landed)
+//	and may yet expire without ever reaching a board.
+					    SidecarSend('EVENT JOIN ' + p.Name + ' ' +
+							AnsiString(p.RemoteAddress));
 
                     LimboZone.Remove(p);
 
@@ -3892,10 +4263,17 @@ constructor TMessageList.Create(APlayer: TPlayer);
 
 	Player:= APlayer;
 
+//	The list id is the player's name with a digit appended, and the digit
+//	lands at min(len + 1, NAME_MAX_CHARS) - so on a name at the cap it
+//	replaces the last character rather than extending past it.
+//
+//	This clamp was 8, and had to move with the name length: two 16-char
+//	names differing only after character 8 would otherwise derive the
+//	SAME list id and collide in ListMessages (quadro.md S9.2).
 	s:= APlayer.Name;
 	p:= Length(s) + 1;
-	if  p > 8 then
-		p:= 8;
+	if  p > NAME_MAX_CHARS then
+		p:= NAME_MAX_CHARS;
 
 	if  Length(s) < p then
 		SetLength(s, p);
@@ -10961,6 +11339,8 @@ initialization
 	ExpireZones:= TExpireZones.Create;
 	ExpirePlayers:= TExpirePlayers.Create;
 
+	SidecarRequests:= TSidecarRequests.Create;
+
 	ListMessages:= TMessageLists.Create;
 
 	SystemZone:= TSystemZone.Create;
@@ -10991,11 +11371,30 @@ finalization
 		ExpireZones.UnlockList;
 		end;
 
-	ServerDisp.Terminate;
-	ServerDisp.WaitFor;
-	ServerDisp.Free;
+//	Guarded because the early exits in DoRun (--help, and every bad
+//	option) return before ServerDisp is ever created, and finalization
+//	still runs - so --help always ended in an access violation.
+	if  Assigned(ServerDisp) then
+		begin
+		ServerDisp.Terminate;
+		ServerDisp.WaitFor;
+		ServerDisp.Free;
+		end;
 
 	DoDestroyListMessages;
+
+	with SidecarRequests.LockList do
+		try
+		while Count > 0 do
+			begin
+			Items[0].Free;
+			Delete(0);
+			end;
+		finally
+		SidecarRequests.UnlockList;
+		end;
+
+	SidecarRequests.Free;
 
 	ExpireZones.Free;
     ExpirePlayers.Free;

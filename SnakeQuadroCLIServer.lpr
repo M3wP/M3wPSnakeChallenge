@@ -19,7 +19,7 @@ uses
     {$ENDIF}
 {$ENDIF}
 	Classes, SysUtils, CustApp, SnakeClasses, SnakeServer, TCPServer, blcksock,
-    synsock;
+    synsock, SidecarClient;
 
 type
 
@@ -52,10 +52,17 @@ procedure TSnakeServer.DoRun;
 	lm: TLogMessage;
 	silent: Boolean;
     s: string;
+	sidehost,
+	sideport: string;
 
 	begin
 	// quick check parameters
-	ErrorMsg:= CheckOptions('hm:sdl:', 'help');
+//	--sidecar and --fail-open are LONG options only. The obvious short
+//	form for the first, -s, is already taken (it is "silent", just below),
+//	and the portal's own document suggests -s purely because it was written
+//	without sight of this file - see doc/portal/implementation.md, which
+//	tells Savrok the flag differs.
+	ErrorMsg:= CheckOptions('hm:sdl:', 'help sidecar: fail-open');
 	if  ErrorMsg <> '' then
 		begin
 		ShowException(Exception.Create(ErrorMsg));
@@ -91,6 +98,52 @@ procedure TSnakeServer.DoRun;
 			end;
 		end;
 
+	// --sidecar <host:port> - talk to a RetroGameGate sidecar, which is
+	// what turns on OTP-verified usernames and join/part events. Absent,
+	// none of that code runs and not one socket is opened: the server
+	// behaves exactly as it did before the portal work.
+	if  HasOption('sidecar') then
+		begin
+		s:= GetOptionValue('sidecar');
+
+		i:= Pos(':', s);
+
+		if  i > 0 then
+			begin
+			sidehost:= Copy(s, 1, i - 1);
+			sideport:= Copy(s, i + 1, MaxInt);
+			end
+		else
+			begin
+			sidehost:= s;
+			sideport:= SIDECAR_DEF_PORT;
+			end;
+
+		if  Length(sidehost) = 0 then
+			sidehost:= SIDECAR_DEF_HOST;
+
+		if  (Length(sideport) = 0)
+		or  (not TryStrToInt(sideport, i)) then
+			begin
+			ShowException(Exception.Create('Invalid sidecar address!'));
+			Terminate;
+			Exit;
+			end;
+
+		SidecarEnabled:= True;
+
+		// fail_closed is the default whenever --sidecar is given: with the
+		// check unavailable nobody should be able to take a portal user's
+		// name (sidecar-local.md S6).
+		SidecarFailOpen:= HasOption('fail-open');
+		end
+	else if HasOption('fail-open') then
+		begin
+		ShowException(Exception.Create('--fail-open needs --sidecar!'));
+		Terminate;
+		Exit;
+		end;
+
     TCPServer.TCPServer:= TTCPServer.Create;
 	TCPServer.TCPServer.OnConnect:= DoConnect;
 	TCPServer.TCPServer.OnDisconnect:= DoDisconnect;
@@ -114,6 +167,9 @@ procedure TSnakeServer.DoRun;
 
 	ServerDisp:= TServerDispatcher.Create;
 
+	if  SidecarEnabled then
+		Sidecar:= TSidecarClient.Create(sidehost, sideport);
+
 	silent:= HasOption('s', '');
 
 	// Otherwise the only sign of life is the first client connecting - a
@@ -128,6 +184,19 @@ procedure TSnakeServer.DoRun;
 				IntToStr(TCPServer.TCPServer.MaxConnections))
 	else
 		AddLogMessage(slkInfo, 'Max connections: unlimited');
+
+	if  SidecarEnabled then
+		begin
+		AddLogMessage(slkInfo, 'Sidecar: ' + sidehost + ':' + sideport);
+
+		if  SidecarFailOpen then
+			AddLogMessage(slkInfo, 'Sidecar mode: fail-open')
+		else
+			AddLogMessage(slkInfo, 'Sidecar mode: fail-closed');
+		end
+	else
+		AddLogMessage(slkInfo, 'Sidecar: none (legacy usernames)');
+
 	AddLogMessage(slkInfo, '----------------------------');
 
 	while not Terminated do
@@ -208,6 +277,12 @@ procedure TSnakeServer.DoRun;
 		SystemZone.PlayersKeepAliveDecrement(100);
 		SystemZone.PlayersKeepAliveExpire;
 
+		// Before the limbo sweep on purpose: a username the sidecar just
+		// approved is set by this call, and ExpirePlayers below is what
+		// then promotes the player - so an approval lands in the very
+		// same pass rather than waiting another 100 ms.
+		SystemZone.SidecarPump;
+
     	LimboZone.BumpCounter;
     	LimboZone.ExpirePlayers;
 
@@ -215,6 +290,14 @@ procedure TSnakeServer.DoRun;
 		// design) drives from here once the movement model exists -
 		// PlayZone's static boards (see ARR_SNAKE_BOARDS) are the fixed
 		// set to iterate.
+		end;
+
+	if  Assigned(Sidecar) then
+		begin
+		Sidecar.Terminate;
+		Sidecar.WaitFor;
+		Sidecar.Free;
+		Sidecar:= nil;
 		end;
 
 	TCPListener.Terminate;
@@ -240,6 +323,11 @@ procedure TSnakeServer.DoConnect(const AConnection: TTCPConnection);
 
 	p.Ident:= AConnection.Ident;
 	p.Ticket:= AConnection.Ticket;
+
+	// TTCPConnection is not reachable from TPlayer, and every sidecar
+	// message carries <remote_ip>, so it is copied across here - the one
+	// place both objects are in scope.
+	p.RemoteAddress:= AConnection.RemoteAddress;
 
 	SystemZone.Add(p);
 
@@ -337,12 +425,22 @@ destructor TSnakeServer.Destroy;
 procedure TSnakeServer.WriteHelp;
 	begin
 	writeln('Usage: ', ExeName,
-			' [-h|--help]|[[-s] [-d] [-m <connections>] [-l <level>]]');
+			' [-h|--help]|[[-s] [-d] [-m <connections>] [-l <level>]');
+	writeln('                  [--sidecar=<host:port>] [--fail-open]]');
 	writeln('  -s              silent');
 	writeln('  -d              debug logging');
 	writeln('  -m <n>          max connections');
 	writeln('  -l <n>          DEBUG: start boards on level n (see the');
 	writeln('                  stage cycle - 4 and 7 are lava, 8 is boss)');
+	writeln('  --sidecar=<a>   RetroGameGate sidecar address, host:port.');
+	writeln('                  (the = is required - FPC long options do');
+	writeln('                  not take a space. Default port ',
+			SIDECAR_DEF_PORT, '.) Enables OTP usernames');
+	writeln('                  and join/part events. Without it the server');
+	writeln('                  behaves exactly as it always has.');
+	writeln('  --fail-open     while the sidecar is unreachable, accept');
+	writeln('                  usernames the old way instead of refusing');
+	writeln('                  them. Needs --sidecar.');
 	end;
 
 var

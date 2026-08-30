@@ -90,8 +90,19 @@ class GhostClient:
     def send_ident(self):
         self.send(CATG_CLNT | 0x1, params("ghost", "PC", "0.00.01A"))
 
-    def send_username(self):
-        self.send(CATG_CNCT | 0x1, self.name.encode("ascii"))
+    def send_username(self, otp=None):
+        """Sets the username (mcConnect/0x1).
+
+        With otp, sends the TWO-param RetroGameGate form
+        "<name> <otp>" - see doc/portal/quadro.md S9.3. That shape is
+        only legal against a server started with --sidecar; anywhere
+        else it comes back as $50 "Invalid connect ident"."""
+        if otp:
+            payload = ("%s %s" % (self.name, otp)).encode("ascii")
+        else:
+            payload = self.name.encode("ascii")
+
+        self.send(CATG_CNCT | 0x1, payload)
 
     def join(self, game, password=None):
         self.game = game

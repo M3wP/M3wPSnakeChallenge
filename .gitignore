@@ -82,3 +82,8 @@ obj/
 
 # Lazarus session file - window positions, breakpoints, per-user
 *.lps
+
+# Python bytecode from the dev-only tools in tools/ - build junk, and it
+# rebuilds itself on every run.
+__pycache__/
+*.pyc
