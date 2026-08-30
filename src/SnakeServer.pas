@@ -10584,7 +10584,7 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 			// Both are now $04 (dengland wanted the standard methods low,
 			// and it matches mcLobby/$04 room chat).
 			//
-			// Inbound is [message] and nothing else: ProcessPlayerMessage
+			// Inbound is the whole typed line: ProcessPlayerMessage
 			// is only reached for a player already in this game, so there
 			// is no room to name, and the sender is stamped HERE from
 			// APlayer rather than trusted from the wire - a client could
@@ -10605,7 +10605,30 @@ procedure TSnakeGame.ProcessPlayerMessage(APlayer: TPlayer;
 					// sender there, not readparm1: unlike RoomPeer there
 					// is no leading room-name field to skip).
 					m.Params.Add(Copy(APlayer.Name, Low(AnsiString), 8));
-					m.Params.Add(AMessage.Params[0]);
+
+					// EVERY inbound param, not just the first.
+					// ExtractParams splits the payload on every space,
+					// so a multi-word chat line arrives as several
+					// params - and adding only Params[0] silently threw
+					// away everything after the first word. The client
+					// always sent the whole line and always rendered the
+					// whole line (clientProcPlayGameChatMsg appends from
+					// readparm1 to the end of the frame), so only this
+					// end was ever wrong.
+					//
+					// DataFromParams re-joins with single spaces, which
+					// reproduces the line as typed - including runs of
+					// spaces, which arrive as empty params. Only a
+					// TRAILING space is lost, because ExtractParams drops
+					// a trailing empty segment.
+					//
+					// FIXED 2026-08-31 (dengland: "the chat should send
+					// the whole message??"). The lobby $24 handler never
+					// had this - it mutates the params in place and
+					// re-joins, so room chat has always been multi-word.
+					for i:= 0 to AMessage.Params.Count - 1 do
+						m.Params.Add(AMessage.Params[i]);
+
 					m.DataFromParams;
 
 					with FPlayers.LockList do

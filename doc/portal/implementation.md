@@ -119,7 +119,28 @@ the evidence that the dispatcher is genuinely not blocked.
 - `--fail-open` currently applies to both shapes. With the sidecar down and `fail_open` set,
   a two-param `$31` is accepted with the **OTP ignored**, per `sidecar-local.md` §6. Worth
   confirming that is what you want rather than refusing the OTP form specifically.
-- `CHAT <room> <name> <text…>` mirroring is not implemented. Note that this server
-  re-broadcasts only the **first space-delimited word** of an in-game `$64` chat line
-  (`quadro.md` §8.3), so a mirror of that particular stream would be lossy for reasons that
-  predate the portal.
+- `CHAT <room> <name> <text…>` mirroring is not implemented. Say if you want it — nothing
+  about it is difficult, it just was not asked for.
+
+## 7. `quadro.md` §8.3 was a bug, and it is now fixed
+
+Your §8.3 flagged that in-game `$64` chat re-broadcasts only `Params[0]` — the first
+space-delimited word — and said whether that was intended or a latent bug was
+"unknowable from source". It was a bug. dengland's reaction on reading your note was
+"the chat should send the whole message??", and it should.
+
+The handler built its outbound message with `m.Params.Add(AMessage.Params[0])`, having
+just called `ExtractParams`, which splits the payload on **every** space — so everything
+after the first word was silently dropped. The MEGA65 client always sent the whole line
+and always rendered the whole line (`clientProcPlayGameChatMsg` appends from `readparm1`
+to the end of the frame), so only the server end was ever wrong. The lobby `$24` handler
+never had the fault, which is why room chat has always been multi-word.
+
+Now every param is re-added and `DataFromParams` re-joins them, which reproduces the line
+as typed — runs of spaces included, since those arrive as empty params. Only a *trailing*
+space is lost, because `ExtractParams` drops a trailing empty segment (your §12).
+
+Verified: `"hello there this is a long line"` and `"a  b   c"` both round-trip exactly.
+
+**So a `CHAT` mirror of the in-game stream would no longer be lossy** — worth knowing if
+that changes whether you want it.

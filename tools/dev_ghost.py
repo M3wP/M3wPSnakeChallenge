@@ -95,6 +95,14 @@ def main():
 	if args.room:
 		c.join_room(args.room, args.password)
 
+		# --raw works on the room path too. It used to sit only in the
+		# --game branch below, which this one returns before reaching,
+		# so there was no way to poke a raw mcLobby message at all.
+		if args.raw:
+			time.sleep(0.3)
+			catg, method, text = args.raw
+			c.send(int(catg, 16) | int(method, 16), text.encode("ascii"))
+
 		print(f"[holding connection open for {args.hold}s]")
 		time.sleep(args.hold)
 
